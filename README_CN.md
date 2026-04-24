@@ -1,35 +1,33 @@
 # swas — Single Worker Async Server
 
-[中文文档](README_CN.md)
+基于 Linux `io_uring` 的单线程异步 HTTP + WebSocket 服务器，使用 Zig 0.16.0 编写。
 
-A single-threaded async HTTP + WebSocket server built on Linux `io_uring`, written in Zig 0.16.0.
+## 设计理念
 
-## Design
+- **单线程事件循环**：避免锁竞争和上下文切换开销
+- **io_uring**：零拷贝系统调用，减少用户态/内核态切换
+- **零拷贝响应**：响应体直接从 handler 传递到写队列，无需中间缓冲
+- **Buffer Pool**：预分配读写缓冲池，运行期零分配
 
-- **Single-threaded event loop** — no locks, no context switch overhead
-- **io_uring** — zero-copy syscalls, minimal user/kernel transitions
-- **Zero-copy responses** — response body goes directly from handler to write queue, no intermediate buffering
-- **Buffer Pool** — pre-allocated read/write buffer pool, zero allocation at runtime
+## 要求
 
-## Requirements
-
-- **Linux 5.1+** (io_uring required; Windows/macOS not supported)
+- **Linux 5.1+**（io_uring 必需，不支持 Windows/macOS）
 - Zig 0.16.0
-- Compiles and runs on Linux only. **Cannot compile on Windows** — the Zig std lib `linux.IoUring` module only defines full types for Linux targets.
+- 在 Linux 上直接编译运行。**Windows 上无法编译**——Zig 标准库的 `linux.IoUring` 模块仅对 Linux 目标有完整类型定义。
 
-## Quick Start
+## 快速开始
 
 ```bash
-git clone https://github.com/fndome/swas
+git clone https://github.com/fndome/swas.git
 cd swas
 zig build run
 ```
 
-Server listens at `http://0.0.0.0:9090`.
+服务器监听 `http://0.0.0.0:9090`。
 
-## Use as a Library
+## 作为库使用
 
-Add to `build.zig.zon`:
+在 `build.zig.zon` 添加依赖：
 
 ```zig
 .dependencies = .{
@@ -40,14 +38,14 @@ Add to `build.zig.zon`:
 },
 ```
 
-Import in `build.zig`:
+在 `build.zig` 中导入模块：
 
 ```zig
 const swas_dep = b.dependency("swas", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("swas", swas_dep.module("swas"));
 ```
 
-Use in code:
+在代码中使用：
 
 ```zig
 const swas = @import("swas");
@@ -67,7 +65,7 @@ pub fn main() !void {
 
 ## API
 
-### Routing
+### 路由注册
 
 ```zig
 try server.GET("/hello", helloHandler);
@@ -77,29 +75,29 @@ try server.PATCH("/resource", patchHandler);
 try server.DELETE("/resource", delHandler);
 ```
 
-Route key = `"METHOD:/path"`. Re-registering the same path with `GET`/`PUT` etc. is idempotent (overwrites).
+路由 key = `"METHOD:/path"`，`PUT` / `GET` 等多次注册同一路径幂等覆盖。
 
-### Middleware
+### 中间件
 
 ```zig
-// Global middleware (matches all paths)
+// 全局中间件（匹配所有路径）
 try server.use("/**", logMiddleware);
 
-// Exact path middleware
+// 精确路径中间件
 try server.use("/admin", authMiddleware);
 
-// AntPath wildcard
+// AntPath 通配符匹配
 try server.use("/api/**/user", apiMiddleware);
 
-// Response middleware (runs synchronously on main thread, intercepts response)
+// 响应中间件（在主线程同步执行，拦截响应）
 try server.useThenRespondImmediately("/antpath-verify", jwtMiddleware);
 ```
 
-Signature:
+中间件签名：
 ```zig
 fn myMiddleware(allocator: Allocator, ctx: *Context) anyerror!bool;
-// return true  → short-circuit, stop further middleware/handlers
-// return false → continue
+// return true  → 短路，停止后续中间件/handler
+// return false → 继续传递
 ```
 
 ### WebSocket
@@ -114,63 +112,32 @@ fn wsHandler(conn_id: u64, frame: *const Frame, ws: *WsServer) void {
 try server.ws("/echo", wsHandler);
 ```
 
-Frame types: `text`, `binary`, `close`, `ping`, `pong`.
+WebSocket 帧类型：`text`、`binary`、`close`、`ping`、`pong`。
 
 ### Context
 
 ```zig
-// Read request header
+// 读请求头
 const token = ctx.getHeader("Authorization");
 
-// Write response header
+// 写响应头
 try ctx.setHeader("X-Request-Id", "abc-123");
 
-// Response types
+// 响应类型
 try ctx.text(200, "plain text");
 try ctx.json(200, .{ .message = "hello" });
 try ctx.html(200, "<h1>hello</h1>");
 try ctx.rawJson(200, `{"raw": true}`);
 ```
 
-`getHeader` is case-insensitive, returns `?[]const u8`.
+`getHeader` 大小写不敏感，返回 `?[]const u8`。
 
-### Configuration
-
-All parameters via `server.config(key, value)`, defaults from `src/constants.zig`:
-
-```zig
-server.config(.idle_timeout_ms, 30000);       // idle timeout 30s
-server.config(.buffer_size, 131072);           // buffer size 128KB
-server.config(.buffer_pool_size, 4096);        // pool count
-server.config(.ring_entries, 4096);            // io_uring queue depth
-server.config(.task_queue_size, 2048);         // task queue capacity
-server.config(.max_cqes_batch, 128);           // max completion events per batch
-server.config(.max_path_length, 4096);         // max URL path length
-```
-
-| key | type | default | description |
-|-----|------|---------|-------------|
-| `max_header_buffer_size` | i32 | 8192 | max header bytes |
-| `max_response_buffer_size` | i32 | 4096 | max response header bytes |
-| `max_cqes_batch` | i32 | 64 | io_uring CQE batch size |
-| `ring_entries` | i32 | 2048 | io_uring queue depth |
-| `task_queue_size` | i32 | 1024 | worker task queue |
-| `response_queue_size` | i32 | 1024 | response queue |
-| `buffer_size` | i32 | 65536 | per-buffer size |
-| `buffer_pool_size` | i32 | 2048 | buffer pool count |
-| `write_buf_count` | i32 | 256 | write buffer count |
-| `max_fixed_files` | i32 | 2048 | fixed file descriptors |
-| `max_path_length` | i32 | 2048 | max URL path length |
-| `idle_timeout_ms` | i32 | 60000 | idle connection timeout (ms) |
-
-Some parameters (`ring_entries`, `buffer_pool_size`, etc.) take effect at `init()` time; `.config()` changes apply on next restart.
-
-## Architecture
+## 架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    Main Thread                       │
-│  io_uring event loop                                 │
+│                     Main Thread                      │
+│  io_uring 事件循环                                    │
 │  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │
 │  │ Accept   │  │ Read     │  │ Write             │  │
 │  │ CQE →    │  │ CQE →    │  │ CQE →             │  │
@@ -186,3 +153,36 @@ Some parameters (`ring_entries`, `buffer_pool_size`, etc.) take effect at `init(
 │              └─────────────┘                          │
 └─────────────────────────────────────────────────────┘
 ```
+
+## 配置
+
+所有参数通过 `server.config(key, value)` 设置，默认值来自 `src/constants.zig`：
+
+```zig
+server.config(.idle_timeout_ms, 30000);       // 空闲超时 30秒
+server.config(.buffer_size, 131072);           // 缓冲大小 128KB
+server.config(.buffer_pool_size, 4096);        // 缓冲池数量
+server.config(.ring_entries, 4096);            // io_uring 队列深度
+server.config(.task_queue_size, 2048);         // 任务队列容量
+server.config(.max_cqes_batch, 128);           // 每次最大完成事件数
+server.config(.max_path_length, 4096);         // 路径最大长度
+```
+
+完整可配项：
+
+| key | 类型 | 默认值 | 说明 |
+|-----|------|--------|------|
+| `max_header_buffer_size` | i32 | 8192 | 请求头最大字节 |
+| `max_response_buffer_size` | i32 | 4096 | 响应头最大字节 |
+| `max_cqes_batch` | i32 | 64 | io_uring CQE 批处理数 |
+| `ring_entries` | i32 | 2048 | io_uring 队列深度 |
+| `task_queue_size` | i32 | 1024 | 工作线程任务队列 |
+| `response_queue_size` | i32 | 1024 | 响应队列 |
+| `buffer_size` | i32 | 65536 | 每个缓冲大小 |
+| `buffer_pool_size` | i32 | 2048 | 缓冲池总数 |
+| `write_buf_count` | i32 | 256 | 写缓冲数量 |
+| `max_fixed_files` | i32 | 2048 | 固定文件描述符数 |
+| `max_path_length` | i32 | 2048 | URL 路径最大长度 |
+| `idle_timeout_ms` | i32 | 60000 | 空闲连接超时（ms） |
+
+部分参数（`ring_entries`、`buffer_pool_size` 等）在 `init()` 时生效，`config()` 修改后下次启动生效。
