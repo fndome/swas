@@ -32,7 +32,7 @@ zig build run
 ```zig
 .dependencies = .{
     .swas = .{
-        .url = "https://github.com/fndome/swas/archive/refs/tags/v0.0.1.tar.gz",
+        .url = "https://github.com/fndome/swas/archive/refs/tags/0.0.1.tar.gz",
         .hash = "1220...",
     },
 },
