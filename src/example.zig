@@ -23,7 +23,7 @@ pub const Middleware = @import("http/types.zig").Middleware;
 pub const Handler = @import("http/types.zig").Handler;
 pub const AsyncServer = @import("http/async_server.zig").AsyncServer;
 
-pub const Frame = @import("ws/frame.zig").Frame;
+pub const Frame = @import("ws/types.zig").Frame;
 pub const WsServer = @import("ws/server.zig").WsServer;
 
 // ========== Example ==========
