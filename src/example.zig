@@ -2,20 +2,21 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 // ========== Re-exports ==========
-pub const MAX_HEADER_BUFFER_SIZE = @import("constants.zig").MAX_HEADER_BUFFER_SIZE;
-pub const MAX_RESPONSE_BUFFER_SIZE = @import("constants.zig").MAX_RESPONSE_BUFFER_SIZE;
-pub const MAX_CQES_BATCH = @import("constants.zig").MAX_CQES_BATCH;
-pub const RING_ENTRIES = @import("constants.zig").RING_ENTRIES;
-pub const TASK_QUEUE_SIZE = @import("constants.zig").TASK_QUEUE_SIZE;
-pub const RESPONSE_QUEUE_SIZE = @import("constants.zig").RESPONSE_QUEUE_SIZE;
-pub const BUFFER_SIZE = @import("constants.zig").BUFFER_SIZE;
-pub const BUFFER_POOL_SIZE = @import("constants.zig").BUFFER_POOL_SIZE;
-pub const WRITE_BUF_COUNT = @import("constants.zig").WRITE_BUF_COUNT;
-pub const READ_BUF_COUNT = @import("constants.zig").READ_BUF_COUNT;
-pub const READ_BUF_GROUP_ID = @import("constants.zig").READ_BUF_GROUP_ID;
-pub const ACCEPT_USER_DATA = @import("constants.zig").ACCEPT_USER_DATA;
-pub const MAX_FIXED_FILES = @import("constants.zig").MAX_FIXED_FILES;
-pub const MAX_PATH_LENGTH = @import("constants.zig").MAX_PATH_LENGTH;
+pub const constants = @import("constants.zig");
+pub const MAX_HEADER_BUFFER_SIZE = constants.MAX_HEADER_BUFFER_SIZE;
+pub const MAX_RESPONSE_BUFFER_SIZE = constants.MAX_RESPONSE_BUFFER_SIZE;
+pub const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
+pub const RING_ENTRIES = constants.RING_ENTRIES;
+pub const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
+pub const RESPONSE_QUEUE_SIZE = constants.RESPONSE_QUEUE_SIZE;
+pub const BUFFER_SIZE = constants.BUFFER_SIZE;
+pub const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
+pub const WRITE_BUF_COUNT = constants.WRITE_BUF_COUNT;
+pub const READ_BUF_COUNT = constants.READ_BUF_COUNT;
+pub const READ_BUF_GROUP_ID = constants.READ_BUF_GROUP_ID;
+pub const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
+pub const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
+pub const MAX_PATH_LENGTH = constants.MAX_PATH_LENGTH;
 
 pub const Connection = @import("http/connection.zig").Connection;
 pub const Context = @import("http/context.zig").Context;

@@ -5,16 +5,17 @@ const Allocator = std.mem.Allocator;
 const RingBuffer = @import("../spsc_ringbuffer.zig").RingBuffer;
 const BufferPool = @import("../buffer_pool.zig").BufferPool;
 
-const RING_ENTRIES = @import("../constants.zig").RING_ENTRIES;
-const TASK_QUEUE_SIZE = @import("../constants.zig").TASK_QUEUE_SIZE;
-const RESPONSE_QUEUE_SIZE = @import("../constants.zig").RESPONSE_QUEUE_SIZE;
-const BUFFER_POOL_SIZE = @import("../constants.zig").BUFFER_POOL_SIZE;
-const READ_BUF_COUNT = @import("../constants.zig").READ_BUF_COUNT;
-const MAX_CQES_BATCH = @import("../constants.zig").MAX_CQES_BATCH;
-const ACCEPT_USER_DATA = @import("../constants.zig").ACCEPT_USER_DATA;
-const MAX_FIXED_FILES = @import("../constants.zig").MAX_FIXED_FILES;
-const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
-const READ_BUF_GROUP_ID = @import("../constants.zig").READ_BUF_GROUP_ID;
+const constants = @import("../constants.zig");
+const RING_ENTRIES = constants.RING_ENTRIES;
+const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
+const RESPONSE_QUEUE_SIZE = constants.RESPONSE_QUEUE_SIZE;
+const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
+const READ_BUF_COUNT = constants.READ_BUF_COUNT;
+const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
+const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
+const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
+const BUFFER_SIZE = constants.BUFFER_SIZE;
+const READ_BUF_GROUP_ID = constants.READ_BUF_GROUP_ID;
 
 const PathRule = @import("../antpath.zig").PathRule;
 
@@ -27,11 +28,12 @@ const ResponseTask = @import("tasks.zig").ResponseTask;
 const MiddlewareStore = @import("middleware_store.zig").MiddlewareStore;
 const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 
-const getMethodFromRequest = @import("http_helpers.zig").getMethodFromRequest;
-const getPathFromRequest = @import("http_helpers.zig").getPathFromRequest;
-const isKeepAliveConnection = @import("http_helpers.zig").isKeepAliveConnection;
-const parseIpv4 = @import("http_helpers.zig").parseIpv4;
-const logErr = @import("http_helpers.zig").logErr;
+const helpers = @import("http_helpers.zig");
+const getMethodFromRequest = helpers.getMethodFromRequest;
+const getPathFromRequest = helpers.getPathFromRequest;
+const isKeepAliveConnection = helpers.isKeepAliveConnection;
+const parseIpv4 = helpers.parseIpv4;
+const logErr = helpers.logErr;
 
 const WsServer = @import("../ws/server.zig").WsServer;
 const WsHandler = @import("../ws/server.zig").WsHandler;
@@ -39,7 +41,6 @@ const Frame = @import("../ws/types.zig").Frame;
 const Opcode = @import("../ws/types.zig").Opcode;
 const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
-const constants = @import("../constants.zig");
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
