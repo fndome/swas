@@ -23,6 +23,9 @@ pub const Middleware = @import("http/types.zig").Middleware;
 pub const Handler = @import("http/types.zig").Handler;
 pub const AsyncServer = @import("http/async_server.zig").AsyncServer;
 
+pub const Frame = @import("ws/frame.zig").Frame;
+pub const WsServer = @import("ws/server.zig").WsServer;
+
 // ========== Example ==========
 const Example = struct {
     fn jwtMiddleware(allocator: Allocator, ctx: *Context) anyerror!bool {
@@ -54,6 +57,12 @@ const Example = struct {
         ctx.status = 200;
     }
 
+    fn wsEchoHandler(conn_id: u64, frame: *const Frame, ws: *WsServer) void {
+        if (frame.opcode == .text or frame.opcode == .binary) {
+            ws.sendWsFrame(conn_id, frame.opcode, frame.payload);
+        }
+    }
+
     pub fn main() !void {
         var gpa = std.heap.DebugAllocator(.{}).init;
         defer _ = gpa.deinit();
@@ -66,10 +75,13 @@ const Example = struct {
         var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", null);
         defer server.deinit();
 
+        server.config(.idle_timeout_ms, 30000);
+
         try server.useThenRespondImmediately("/antpath-verify", jwtMiddleware);
         try server.use("/admin", logMiddleware);
-        try server.register("/hello", helloHandler);
-        try server.register("/admin/dashboard", helloHandler);
+        try server.GET("/hello", helloHandler);
+        try server.GET("/admin/dashboard", helloHandler);
+        try server.ws("/echo", wsEchoHandler);
 
         std.debug.print("Server listening on http://0.0.0.0:9090\n", .{});
         try server.run();

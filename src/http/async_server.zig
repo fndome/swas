@@ -27,6 +27,7 @@ const ResponseTask = @import("tasks.zig").ResponseTask;
 const MiddlewareStore = @import("middleware_store.zig").MiddlewareStore;
 const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 
+const getMethodFromRequest = @import("http_helpers.zig").getMethodFromRequest;
 const getPathFromRequest = @import("http_helpers.zig").getPathFromRequest;
 const isKeepAliveConnection = @import("http_helpers.zig").isKeepAliveConnection;
 const parseIpv4 = @import("http_helpers.zig").parseIpv4;
@@ -38,6 +39,7 @@ const Frame = @import("../ws/types.zig").Frame;
 const Opcode = @import("../ws/types.zig").Opcode;
 const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
+const constants = @import("../constants.zig");
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -71,11 +73,59 @@ pub const AsyncServer = struct {
     respond_middlewares: MiddlewareStore,
     handlers: std.StringHashMap(Handler),
 
-    idle_timeout_ms: u64 = 60000,
     timeout_user_data: u64 = 0,
     timeout_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
 
+    cfg: Config,
+
     const Self = @This();
+
+    pub const Config = struct {
+        max_header_buffer_size: u32 = constants.MAX_HEADER_BUFFER_SIZE,
+        max_response_buffer_size: u32 = constants.MAX_RESPONSE_BUFFER_SIZE,
+        max_cqes_batch: u32 = constants.MAX_CQES_BATCH,
+        ring_entries: u32 = constants.RING_ENTRIES,
+        task_queue_size: u32 = constants.TASK_QUEUE_SIZE,
+        response_queue_size: u32 = constants.RESPONSE_QUEUE_SIZE,
+        buffer_size: u32 = constants.BUFFER_SIZE,
+        buffer_pool_size: u32 = constants.BUFFER_POOL_SIZE,
+        write_buf_count: u32 = constants.WRITE_BUF_COUNT,
+        max_fixed_files: u32 = constants.MAX_FIXED_FILES,
+        max_path_length: u32 = constants.MAX_PATH_LENGTH,
+        idle_timeout_ms: u64 = constants.IDLE_TIMEOUT_MS,
+    };
+
+    pub const ConfigKey = enum {
+        max_header_buffer_size,
+        max_response_buffer_size,
+        max_cqes_batch,
+        ring_entries,
+        task_queue_size,
+        response_queue_size,
+        buffer_size,
+        buffer_pool_size,
+        write_buf_count,
+        max_fixed_files,
+        max_path_length,
+        idle_timeout_ms,
+    };
+
+    pub fn config(self: *Self, key: ConfigKey, value: i32) void {
+        switch (key) {
+            .max_header_buffer_size => self.cfg.max_header_buffer_size = @intCast(value),
+            .max_response_buffer_size => self.cfg.max_response_buffer_size = @intCast(value),
+            .max_cqes_batch => self.cfg.max_cqes_batch = @intCast(value),
+            .ring_entries => self.cfg.ring_entries = @intCast(value),
+            .task_queue_size => self.cfg.task_queue_size = @intCast(value),
+            .response_queue_size => self.cfg.response_queue_size = @intCast(value),
+            .buffer_size => self.cfg.buffer_size = @intCast(value),
+            .buffer_pool_size => self.cfg.buffer_pool_size = @intCast(value),
+            .write_buf_count => self.cfg.write_buf_count = @intCast(value),
+            .max_fixed_files => self.cfg.max_fixed_files = @intCast(value),
+            .max_path_length => self.cfg.max_path_length = @intCast(value),
+            .idle_timeout_ms => self.cfg.idle_timeout_ms = @intCast(value),
+        }
+    }
 
     pub fn init(allocator: Allocator, io: std.Io, listen_addr: []const u8, app_ctx: ?*anyopaque) !Self {
         const colon = std.mem.indexOfScalar(u8, listen_addr, ':') orelse return error.InvalidListenAddress;
@@ -157,7 +207,9 @@ pub const AsyncServer = struct {
             .middlewares = mw_store,
             .respond_middlewares = respond_mw_store,
             .handlers = std.StringHashMap(Handler).init(allocator),
+            .cfg = Config{},
         };
+        server.ws_server.parent = @ptrCast(&server);
         try server.buffer_pool.provideAllReads(&server.ring);
         return server;
     }
@@ -183,6 +235,12 @@ pub const AsyncServer = struct {
         self.ws_server.deinit();
         self.middlewares.deinit(self.allocator);
         self.respond_middlewares.deinit(self.allocator);
+        {
+            var handler_it = self.handlers.iterator();
+            while (handler_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+        }
         self.handlers.deinit();
     }
 
@@ -263,13 +321,34 @@ pub const AsyncServer = struct {
         });
     }
 
-    pub fn register(self: *Self, path: []const u8, handler: Handler) !void {
+    fn register(self: *Self, method: []const u8, path: []const u8, handler: Handler) !void {
         try self.ensureWorkerStarted();
-        _ = try self.handlers.put(path, handler);
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ method, path });
+        _ = try self.handlers.put(key, handler);
     }
 
-    pub fn ws(self: *Self, path: []const u8, handler: WsHandler, user_data: ?*anyopaque) !void {
-        try self.ws_server.register(path, handler, user_data);
+    pub fn GET(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.register("GET", path, handler);
+    }
+
+    pub fn POST(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.register("POST", path, handler);
+    }
+
+    pub fn PUT(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.register("PUT", path, handler);
+    }
+
+    pub fn PATCH(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.register("PATCH", path, handler);
+    }
+
+    pub fn DELETE(self: *Self, path: []const u8, handler: Handler) !void {
+        try self.register("DELETE", path, handler);
+    }
+
+    pub fn ws(self: *Self, path: []const u8, handler: WsHandler) !void {
+        try self.ws_server.register(path, handler);
     }
 
     fn ensureWorkerStarted(self: *Self) !void {
@@ -582,11 +661,18 @@ pub const AsyncServer = struct {
                 return;
             }
             const selected_buf = self.buffer_pool.getReadBuf(conn.read_bid);
+            const method_str = getMethodFromRequest(selected_buf[0..conn.read_len]) orelse "GET";
+            const method_dup = self.allocator.dupe(u8, method_str) catch {
+                self.respond(conn, 500, "Internal Server Error");
+                return;
+            };
             const path_dup = self.allocator.dupe(u8, path) catch {
+                self.allocator.free(method_dup);
                 self.respond(conn, 500, "Internal Server Error");
                 return;
             };
             const request_data_dup = self.allocator.dupe(u8, selected_buf[0..conn.read_len]) catch {
+                self.allocator.free(method_dup);
                 self.allocator.free(path_dup);
                 self.respond(conn, 500, "Internal Server Error");
                 return;
@@ -595,10 +681,12 @@ pub const AsyncServer = struct {
             conn.read_len = 0;
             const task = Task{
                 .conn_id = conn_id,
+                .method = method_dup,
                 .path = path_dup,
                 .request_data = request_data_dup,
             };
             if (!self.task_queue.tryPush(task)) {
+                self.allocator.free(method_dup);
                 self.allocator.free(path_dup);
                 self.allocator.free(request_data_dup);
                 self.respond(conn, 503, "Service Unavailable");
@@ -739,7 +827,7 @@ pub const AsyncServer = struct {
             const conn = entry.value_ptr;
             if (conn.state == .reading and conn.last_active_ms > 0) {
                 const idle_ms = now - conn.last_active_ms;
-                if (idle_ms >= @as(i64, @intCast(self.idle_timeout_ms))) {
+                if (idle_ms >= @as(i64, @intCast(self.cfg.idle_timeout_ms))) {
                     to_remove.append(self.allocator, entry.key_ptr.*) catch {};
                 }
             }
@@ -857,7 +945,7 @@ pub const AsyncServer = struct {
             return;
         };
 
-        self.ws_server.addActive(conn_id, entry.handler, entry.user_data) catch {
+        self.ws_server.addActive(conn_id, entry.handler) catch {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 500, "Internal Server Error");
@@ -970,7 +1058,7 @@ pub const AsyncServer = struct {
                     self.closeConn(conn_id, conn.fd);
                     return;
                 };
-                active.handler(conn_id, &frame, active.user_data);
+                active.handler(conn_id, &frame, &self.ws_server);
 
                 if (conn.state == .ws_writing) {
                     return;
@@ -1034,6 +1122,7 @@ fn workerThreadEntry(server: *AsyncServer) void {
     while (!server.worker_should_stop) {
         if (server.task_queue.tryPop()) |task| {
             defer {
+                server.allocator.free(task.method);
                 server.allocator.free(task.path);
                 server.allocator.free(task.request_data);
             }
@@ -1108,11 +1197,17 @@ fn workerThreadEntry(server: *AsyncServer) void {
             }
 
             if (!handled) {
-                if (server.handlers.get(task.path)) |handler| {
-                    handler(server.allocator, &ctx) catch |err| {
-                        logErr("handler error: {s}", .{@errorName(err)});
-                        ctx.text(500, @errorName(err)) catch {};
-                    };
+                var key_buf: [512]u8 = undefined;
+                const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ task.method, task.path }) catch null;
+                if (key) |k| {
+                    if (server.handlers.get(k)) |handler| {
+                        handler(server.allocator, &ctx) catch |err| {
+                            logErr("handler error: {s}", .{@errorName(err)});
+                            ctx.text(500, @errorName(err)) catch {};
+                        };
+                    } else {
+                        ctx.text(404, "Not Found") catch {};
+                    }
                 } else {
                     ctx.text(404, "Not Found") catch {};
                 }

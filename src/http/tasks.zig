@@ -2,6 +2,7 @@ const Context = @import("context.zig").Context;
 
 pub const Task = struct {
     conn_id: u64,
+    method: []u8,
     path: []u8,
     request_data: []u8,
 };

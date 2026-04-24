@@ -3,28 +3,28 @@ const Allocator = std.mem.Allocator;
 const Frame = @import("types.zig").Frame;
 const Opcode = @import("types.zig").Opcode;
 
-pub const WsHandler = *const fn (conn_id: u64, frame: *const Frame, server: ?*anyopaque) void;
+pub const WsHandler = *const fn (conn_id: u64, frame: *const Frame, ws: *WsServer) void;
 
 pub const WsHandlerEntry = struct {
     handler: WsHandler,
-    user_data: ?*anyopaque,
 };
 
 pub const WsActiveConn = struct {
     handler: WsHandler,
-    user_data: ?*anyopaque,
 };
 
 pub const WsServer = struct {
     allocator: Allocator,
     handlers: std.StringHashMap(WsHandlerEntry),
     active: std.AutoHashMap(u64, WsActiveConn),
+    parent: ?*anyopaque,
 
     pub fn init(allocator: Allocator) WsServer {
         return WsServer{
             .allocator = allocator,
             .handlers = std.StringHashMap(WsHandlerEntry).init(allocator),
             .active = std.AutoHashMap(u64, WsActiveConn).init(allocator),
+            .parent = null,
         };
     }
 
@@ -37,8 +37,8 @@ pub const WsServer = struct {
         self.handlers.deinit();
     }
 
-    pub fn register(self: *WsServer, path: []const u8, handler: WsHandler, user_data: ?*anyopaque) !void {
-        try self.handlers.put(path, .{ .handler = handler, .user_data = user_data });
+    pub fn register(self: *WsServer, path: []const u8, handler: WsHandler) !void {
+        try self.handlers.put(path, .{ .handler = handler });
     }
 
     pub fn hasHandlers(self: *const WsServer) bool {
@@ -54,11 +54,17 @@ pub const WsServer = struct {
         return self.active.get(conn_id);
     }
 
-    pub fn addActive(self: *WsServer, conn_id: u64, handler: WsHandler, user_data: ?*anyopaque) !void {
-        try self.active.put(conn_id, .{ .handler = handler, .user_data = user_data });
+    pub fn addActive(self: *WsServer, conn_id: u64, handler: WsHandler) !void {
+        try self.active.put(conn_id, .{ .handler = handler });
     }
 
     pub fn removeActive(self: *WsServer, conn_id: u64) void {
         _ = self.active.remove(conn_id);
+    }
+
+    pub fn sendWsFrame(self: *WsServer, conn_id: u64, opcode: Opcode, payload: []const u8) void {
+        const AsyncServer = @import("../http/async_server.zig").AsyncServer;
+        const server: *AsyncServer = @ptrCast(@alignCast(self.parent.?));
+        server.sendWsFrame(conn_id, opcode, payload);
     }
 };

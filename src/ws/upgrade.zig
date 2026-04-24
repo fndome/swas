@@ -11,13 +11,9 @@ pub fn isUpgradeRequest(data: []const u8) bool {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (std.ascii.startsWithIgnoreCase(line, "Upgrade:")) {
-            for (line[7..]) |c| {
-                if (c != ' ' and c != '\t') {
-                    if (std.ascii.startsWithIgnoreCase(line[7 + @intFromPtr(&c) - @intFromPtr(line.ptr) ..], "websocket")) {
-                        has_upgrade = true;
-                    }
-                    break;
-                }
+            const value = std.mem.trim(u8, line[7..], " \t");
+            if (std.ascii.eqlIgnoreCase(value, "websocket")) {
+                has_upgrade = true;
             }
         }
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Key:")) {
@@ -56,11 +52,12 @@ pub fn computeAcceptKey(key: []const u8, buf: *[29]u8) void {
 }
 
 pub fn buildUpgradeResponse(buf: []u8, accept_key: []const u8) !usize {
-    return try std.fmt.bufPrint(buf,
+    const written = try std.fmt.bufPrint(buf,
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Accept: {s}\r\n\r\n",
         .{accept_key},
     );
+    return written.len;
 }

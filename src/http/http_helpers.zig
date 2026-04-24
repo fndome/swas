@@ -1,6 +1,13 @@
 const std = @import("std");
 const MAX_PATH_LENGTH = @import("../constants.zig").MAX_PATH_LENGTH;
 
+pub fn getMethodFromRequest(buf: []const u8) ?[]const u8 {
+    const end = std.mem.indexOf(u8, buf, "\r\n") orelse std.mem.indexOfScalar(u8, buf, '\n') orelse return null;
+    const line = buf[0..end];
+    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    return line[0..first_space];
+}
+
 pub fn getPathFromRequest(buf: []const u8) ?[]const u8 {
     const end = std.mem.indexOf(u8, buf, "\r\n") orelse std.mem.indexOfScalar(u8, buf, '\n') orelse return null;
     const line = buf[0..end];

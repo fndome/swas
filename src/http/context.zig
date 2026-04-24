@@ -50,6 +50,19 @@ pub const Context = struct {
         try self.headers.?.print(self.allocator, "{s}: {s}\r\n", .{ key, value });
     }
 
+    pub fn getHeader(self: *Context, key: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, self.request_data, "\r\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) break;
+            if (std.ascii.startsWithIgnoreCase(line, key)) {
+                if (line.len > key.len) {
+                    return std.mem.trim(u8, line[key.len..], ": \t\r\n");
+                }
+            }
+        }
+        return null;
+    }
+
     pub fn clearHeaders(self: *Context) void {
         if (self.headers) |*h| {
             h.clearRetainingCapacity();

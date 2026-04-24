@@ -1,5 +1,10 @@
-pub const AsyncServer = @import("aio_server.zig").AsyncServer;
-pub const Connection = @import("aio_server.zig").Connection;
-pub const Context = @import("aio_server.zig").Context;
-pub const Middleware = @import("aio_server.zig").Middleware;
-pub const Handler = @import("aio_server.zig").Handler;
+pub const AsyncServer = @import("example.zig").AsyncServer;
+pub const Connection = @import("example.zig").Connection;
+pub const Context = @import("example.zig").Context;
+pub const Middleware = @import("example.zig").Middleware;
+pub const Handler = @import("example.zig").Handler;
+
+pub const WsServer = @import("ws/server.zig").WsServer;
+pub const WsHandler = @import("ws/server.zig").WsHandler;
+pub const Frame = @import("ws/types.zig").Frame;
+pub const Opcode = @import("ws/types.zig").Opcode;

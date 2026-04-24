@@ -12,3 +12,4 @@ pub const READ_BUF_GROUP_ID = 0;
 pub const ACCEPT_USER_DATA: u64 = (1 << 63);
 pub const MAX_FIXED_FILES = 2048;
 pub const MAX_PATH_LENGTH = 2048;
+pub const IDLE_TIMEOUT_MS = 30000;
