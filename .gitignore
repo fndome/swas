@@ -1,0 +1,13 @@
+```
+# Patch files
+*.diff
+*.diff.b64
+```
+
+.zig-cache
+zig-out
+
+*.bak*
+
+.skills
+

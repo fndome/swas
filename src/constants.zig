@@ -1,0 +1,14 @@
+pub const MAX_HEADER_BUFFER_SIZE = 8192;
+pub const MAX_RESPONSE_BUFFER_SIZE = 4096;
+pub const MAX_CQES_BATCH = 64;
+pub const RING_ENTRIES = 2048;
+pub const TASK_QUEUE_SIZE = 1024;
+pub const RESPONSE_QUEUE_SIZE = 1024;
+pub const BUFFER_SIZE = 65536;
+pub const BUFFER_POOL_SIZE = 2048;
+pub const WRITE_BUF_COUNT = 256;
+pub const READ_BUF_COUNT = BUFFER_POOL_SIZE - WRITE_BUF_COUNT;
+pub const READ_BUF_GROUP_ID = 0;
+pub const ACCEPT_USER_DATA: u64 = (1 << 63);
+pub const MAX_FIXED_FILES = 2048;
+pub const MAX_PATH_LENGTH = 2048;
