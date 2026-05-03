@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: swas-app
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: seccomp/io_uring-allowed.json
+  containers:
+    - name: app
+      image: your-app-image
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      ports:
+        - containerPort: 9090
+          protocol: TCP
+  restartPolicy: Never
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swas-app
+  labels:
+    app: swas-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: swas-app
+  template:
+    metadata:
+      labels:
+        app: swas-app
+    spec:
+      securityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: seccomp/io_uring-allowed.json
+      containers:
+        - name: app
+          image: your-app-image
+          ports:
+            - containerPort: 9090
+              name: http
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swas-app-svc
+spec:
+  selector:
+    app: swas-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 9090
+  type: ClusterIP

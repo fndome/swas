@@ -1,0 +1,58 @@
+{
+	"defaultAction": "SCMP_ACT_ERRNO",
+	"architectures": [
+		"SCMP_ARCH_X86_64",
+		"SCMP_ARCH_AARCH64"
+	],
+	"syscalls": [
+		{
+			"names": [
+				"io_uring_setup",
+				"io_uring_enter",
+				"io_uring_register"
+			],
+			"action": "SCMP_ACT_ALLOW"
+		},
+		{
+			"names": [
+				"accept4",
+				"bind",
+				"close",
+				"connect",
+				"epoll_create1",
+				"epoll_ctl",
+				"epoll_pwait",
+				"eventfd2",
+				"exit_group",
+				"fstat",
+				"ftruncate",
+				"getdents64",
+				"getrandom",
+				"listen",
+				"mmap",
+				"mprotect",
+				"munmap",
+				"newfstatat",
+				"openat",
+				"pread64",
+				"read",
+				"readlinkat",
+				"rt_sigaction",
+				"rt_sigprocmask",
+				"sched_getaffinity",
+				"sched_yield",
+				"sendmsg",
+				"set_robust_list",
+				"set_tid_address",
+				"setsockopt",
+				"shutdown",
+				"sigaltstack",
+				"socket",
+				"statx",
+				"write",
+				"writev"
+			],
+			"action": "SCMP_ACT_ALLOW"
+		}
+	]
+}

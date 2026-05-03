@@ -1,0 +1,22 @@
+{
+  "server": {
+    "listen_addr": "0.0.0.0:9091",
+    "log_level": "info",
+    "io_cpu": 3
+  },
+  "jwt": {
+    "secret_key": "${JWT_SECRET}",
+    "header_key": "Authorization"
+  },
+  "whitelist": [
+    "/health"
+  ],
+  "rate_limits": [
+    {
+      "path_pattern": "/ws/**",
+      "qps": 20000,
+      "burst": 40000,
+      "window_seconds": 1
+    }
+  ]
+}

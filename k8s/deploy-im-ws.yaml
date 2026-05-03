@@ -1,0 +1,73 @@
+# =============================================================================
+# IM-WS 服务部署 —— 基于 swas 的 WebSocket 服务
+# =============================================================================
+# IO 线程绑核: 在应用配置中设置 io_cpu=3（CPU 3，第 4 个 CPU）
+# Worker 线程不绑核，host 上几十个 worker 由内核调度器自动分配空闲核
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-ws
+  namespace: gw
+  labels:
+    app: im-ws
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: im-ws
+  template:
+    metadata:
+      labels:
+        app: im-ws
+    spec:
+      securityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: seccomp/io_uring-allowed.json
+      containers:
+        - name: im-ws
+          image: im-ws:latest
+          imagePullPolicy: IfNotPresent
+          # IO 线程绑核由应用配置 io_cpu=3 控制
+          # Worker 线程由内核调度，不绑核
+          ports:
+            - containerPort: 9091
+              name: ws
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9091
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 1
+              memory: 64Mi
+            limits:
+              cpu: 1
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-ws-svc
+  namespace: gw
+spec:
+  selector:
+    app: im-ws
+  ports:
+    - name: ws
+      protocol: TCP
+      port: 80
+      targetPort: 9091
+  type: ClusterIP
