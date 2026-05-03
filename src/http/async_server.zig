@@ -95,6 +95,8 @@ pub const AsyncServer = struct {
     deferred_head: ?*DeferredNode align(@alignOf(usize)) = null,
     /// 钩子列表：在 drainDeferred 发送响应前依次调用（IO 线程内执行）
     deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
+    /// tick 钩子列表：每轮 IO 循环必触发（有/无 deferred 节点都跑）
+    tick_hooks: std.ArrayList(*const fn (self: *Self) void),
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
@@ -234,6 +236,7 @@ pub const AsyncServer = struct {
             .next_conn_id = 1,
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).init(allocator),
+            .tick_hooks = std.ArrayList(*const fn (self: *Self) void).init(allocator),
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -289,6 +292,7 @@ pub const AsyncServer = struct {
 
         self.connections.deinit();
         self.deferred_hooks.deinit();
+        self.tick_hooks.deinit();
         self.submit_registry.deinit();
         self.ring.deinit();
         self.buffer_pool.deinit();
@@ -909,6 +913,8 @@ pub const AsyncServer = struct {
                 self.dispatchCqes(&cqes, n);
                 // Next.go() 任务: 同一线程 fiber 执行
                 self.drainNextTasks();
+                // tick 钩子: 每轮必触发（倒计时、超时检测等）
+                self.drainTick();
                 // worker 线程异步回调
                 self.drainDeferred();
                 // 处理中可能产生新 SQE → 下一轮 submit 带出去
@@ -931,6 +937,8 @@ pub const AsyncServer = struct {
 
             // Next.go() 任务
             self.drainNextTasks();
+            // tick 钩子: 每轮必触发
+            self.drainTick();
             self.drainDeferred();
 
             // 提交 + 阻塞等至少 1 个完成事件
@@ -1176,6 +1184,23 @@ pub const AsyncServer = struct {
     /// - **不应释放** `node.body` — body 由框架负责释放
     pub fn addHookDeferred(self: *Self, hook: *const fn (self: *Self, node: *DeferredNode) void) !void {
         try self.deferred_hooks.append(hook);
+    }
+
+    /// 添加 tick 钩子，每轮 IO 循环必触发（有/无 deferred 节点都跑）。
+    ///
+    /// 可用于倒计时、超时检测、定期广播等独立于 HTTP 请求的周期性逻辑。
+    ///
+    /// **重要提醒：**
+    /// - 钩子**不应 panic**（用 log 记录错误）
+    /// - tick 钩子在 IO 线程执行，应保持轻量（不做重计算，可用 Next.submit 卸货）
+    pub fn addHookTick(self: *Self, hook: *const fn (self: *Self) void) !void {
+        try self.tick_hooks.append(hook);
+    }
+
+    fn drainTick(self: *Self) void {
+        for (self.tick_hooks.items) |hook| {
+            hook(self);
+        }
     }
 
     fn drainDeferred(self: *Self) void {

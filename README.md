@@ -170,8 +170,10 @@ try server.addHookDeferred(updateGameState);
 
 #### Room Auto-Battle Example
 
-Rooms with countdown → auto-battle for hundreds of players. Hook checks deadline, copies data,
-then `Next.submit` runs CPU-heavy battle on worker threads. Zero locks — all state on IO thread.
+Rooms with countdown → auto-battle for hundreds of players. Two hooks cooperate:
+`addHookTick` checks deadlines every loop iteration (no deferred node needed);
+`addHookDeferred` processes incoming player commands.
+Battle CPU work offloaded via `Next.submit`. Zero locks — all state on IO thread.
 
 ```zig
 const Room = struct {
@@ -181,14 +183,9 @@ const Room = struct {
     teams: [2]std.ArrayList(*Player),
 };
 
-const Player = struct {
-    id: u64,
-    hp: u32,
-    atk: u32,
-};
+const Player = struct { id: u64, hp: u32, atk: u32 };
 
 const BattleCtx = struct {
-    // copied from room before submit (lightweight, no deep-clone)
     blue_team: []PlayerSnapshot,
     red_team:  []PlayerSnapshot,
 };
@@ -197,17 +194,19 @@ const PlayerSnapshot = struct { hp: u32, atk: u32 };
 ```
 
 ```zig
-fn roomHook(server: *AsyncServer, node: *DeferredNode) void {
+fn roomTick(server: *AsyncServer) void {
     const app: *GameApp = @ptrCast(@alignCast(server.app_ctx.?));
-    // node.body = player command (join / ready / action)
-    app.processCommand(node.body);
-
     for (app.rooms.items) |*room| {
         if (room.state == .waiting and server.monotonic_ms() >= room.deadline) {
             room.state = .fighting;
             startBattle(server, room);
         }
     }
+}
+
+fn roomCommand(server: *AsyncServer, node: *DeferredNode) void {
+    const app: *GameApp = @ptrCast(@alignCast(server.app_ctx.?));
+    app.processCommand(node.body);  // join / ready / action
 }
 
 fn startBattle(server: *AsyncServer, room: *Room) void {
@@ -218,18 +217,15 @@ fn startBattle(server: *AsyncServer, room: *Room) void {
 }
 
 fn doBattle(ctx: *BattleCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
-    // heavy combat calc — safe on worker thread
     const result = simulateCombat(ctx.blue_team, ctx.red_team);
-
     var buf: [4096]u8 = undefined;
     const json = result.toJson(&buf);
-
-    // push result back to IO thread — lock-free
     server.sendDeferredResponse(room_id, 200, .json, json);
     _ = complete;
 }
 
-try server.addHookDeferred(roomHook);
+try server.addHookTick(roomTick);        // tick: fires every IO loop
+try server.addHookDeferred(roomCommand); // deferred: fires per-player command
 ```
 
 ### Next.go / Next.submit

@@ -168,7 +168,10 @@ try server.addHookDeferred(updateGameState);
 
 #### 房间自动战场示例
 
-倒计时 → 自动开战，支持数百人混战。hook 检查截止时间、复制数据，`Next.submit` 将战斗计算推到线程池。全程零锁——游戏状态都在 IO 线程。
+倒计时 → 自动开战，支持数百人混战。两个钩子协作：
+`addHookTick` 每轮 IO 循环检查截止时间（无需 deferred 节点）；
+`addHookDeferred` 处理玩家指令。
+战斗 CPU 重活通过 `Next.submit` 卸到线程池。全程零锁——游戏状态都在 IO 线程。
 
 ```zig
 const Room = struct {
@@ -178,14 +181,9 @@ const Room = struct {
     teams: [2]std.ArrayList(*Player),
 };
 
-const Player = struct {
-    id: u64,
-    hp: u32,
-    atk: u32,
-};
+const Player = struct { id: u64, hp: u32, atk: u32 };
 
 const BattleCtx = struct {
-    // 在 submit 前从 room 复制的快照（轻量，不做深拷贝）
     blue_team: []PlayerSnapshot,
     red_team:  []PlayerSnapshot,
 };
@@ -194,17 +192,19 @@ const PlayerSnapshot = struct { hp: u32, atk: u32 };
 ```
 
 ```zig
-fn roomHook(server: *AsyncServer, node: *DeferredNode) void {
+fn roomTick(server: *AsyncServer) void {
     const app: *GameApp = @ptrCast(@alignCast(server.app_ctx.?));
-    // node.body = 玩家命令（进房 / 准备 / 操作）
-    app.processCommand(node.body);
-
     for (app.rooms.items) |*room| {
         if (room.state == .waiting and server.monotonic_ms() >= room.deadline) {
             room.state = .fighting;
             startBattle(server, room);
         }
     }
+}
+
+fn roomCommand(server: *AsyncServer, node: *DeferredNode) void {
+    const app: *GameApp = @ptrCast(@alignCast(server.app_ctx.?));
+    app.processCommand(node.body);  // 进房 / 准备 / 操作
 }
 
 fn startBattle(server: *AsyncServer, room: *Room) void {
@@ -215,18 +215,15 @@ fn startBattle(server: *AsyncServer, room: *Room) void {
 }
 
 fn doBattle(ctx: *BattleCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
-    // 重战斗计算 — 安全跑在 worker 线程
     const result = simulateCombat(ctx.blue_team, ctx.red_team);
-
     var buf: [4096]u8 = undefined;
     const json = result.toJson(&buf);
-
-    // 结果推回 IO 线程 — 无锁
     server.sendDeferredResponse(room_id, 200, .json, json);
     _ = complete;
 }
 
-try server.addHookDeferred(roomHook);
+try server.addHookTick(roomTick);        // tick: 每轮 IO 循环必触发
+try server.addHookDeferred(roomCommand); // deferred: 每条玩家指令触发一次
 ```
 
 ### Next.go / Next.submit
