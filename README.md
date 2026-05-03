@@ -148,6 +148,26 @@ resp.json(200, "{\"ok\":true}");
 resp.text(200, "plain");
 ```
 
+### Deferred Hooks
+
+Execute custom logic before each deferred response is sent, on the IO thread.
+Essential for MMORPG / real-time use cases (update game state, leaderboard, broadcast):
+
+```zig
+fn updateGameState(server: *AsyncServer, node: *DeferredNode) void {
+    const world: *GameWorld = @ptrCast(@alignCast(server.app_ctx.?));
+    world.update(node.body);
+}
+
+try server.addHookDeferred(updateGameState);
+```
+
+**Rules:**
+- Hooks run in registration order on the IO thread — safe for IO-thread-exclusive data
+- `node.body` is valid during hook execution; do NOT free it
+- Do NOT store `node` pointer — the node is destroyed after the hook returns
+- Must not panic (log errors instead)
+
 ### Next.go / Next.submit
 
 ```zig

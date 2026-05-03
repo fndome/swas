@@ -93,6 +93,8 @@ pub const AsyncServer = struct {
 
     /// 线程安全：worker 线程通过 CAS push，IO 线程 swap 清空
     deferred_head: ?*DeferredNode align(@alignOf(usize)) = null,
+    /// 钩子列表：在 drainDeferred 发送响应前依次调用（IO 线程内执行）
+    deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
@@ -231,6 +233,7 @@ pub const AsyncServer = struct {
             .listen_fd = fd,
             .next_conn_id = 1,
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
+            .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).init(allocator),
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -285,6 +288,7 @@ pub const AsyncServer = struct {
         if (lrc != 0) logErr("close listen_fd={d} failed: {d}", .{ self.listen_fd, lrc });
 
         self.connections.deinit();
+        self.deferred_hooks.deinit();
         self.submit_registry.deinit();
         self.ring.deinit();
         self.buffer_pool.deinit();
@@ -1162,6 +1166,11 @@ pub const AsyncServer = struct {
         }
     }
 
+    /// 添加 deferred 钩子，在 drainDeferred 发送响应前调用
+    pub fn addHookDeferred(self: *Self, hook: *const fn (self: *Self, node: *DeferredNode) void) !void {
+        try self.deferred_hooks.append(hook);
+    }
+
     fn drainDeferred(self: *Self) void {
         const head = @atomicRmw(?*DeferredNode, &self.deferred_head, .Xchg, null, .acquire);
         var node = head;
@@ -1170,6 +1179,9 @@ pub const AsyncServer = struct {
                 const next = n.next;
                 self.allocator.destroy(n);
                 node = next;
+            }
+            for (self.deferred_hooks.items) |hook| {
+                hook(self, n);
             }
             if (self.connections.getPtr(n.conn_id)) |conn| {
                 self.respondZeroCopy(conn, n.status, n.ct, n.body, "");

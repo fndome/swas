@@ -146,6 +146,26 @@ resp.json(200, "{\"ok\":true}");
 resp.text(200, "plain");
 ```
 
+### Deferred 钩子
+
+在每次延迟响应发送前执行自定义逻辑，跑在 IO 线程上。
+MMORPG / 实时场景必需（更新游戏状态、排行榜、广播）：
+
+```zig
+fn updateGameState(server: *AsyncServer, node: *DeferredNode) void {
+    const world: *GameWorld = @ptrCast(@alignCast(server.app_ctx.?));
+    world.update(node.body);
+}
+
+try server.addHookDeferred(updateGameState);
+```
+
+**规则：**
+- 按注册顺序在 IO 线程执行——可安全访问 IO 线程独占数据
+- `node.body` 在钩子执行期间有效，**禁止释放**
+- **禁止保存** `node` 指针——钩子返回后 node 被销毁
+- 必须不能 panic（用 log 记录错误）
+
 ### Next.go / Next.submit
 
 ```zig
