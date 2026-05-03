@@ -252,11 +252,20 @@ after submitting a kernel, freeing the worker thread to process other tasks whil
 the GPU runs. The worker tick polls parked fibers and resumes when the kernel completes.
 
 ```zig
-// GPU task (runs on worker thread)
+// CPU task — no yield, runs to completion
+Next.submit(CpuCtx, ctx, struct {
+    fn exec(c: *CpuCtx, complete: ...) void {
+        const result = heavyCompute(c.input);
+        complete(c, result);
+    }
+}.exec);
+
+// GPU task — MUST call workerYield after submitting kernel
+//                                 ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 Next.submit(GpuCtx, ctx, struct {
     fn exec(c: *GpuCtx, complete: ...) void {
-        cudaLaunchKernel(kernel, stream, args);   // or aclrtLaunchKernel / vkQueueSubmit
-        Fiber.workerYield(
+        cudaLaunchKernel(kernel, stream, args);
+        Fiber.workerYield(            // ← THIS LINE makes it a GPU task
             struct { fn poll(s: *anyopaque) bool {
                 return cuStreamQuery(@ptrCast(@alignCast(s))) == CUDA_SUCCESS;
             }}.poll,
@@ -268,10 +277,27 @@ Next.submit(GpuCtx, ctx, struct {
 }.exec);
 ```
 
-**IMPORTANT: `initPool4NextSubmit(1)` is sufficient for GPU.**
-One worker thread with fiber can multiplex N concurrent GPU tasks — the thread
-only works during the ~1ms pre/post-processing window, yielding while the GPU computes.
-Multiple workers waste threads (they all just wait on GPU, no CPU work to parallelize).
+**The only difference between CPU and GPU:** GPU tasks call `Fiber.workerYield`.
+Without it, the worker thread blocks synchronously until the kernel completes,
+defeating fiber multiplexing.
+
+> ⚠️ **GPU tasks MUST use `Next.submit`, never `Next.go`.**
+>
+> `Next.go` runs on the IO thread. Two failure modes:
+> - **Without `workerYield`:** `cuStreamSynchronize` blocks the IO thread —
+>   io_uring CQE processing stops, entire server freezes.
+> - **With `workerYield`:** fiber yields correctly, IO thread stays alive — but
+>   the fiber never wakes up. The IO thread has no poll tick; it only responds to
+>   io_uring CQEs. GPU kernels don't produce CQEs, so the IO thread never learns
+>   the kernel finished.
+>
+> Worker threads have a built-in poll tick (`while poll_fn() try resume`) which
+> is why GPU works there: `workerYield` → park → tick → poll → resume.
+
+**IMPORTANT: GPU uses `initPool4NextSubmit(1)`.**
+GPU drivers are async internally — one worker + fiber can submit N streams
+and poll for completion. No extra thread pool needed. io_uring not yet
+supported for GPU compute (kernel driver gap).
 
 ### ClientStream
 

@@ -133,9 +133,9 @@ try server.initPool4NextSubmit(1); // 1 个 worker 线程（推荐）
 ```
 
 **推荐配置：**
-- `1` — 默认，加解密、压缩够用
-- `N/2`（8 核设 4）— 仅持续 LLM CPU 推理时才需要
-- GPU 推理：worker 数量无关（计算在 GPU）
+- `1` — 默认，加解密、压缩、CPU 推理够用
+- `N/2`（8 核设 4）— 持续 CPU 推理或阻塞 I/O
+- GPU 推理：`1` — 目前 GPU 不支持 io_uring，1 个 worker + fiber 即可复用 N 个并发任务
 
 ### DeferredResponse
 
@@ -251,11 +251,20 @@ Worker 池始终支持 fiber。GPU 任务提交 kernel 后调 `Fiber.workerYield
 kernel 完成后自动 resume。
 
 ```zig
-// GPU 任务（跑在 worker 线程）
+// CPU 任务 — 不 yield，跑到结束
+Next.submit(CpuCtx, ctx, struct {
+    fn exec(c: *CpuCtx, complete: ...) void {
+        const result = heavyCompute(c.input);
+        complete(c, result);
+    }
+}.exec);
+
+// GPU 任务 — 提交 kernel 后必须调 workerYield
+//                              ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 Next.submit(GpuCtx, ctx, struct {
     fn exec(c: *GpuCtx, complete: ...) void {
-        cudaLaunchKernel(kernel, stream, args);   // 或 aclrtLaunchKernel / vkQueueSubmit
-        Fiber.workerYield(
+        cudaLaunchKernel(kernel, stream, args);
+        Fiber.workerYield(            // ← 这一行决定它是 GPU 任务
             struct { fn poll(s: *anyopaque) bool {
                 return cuStreamQuery(@ptrCast(@alignCast(s))) == CUDA_SUCCESS;
             }}.poll,
@@ -267,9 +276,24 @@ Next.submit(GpuCtx, ctx, struct {
 }.exec);
 ```
 
-**注意：GPU 场景只需 `initPool4NextSubmit(1)`。**
-一个 worker 线程 + fiber 即可复用处理 N 个并发 GPU 任务——线程只在前后处理的
-~1ms 窗口活跃，GPU 计算期间 yield 让出。多 worker 浪费线程（等 GPU 期间无事可并行）。
+**CPU 与 GPU 的唯一区别：** GPU 任务调 `Fiber.workerYield`。
+不调这行 = worker 线程同步阻塞等 kernel 结束 = fiber 复用失效。
+
+> ⚠️ **GPU 任务只能用 `Next.submit`，禁止用 `Next.go`。**
+>
+> `Next.go` 跑在 IO 线程。两种死法：
+> - **不调 `workerYield`：** `cuStreamSynchronize` 同步阻塞 IO 线程 —
+>   io_uring CQE 停摆，整个服务器冻结。
+> - **调了 `workerYield`：** fiber 正常挂起，IO 线程继续跑 — 但 fiber 永远不醒。
+>   IO 线程没有 poll tick，只响应 io_uring CQE。GPU kernel 不产生 CQE，
+>   所以 IO 线程永远不会知道 kernel 完成了。
+>
+> Worker 线程有内置 poll tick（`while poll_fn() try resume`），GPU 能工作正是
+> 因为这个：`workerYield` → park → tick → poll → resume。
+
+**注意：GPU 推理用 `initPool4NextSubmit(1)`。**
+GPU 驱动内置异步执行，1 个 worker + fiber 即可提交 N 个 stream 并轮询完成，
+无需额外线程池。
 
 ### ClientStream
 
