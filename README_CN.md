@@ -146,7 +146,7 @@ resp.json(200, "{\"ok\":true}");
 resp.text(200, "plain");
 ```
 
-### Deferred 钩子
+### Deferred 钩子、Tick 钩子
 
 在每次延迟响应发送前执行自定义逻辑，跑在 IO 线程上。
 MMORPG / 实时场景必需（更新游戏状态、排行榜、广播）：

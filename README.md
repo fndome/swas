@@ -148,7 +148,7 @@ resp.json(200, "{\"ok\":true}");
 resp.text(200, "plain");
 ```
 
-### Deferred Hooks
+### Deferred Hooks, Tick Hooks
 
 Execute custom logic before each deferred response is sent, on the IO thread.
 Essential for MMORPG / real-time use cases (update game state, leaderboard, broadcast):
