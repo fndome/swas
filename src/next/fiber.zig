@@ -16,13 +16,18 @@ threadlocal var current_context: ?*IoFiber.Context = null;
 /// ── yield/resume 状态 ──
 threadlocal var yielded_fiber: ?*IoFiber.Context = null;
 threadlocal var yielded_result: ?[]const u8 = null;
-threadlocal var saved_call: ?FiberCall = null;
+pub threadlocal var saved_call: ?FiberCall = null;
 threadlocal var yield_seq: u64 = 0;
+
+/// ── worker 线程 parking 状态（transient，fiber.exec 返回后由 workerLoop 读取） ──
+pub threadlocal var parked_ctx: ?*IoFiber.Context = null;
+pub threadlocal var parked_call: ?FiberCall = null;
+pub threadlocal var parked_poll: ?*const fn (*anyopaque) bool = null;
+pub threadlocal var parked_poll_ctx: ?*anyopaque = null;
 
 fn trampoline() void {
     const c = active_call.?;
     c.execFn(c.userCtx, c.complete);
-    // execFn 返回（complete 已被调用，或 handler 的 execFn 已结束）
     var fiber_ctx: IoFiber.Context = undefined;
     _ = IoFiber.contextSwitch(&.{ .old = &fiber_ctx, .new = caller_context.? });
     unreachable;
@@ -52,11 +57,8 @@ pub const Fiber = struct {
         current_context = null;
         active_call = null;
         caller_context = null;
-        // 如果 fiber yield 了，上面 contextSwitch 已经返回
-        // self.context 保存着 fiber 的执行点
     }
 
-    /// 任意代码调用：yield 当前正在执行的 fiber（例如 Pipe reader 等待数据时）
     pub fn currentYield() void {
         const ctx = current_context orelse return;
         yielded_fiber = ctx;
@@ -66,7 +68,6 @@ pub const Fiber = struct {
         _ = IoFiber.contextSwitch(&.{ .old = &tmp, .new = caller_context.? });
     }
 
-    /// fiber 内调用：yield，保存当前执行点，切回 IO 线程
     pub fn yieldCurrent(self: *Fiber) void {
         yielded_fiber = &self.context;
         saved_call = active_call;
@@ -75,7 +76,6 @@ pub const Fiber = struct {
         _ = IoFiber.contextSwitch(&.{ .old = &tmp, .new = caller_context.? });
     }
 
-    /// IO 线程调用：resume 之前 yield 的 fiber，传入结果 data
     pub fn resumeYielded(data: []const u8) void {
         const target = yielded_fiber orelse return;
         yielded_result = data;
@@ -89,9 +89,7 @@ pub const Fiber = struct {
 
         _ = IoFiber.contextSwitch(&.{ .old = &resume_caller, .new = target });
 
-        // fiber 可能已完成，也可能又 yield 了 — 用 yield_seq 区分
         if (yield_seq == seq_before) {
-            // fiber 完成了 — 清理状态
             current_context = null;
             caller_context = null;
             yielded_fiber = null;
@@ -99,13 +97,11 @@ pub const Fiber = struct {
             active_call = null;
             saved_call = null;
         } else {
-            // fiber 又 yield 了 — 保持状态，等下次 resume
             current_context = null;
             caller_context = null;
         }
     }
 
-    /// fiber 内调用：取 resume 时传入的结果
     pub fn yieldResult() ?[]const u8 {
         const r = yielded_result;
         yielded_result = null;
@@ -114,5 +110,22 @@ pub const Fiber = struct {
 
     pub fn isYielded() bool {
         return yielded_fiber != null;
+    }
+
+    /// Worker fiber 内调用：yield 当前 fiber，注册 poll 回调。
+    /// worker 线程的 tick 里周期调 pollFn，返回 true 时 resume 本 fiber。
+    pub fn workerYield(pollFn: *const fn (*anyopaque) bool, pollCtx: *anyopaque) void {
+        parked_poll = pollFn;
+        parked_poll_ctx = pollCtx;
+        currentYield();
+        parked_ctx = yielded_fiber;
+        parked_call = saved_call;
+    }
+
+    /// Worker 线程 tick 调用：resume 一个已保存的 fiber context
+    pub fn resumeContext(ctx: *IoFiber.Context) void {
+        yielded_fiber = ctx;
+        // saved_call should already be set by the caller or stored alongside
+        resumeYielded("");
     }
 };

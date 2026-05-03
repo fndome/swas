@@ -2,7 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
-const ClientRegistry = @import("../client_registry.zig").ClientRegistry;
+const IORegistry = @import("../io_registry.zig").IORegistry;
 
 pub const CLIENT_READ_BUF = 16384;
 
@@ -14,7 +14,7 @@ fn clientDispatch(ptr: *anyopaque, res: i32) void {
 pub const ClientStream = struct {
     allocator: Allocator,
     ring: *linux.IoUring,
-    registry: *ClientRegistry,
+        registry: *IORegistry,
     id: u64,
     fd: i32,
     state: State,
@@ -24,8 +24,8 @@ pub const ClientStream = struct {
     callback_ctx: ?*anyopaque,
 
     read_buf: []u8,
-    connect_addr: linux.sockaddr = undefined,
-    connect_addrlen: u32 = 0,
+    connect_addr: std.net.Address = undefined,
+    _connect_sockaddr: [@sizeOf(linux.sockaddr_storage)]u8 = undefined,
 
     write_buf: std.ArrayList(u8),
     write_offset: usize,
@@ -42,7 +42,7 @@ pub const ClientStream = struct {
     pub fn init(
         allocator: Allocator,
         ring: *linux.IoUring,
-        registry: *ClientRegistry,
+    registry: *IORegistry,
         on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
         on_close: *const fn (ctx: ?*anyopaque) void,
         callback_ctx: ?*anyopaque,
@@ -65,8 +65,7 @@ pub const ClientStream = struct {
             .write_offset = 0,
             .writing = false,
         };
-        // 首次初始化时设置 dispatch 回调，async_server 无需知道 ClientStream 类型
-        registry.dispatch_fn = &clientDispatch;
+        // 已移除此处的 dispatch_fn 设置——register 时传入
         return self;
     }
 
@@ -85,13 +84,10 @@ pub const ClientStream = struct {
     }
 
     pub fn connect(self: *ClientStream, host: []const u8, port: u16) !void {
-        const addr_list = try std.net.getAddressList(self.allocator, host, port);
-        defer addr_list.deinit();
-
-        const addr = addr_list.addrs[0];
+        const addr = try std.net.Address.resolveIp(self.allocator, host, port);
 
         const fd = try std.posix.socket(
-            addr.any.family,
+            @intFromEnum(addr.getFamily()),
             linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
             0,
         );
@@ -99,13 +95,12 @@ pub const ClientStream = struct {
 
         self.fd = fd;
         self.id = self.registry.allocUserData();
-        self.connect_addr = addr.any;
-        self.connect_addrlen = addr.getOsSockLen();
+        self.connect_addr = addr;
 
-        try self.registry.register(self.id, @ptrCast(self));
+        try self.registry.register(self.id, @ptrCast(self), &clientDispatch);
         self.state = .connecting;
 
-        _ = std.posix.connect(fd, addr.any, addr.getOsSockLen()) catch |e| {
+        _ = std.posix.connect(fd, addr) catch |e| {
             if (e != error.WouldBlock) return e;
         };
         try self.submitPollOut();
@@ -115,8 +110,11 @@ pub const ClientStream = struct {
         const sqe = self.ring.nop(self.id);
         sqe.opcode = .IORING_OP_CONNECT;
         sqe.fd = self.fd;
-        sqe.addr = @intFromPtr(&self.connect_addr);
-        sqe.off = self.connect_addrlen;
+        // Copy sockaddr to struct-local buffer so io_uring can read it async
+        const sock_addr = self.connect_addr.toSockAddr();
+        @memcpy(self._connect_sockaddr[0..sock_addr.len], sock_addr.bytes[0..sock_addr.len]);
+        sqe.addr = @intFromPtr(&self._connect_sockaddr);
+        sqe.off = self.connect_addr.getOsSockLen();
     }
 
     pub fn write(self: *ClientStream, data: []const u8) !void {

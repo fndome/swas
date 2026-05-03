@@ -11,7 +11,7 @@ IO thread (io_uring + fiber):
   ├── drain Next.go() ringbuffer tasks
   └── drain DeferredResponse → respond
 
-Worker pool (optional, CPU-heavy only):
+Worker pool (optional, offload CPU/GPU/blocking I/O):
   └── Next.submit() → worker thread → compute → DeferredResponse → IO thread drains
 ```
 
@@ -106,7 +106,7 @@ fn myHandler(allocator: Allocator, ctx: *Context) anyerror!void {
 
 ### Handler — `Next.submit` (worker pool, thread switch)
 
-For CPU-heavy work (crypto, compression, LLM inference):
+For offload work (crypto, compression, LLM/GPU inference, blocking I/O):
 
 ```zig
 const Ctx = struct { allocator: Allocator, resp: *DeferredResponse };
@@ -114,7 +114,7 @@ const Ctx = struct { allocator: Allocator, resp: *DeferredResponse };
 fn exec(c: *Ctx, complete: *const fn (?*anyopaque, []const u8) void) void {
     defer c.allocator.destroy(c);
     defer c.allocator.destroy(c.resp);
-    // CPU-heavy work here...
+    // Offload work here (CPU/GPU/blocking I/O)...
     c.resp.json(200, "{\"done\": true}");
     complete(c, "");
 }
@@ -136,8 +136,7 @@ try server.initPool4NextSubmit(1); // 1 worker thread (recommended)
 
 **Recommendations:**
 - `1` — default, sufficient for crypto, compression
-- `N/2` (e.g. 4 on 8-core) — sustained LLM CPU inference
-- GPU inference: worker count irrelevant (GPU handles compute)
+- `N/2` (e.g. 4 on 8-core) — sustained LLM/GPU inference or blocking I/O
 
 ### DeferredResponse
 
@@ -232,10 +231,47 @@ try server.addHookDeferred(roomCommand); // deferred: fires per-player command
 
 ```zig
 Next.go(Ctx, ctx, exec);       // fiber on IO thread (io_uring I/O)
-Next.submit(Ctx, ctx, exec);   // worker pool (CPU-heavy)
+Next.submit(Ctx, ctx, exec);   // worker pool (offload work)
 ```
 
 Both are static. `Next.go` works out of the box (auto `setDefault` on first route). `Next.submit` requires `server.initPool4NextSubmit(n)`.
+
+#### GPU / Heavy Compute
+
+GPU compute uses `Next.submit` — worker thread calls CUDA / CANN / Vulkan runtime.
+io_uring direct dispatch for GPU is blocked on Linux kernel drivers (missing
+`IORING_OP_URING_CMD` for compute queues, NVIDIA / Huawei not yet shipped).
+
+Once drivers add it, `IORegistry` handles GPU with zero code changes —
+same `register(id, ptr, on_cqe)` → submit SQE → dispatch CQE pattern.
+
+**Current: fiber + worker pool**
+
+Worker pool always supports fiber. GPU task calls `Fiber.workerYield(poll, ctx)`
+after submitting a kernel, freeing the worker thread to process other tasks while
+the GPU runs. The worker tick polls parked fibers and resumes when the kernel completes.
+
+```zig
+// GPU task (runs on worker thread)
+Next.submit(GpuCtx, ctx, struct {
+    fn exec(c: *GpuCtx, complete: ...) void {
+        cudaLaunchKernel(kernel, stream, args);   // or aclrtLaunchKernel / vkQueueSubmit
+        Fiber.workerYield(
+            struct { fn poll(s: *anyopaque) bool {
+                return cuStreamQuery(@ptrCast(@alignCast(s))) == CUDA_SUCCESS;
+            }}.poll,
+            @ptrCast(stream),
+        );
+        // resume point — GPU done
+        complete(c, output);
+    }
+}.exec);
+```
+
+**IMPORTANT: `initPool4NextSubmit(1)` is sufficient for GPU.**
+One worker thread with fiber can multiplex N concurrent GPU tasks — the thread
+only works during the ~1ms pre/post-processing window, yielding while the GPU computes.
+Multiple workers waste threads (they all just wait on GPU, no CPU work to parallelize).
 
 ### ClientStream
 
@@ -256,7 +292,7 @@ fn onClose(ctx: ?*anyopaque) void {
 }
 
 // Create + connect
-var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, nats_ctx);
+var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, nats_ctx);
 defer cs.deinit();
 try cs.connect("127.0.0.1", 4222);
 

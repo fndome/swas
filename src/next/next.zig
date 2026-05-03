@@ -20,6 +20,30 @@ const PoolTask = struct {
     alloc: Allocator,
 };
 
+const ParkedTask = struct {
+    fiber_ctx: std.Io.fiber.Context,
+    task: *PoolTask,
+    poll_fn: *const fn (*anyopaque) bool,
+    poll_ctx: *anyopaque,
+};
+
+const FIBER_STACK: u32 = 65536;
+
+fn makeFiberCall(task: *PoolTask) @import("fiber.zig").FiberCall {
+    return .{
+        .userCtx = @ptrCast(task),
+        .complete = struct {
+            fn done(_: ?*anyopaque, _: []const u8) void {}
+        }.done,
+        .execFn = struct {
+            fn run(c: ?*anyopaque, _: *const fn (?*anyopaque, []const u8) void) void {
+                const t: *PoolTask = @ptrCast(@alignCast(c));
+                t.exec(t.ctx, t.alloc);
+            }
+        }.run,
+    };
+}
+
 const WorkerPool = struct {
     allocator: Allocator,
     workers: []std.Thread,
@@ -63,9 +87,7 @@ const WorkerPool = struct {
         self.acquire();
         @atomicStore(bool, &self.stop, true, .release);
         self.release();
-        // Drain remaining tasks: exec+free user ctx, then destroy task
         while (self.pop()) |task| {
-            task.exec(task.ctx, task.alloc);
             self.allocator.destroy(task);
         }
         for (self.workers) |w| w.join();
@@ -97,17 +119,78 @@ const WorkerPool = struct {
     }
 
     fn workerLoop(pool: *WorkerPool, _: u8) void {
+        var parked = std.ArrayList(ParkedTask).empty;
+
         while (true) {
             if (@atomicLoad(bool, &pool.stop, .acquire)) return;
+
+            var i: usize = 0;
+            while (i < parked.items.len) {
+                if (parked.items[i].poll_fn(parked.items[i].poll_ctx)) {
+                    var pt = parked.swapRemove(i);
+                    resumeParked(pool, &pt, &parked);
+                } else {
+                    i += 1;
+                }
+            }
+
             if (pool.pop()) |task| {
-                task.exec(task.ctx, task.alloc);
-                pool.allocator.destroy(task);
+                runTask(pool, task, &parked);
             } else {
                 std.Thread.yield() catch {};
             }
         }
     }
 };
+
+fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask)) void {
+    var stack: [FIBER_STACK]u8 = undefined;
+    var fiber = Fiber.init(&stack);
+    const call = makeFiberCall(task);
+    fiber.exec(call);
+
+    if (Fiber.isYielded()) {
+        const ctx = @import("fiber.zig").parked_ctx orelse return;
+        const poll = @import("fiber.zig").parked_poll orelse return;
+        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse return;
+        parked.append(pool.allocator, .{
+            .fiber_ctx = ctx.*,
+            .task = task,
+            .poll_fn = poll,
+            .poll_ctx = poll_ctx,
+        }) catch {
+            @import("fiber.zig").saved_call = call;
+            Fiber.resumeContext(ctx);
+        };
+        @import("fiber.zig").parked_ctx = null;
+        @import("fiber.zig").parked_poll = null;
+        @import("fiber.zig").parked_poll_ctx = null;
+    } else {
+        pool.allocator.destroy(task);
+    }
+}
+
+fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(ParkedTask)) void {
+    @import("fiber.zig").saved_call = makeFiberCall(pt.task);
+    Fiber.resumeContext(&pt.fiber_ctx);
+
+    if (Fiber.isYielded()) {
+        const ctx = @import("fiber.zig").parked_ctx orelse return;
+        const poll = @import("fiber.zig").parked_poll orelse return;
+        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse return;
+        parked.append(pool.allocator, .{
+            .fiber_ctx = ctx.*,
+            .task = pt.task,
+            .poll_fn = poll,
+            .poll_ctx = poll_ctx,
+        }) catch {};
+        @import("fiber.zig").parked_ctx = null;
+        @import("fiber.zig").parked_poll = null;
+        @import("fiber.zig").parked_poll_ctx = null;
+    } else {
+        pool.allocator.destroy(pt.task);
+    }
+}
 
 /// ── Next ──────────────────────────────────────────────────
 pub const Next = struct {
@@ -136,8 +219,8 @@ pub const Next = struct {
         self.allocator.destroy(self.ringbuffer);
     }
 
-    /// 初始化线程池，供 Next.submit 使用。0=默认1。
     pub fn initPool4NextSubmit(self: *Next, count: u8) !void {
+        if (self.pool != null) return;
         const n = if (count == 0) @as(u8, 1) else count;
         const p = try self.allocator.create(WorkerPool);
         errdefer self.allocator.destroy(p);
@@ -145,12 +228,10 @@ pub const Next = struct {
         self.pool = p;
     }
 
-    /// 设为默认实例，之后可调用 Next.go / Next.submit
     pub fn setDefault(self: *Next) void {
         @atomicStore(?*Next, &default_next, self, .release);
     }
 
-    /// 静态方法——CPU 密集型：使用线程池执行
     pub fn submit(
         comptime T: type,
         ctx: T,
@@ -187,40 +268,11 @@ pub const Next = struct {
             return;
         }
 
-        // Fallback: no pool, spawn thread directly
-        const Tctx = struct {
-            allocator: Allocator,
-            user: *T,
-        };
-        const tc = n.allocator.create(Tctx) catch {
-            n.allocator.destroy(user);
-            return;
-        };
-        tc.* = .{ .allocator = n.allocator, .user = user };
-
-        const t = std.Thread.spawn(.{}, struct {
-            fn run(c: *Tctx) void {
-                defer c.allocator.destroy(c);
-                defer c.allocator.destroy(c.user);
-                const complete = struct {
-                    fn done(_: ?*anyopaque, _: []const u8) void {}
-                }.done;
-                execFn(c.user, complete);
-            }
-        }.run, .{tc}) catch {
-            n.allocator.destroy(tc);
-            n.allocator.destroy(user);
-            std.log.err("Next.submit: failed to spawn thread", .{});
-            return;
-        };
-        n.submit_threads.append(n.allocator, t) catch {
-            t.join();
-            std.log.err("Next.submit: failed to track thread, joined immediately", .{});
-        };
+        // No pool — log error, destroy user ctx
+        std.log.err("Next.submit: no worker pool configured. Call initPool4NextSubmit(n) first.", .{});
+        n.allocator.destroy(user);
     }
 
-    /// 静态方法——IO 线程 fiber 执行（类似 goroutine）
-    /// 不切线程，推 ringbuffer → IO 线程 drain → fiber 里执行 execFn
     pub fn go(
         comptime T: type,
         ctx: T,
@@ -233,7 +285,6 @@ pub const Next = struct {
         n.push(T, ctx, execFn, n.default_stack_size);
     }
 
-    /// 静态方法 + 自定义 fiber 栈大小（同 Next.go，IO 线程 fiber）
     pub fn goWithStackConfigurable(
         comptime T: type,
         ctx: T,
@@ -282,19 +333,15 @@ pub const Next = struct {
                     }
 
                     var temp_fiber = Fiber.init(stack);
-
-                    const adapter = struct {
-                        fn call(ptr: ?*anyopaque, c: *const fn (?*anyopaque, []const u8) void) void {
-                            execFn(@ptrCast(@alignCast(ptr)), c);
-                        }
-                    }.call;
-
                     temp_fiber.exec(.{
                         .userCtx = u,
                         .complete = complete,
-                        .execFn = adapter,
+                        .execFn = struct {
+                            fn call(ptr: ?*anyopaque, c: *const fn (?*anyopaque, []const u8) void) void {
+                                execFn(@ptrCast(@alignCast(ptr)), c);
+                            }
+                        }.call,
                     });
-
                 }
             }.exec,
             .on_complete = struct {

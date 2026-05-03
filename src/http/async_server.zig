@@ -10,8 +10,8 @@ const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
 const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
 const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
 const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
-const CLIENT_USER_DATA_FLAG = @import("../client_registry.zig").CLIENT_USER_DATA_FLAG;
-const ClientRegistry = @import("../client_registry.zig").ClientRegistry;
+const CLIENT_USER_DATA_FLAG = @import("../io_registry.zig").CLIENT_USER_DATA_FLAG;
+const IORegistry = @import("../io_registry.zig").IORegistry;
 
 const USER_TASK_BATCH = constants.USER_TASK_BATCH;
 const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
@@ -101,7 +101,7 @@ pub const AsyncServer = struct {
     tick_hooks: std.ArrayList(*const fn (self: *Self) void),
 
     /// 客户端出站连接注册表（io_uring TCP client）
-    client_registry: ClientRegistry,
+    io_registry: IORegistry,
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
@@ -242,7 +242,7 @@ pub const AsyncServer = struct {
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
             .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
-            .client_registry = ClientRegistry.init(allocator),
+            .io_registry = IORegistry.init(allocator),
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -299,7 +299,7 @@ pub const AsyncServer = struct {
         self.connections.deinit();
         self.deferred_hooks.deinit(self.allocator);
         self.tick_hooks.deinit(self.allocator);
-        self.client_registry.deinit();
+        self.io_registry.deinit();
         self.submit_registry.deinit();
         self.ring.deinit();
         self.buffer_pool.deinit();
@@ -972,7 +972,7 @@ pub const AsyncServer = struct {
                 self.onAcceptComplete(res, user_data);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
                 defer self.ring.cqe_seen(&cqes[i]);
-                self.client_registry.dispatch(user_data, res);
+                self.io_registry.dispatch(user_data, res);
             } else {
                 const conn_id = user_data;
                 const conn = self.connections.getPtr(conn_id) orelse {
