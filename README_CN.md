@@ -312,7 +312,7 @@ fn onClose(ctx: ?*anyopaque) void {
     nats.discard();
 }
 
-// 创建 + 连接
+// 在 main() 里，server.run() 之前：
 var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, nats_ctx);
 defer cs.deinit();
 try cs.connect("127.0.0.1", 4222);
@@ -334,14 +334,21 @@ cs.close();  // 优雅关闭
 无需 worker 线程，全程零锁。
 
 ```zig
+// 在 main() 里，AsyncServer.init() 之后、server.run() 之前：
 const Pipe = @import("swas").Pipe;
+const ClientStream = @import("swas").ClientStream;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const p: *Pipe = @ptrCast(@alignCast(ctx));
     p.feed(data) catch {};
 }
 
-var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, &pipe);
+fn onClose(ctx: ?*anyopaque) void {
+    const p: *Pipe = @ptrCast(@alignCast(ctx));
+    p.reset();
+}
+
+var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, &pipe);
 var pipe = try Pipe.init(allocator, cs);
 defer pipe.deinit();
 

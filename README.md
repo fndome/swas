@@ -317,7 +317,7 @@ fn onClose(ctx: ?*anyopaque) void {
     nats.discard();
 }
 
-// Create + connect
+// In main(), before server.run():
 var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, nats_ctx);
 defer cs.deinit();
 try cs.connect("127.0.0.1", 4222);
@@ -339,21 +339,28 @@ Enables synchronous-protocol libraries (pgz, myzql) to run directly on the IO th
 via fiber yield/resume — no worker threads, no locks.
 
 ```zig
+// In main(), after AsyncServer.init() and before server.run():
 const Pipe = @import("swas").Pipe;
+const ClientStream = @import("swas").ClientStream;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const p: *Pipe = @ptrCast(@alignCast(ctx));
     p.feed(data) catch {};
 }
 
-var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, &pipe);
+fn onClose(ctx: ?*anyopaque) void {
+    const p: *Pipe = @ptrCast(@alignCast(ctx));
+    p.reset();
+}
+
+var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, &pipe);
 var pipe = try Pipe.init(allocator, cs);
 defer pipe.deinit();
 
 try cs.connect("localhost", 5432);
 // ... wait for connect (yield) ...
 
-// Now any protocol lib with anytype reader/writer works:
+// Any protocol lib with anytype reader/writer works:
 // var conn = try pgz.Connection.init(allocator, pipe.reader(), pipe.writer());
 // var result = try conn.query("SELECT 1", struct { u8 });
 ```
