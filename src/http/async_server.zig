@@ -1166,7 +1166,14 @@ pub const AsyncServer = struct {
         }
     }
 
-    /// 添加 deferred 钩子，在 drainDeferred 发送响应前调用
+    /// 添加 deferred 钩子，在 drainDeferred 发送响应前调用。
+    ///
+    /// 钩子按注册顺序在 IO 线程执行，可安全访问 IO 线程独占数据。
+    ///
+    /// **重要提醒：**
+    /// - 钩子**不应 panic**（用 log 记录错误）
+    /// - **不应保存** `node` 指针引用 — 钩子返回后 node 被销毁
+    /// - **不应释放** `node.body` — body 由框架负责释放
     pub fn addHookDeferred(self: *Self, hook: *const fn (self: *Self, node: *DeferredNode) void) !void {
         try self.deferred_hooks.append(hook);
     }

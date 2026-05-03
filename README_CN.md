@@ -166,6 +166,69 @@ try server.addHookDeferred(updateGameState);
 - **禁止保存** `node` 指针——钩子返回后 node 被销毁
 - 必须不能 panic（用 log 记录错误）
 
+#### 房间自动战场示例
+
+倒计时 → 自动开战，支持数百人混战。hook 检查截止时间、复制数据，`Next.submit` 将战斗计算推到线程池。全程零锁——游戏状态都在 IO 线程。
+
+```zig
+const Room = struct {
+    id: u64,
+    state: enum { waiting, fighting, settle },
+    deadline: i64,                  // 单调时间戳
+    teams: [2]std.ArrayList(*Player),
+};
+
+const Player = struct {
+    id: u64,
+    hp: u32,
+    atk: u32,
+};
+
+const BattleCtx = struct {
+    // 在 submit 前从 room 复制的快照（轻量，不做深拷贝）
+    blue_team: []PlayerSnapshot,
+    red_team:  []PlayerSnapshot,
+};
+
+const PlayerSnapshot = struct { hp: u32, atk: u32 };
+```
+
+```zig
+fn roomHook(server: *AsyncServer, node: *DeferredNode) void {
+    const app: *GameApp = @ptrCast(@alignCast(server.app_ctx.?));
+    // node.body = 玩家命令（进房 / 准备 / 操作）
+    app.processCommand(node.body);
+
+    for (app.rooms.items) |*room| {
+        if (room.state == .waiting and server.monotonic_ms() >= room.deadline) {
+            room.state = .fighting;
+            startBattle(server, room);
+        }
+    }
+}
+
+fn startBattle(server: *AsyncServer, room: *Room) void {
+    const ctx = server.allocator.create(BattleCtx) catch return;
+    ctx.blue_team = snapshotTeam(&room.teams[0], server.allocator) catch return;
+    ctx.red_team  = snapshotTeam(&room.teams[1], server.allocator) catch return;
+    Next.submit(BattleCtx, ctx, doBattle);
+}
+
+fn doBattle(ctx: *BattleCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
+    // 重战斗计算 — 安全跑在 worker 线程
+    const result = simulateCombat(ctx.blue_team, ctx.red_team);
+
+    var buf: [4096]u8 = undefined;
+    const json = result.toJson(&buf);
+
+    // 结果推回 IO 线程 — 无锁
+    server.sendDeferredResponse(room_id, 200, .json, json);
+    _ = complete;
+}
+
+try server.addHookDeferred(roomHook);
+```
+
 ### Next.go / Next.submit
 
 ```zig
