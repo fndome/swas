@@ -235,6 +235,70 @@ Next.submit(Ctx, ctx, exec);   // 线程池（CPU 重活）
 
 都是静态方法。`Next.go` 开箱即用（首次路由自动 `setDefault`）。`Next.submit` 需要 `server.initPool4NextSubmit(n)`。
 
+### ClientStream
+
+基于 io_uring 的出站 TCP 客户端胶水层。用于将 NATS / Redis / HTTP client 等第三方库集成到 swas 的 IO 线程——无需独立运行时，全程零锁。
+
+```zig
+const ClientStream = @import("swas").ClientStream;
+
+fn onData(ctx: ?*anyopaque, data: []u8) void {
+    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
+    nats.feed(data);
+}
+
+fn onClose(ctx: ?*anyopaque) void {
+    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
+    nats.discard();
+}
+
+// 创建 + 连接
+var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, nats_ctx);
+defer cs.deinit();
+try cs.connect("127.0.0.1", 4222);
+
+// 发送数据（排队，经由 io_uring 异步发送）
+try cs.write("PUB subject 5\r\nhello\r\n");
+cs.close();  // 优雅关闭
+```
+
+- 所有 I/O 跑在 swas IO 线程 — `onData` / `onClose` 与 hook 在同一上下文执行
+- `write()` 排队发送；待发数据在 io_uring CQE 到达时自动冲刷
+- 协议层（NATS / Redis / HTTP）只需实现 `feed([]u8)` 和 `write([]const u8)`
+- 支持多个 client 实例；user_data 用专属高位 bit 避免碰撞
+
+### Pipe
+
+将 ClientStream 的推模型适配为拉模型（`reader.read` / `writer.write`）。
+使同步风格的协议库（pgz、myzql）通过 fiber yield/resume 直接跑在 IO 线程——
+无需 worker 线程，全程零锁。
+
+```zig
+const Pipe = @import("swas").Pipe;
+
+fn onData(ctx: ?*anyopaque, data: []u8) void {
+    const p: *Pipe = @ptrCast(@alignCast(ctx));
+    p.feed(data) catch {};
+}
+
+var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, &pipe);
+var pipe = try Pipe.init(allocator, cs);
+defer pipe.deinit();
+
+try cs.connect("localhost", 5432);
+// ... wait for connect (yield) ...
+
+// 任何接受 anytype reader/writer 的协议库直接可用：
+// var conn = try pgz.Connection.init(allocator, pipe.reader(), pipe.writer());
+// var result = try conn.query("SELECT 1", struct { u8 });
+```
+
+- `feed(data)` 将 ClientStream 字节推入读缓冲区，唤醒等待中的 fiber
+- `reader.read()` 在无数据时通过 fiber yield 挂起——对调用方表现为同步阻塞
+- `writer.write()` 写入缓冲区；`flushWrite()` 通过 ClientStream 发出
+- `reset()` 在断开/重连时清空缓冲区
+- 要求协议库接受 `anytype` reader/writer（pgz 需改 `WriteBuffer.send` 一行）
+
 ### Fiber
 
 swas 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享一块预分配栈**——顺序执行，无 per-request 分配，零竞争。

@@ -10,6 +10,8 @@ const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
 const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
 const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
 const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
+const CLIENT_USER_DATA_FLAG = @import("../client_registry.zig").CLIENT_USER_DATA_FLAG;
+const ClientRegistry = @import("../client_registry.zig").ClientRegistry;
 
 const USER_TASK_BATCH = constants.USER_TASK_BATCH;
 const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
@@ -97,6 +99,9 @@ pub const AsyncServer = struct {
     deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
     /// tick 钩子列表：每轮 IO 循环必触发（有/无 deferred 节点都跑）
     tick_hooks: std.ArrayList(*const fn (self: *Self) void),
+
+    /// 客户端出站连接注册表（io_uring TCP client）
+    client_registry: ClientRegistry,
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
@@ -235,8 +240,9 @@ pub const AsyncServer = struct {
             .listen_fd = fd,
             .next_conn_id = 1,
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
-            .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).init(allocator),
-            .tick_hooks = std.ArrayList(*const fn (self: *Self) void).init(allocator),
+            .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
+            .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
+            .client_registry = ClientRegistry.init(allocator),
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -291,8 +297,9 @@ pub const AsyncServer = struct {
         if (lrc != 0) logErr("close listen_fd={d} failed: {d}", .{ self.listen_fd, lrc });
 
         self.connections.deinit();
-        self.deferred_hooks.deinit();
-        self.tick_hooks.deinit();
+        self.deferred_hooks.deinit(self.allocator);
+        self.tick_hooks.deinit(self.allocator);
+        self.client_registry.deinit();
         self.submit_registry.deinit();
         self.ring.deinit();
         self.buffer_pool.deinit();
@@ -963,6 +970,9 @@ pub const AsyncServer = struct {
             if (user_data == ACCEPT_USER_DATA) {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
+            } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
+                defer self.ring.cqe_seen(&cqes[i]);
+                self.client_registry.dispatch(user_data, res);
             } else {
                 const conn_id = user_data;
                 const conn = self.connections.getPtr(conn_id) orelse {
@@ -1183,7 +1193,7 @@ pub const AsyncServer = struct {
     /// - **不应保存** `node` 指针引用 — 钩子返回后 node 被销毁
     /// - **不应释放** `node.body` — body 由框架负责释放
     pub fn addHookDeferred(self: *Self, hook: *const fn (self: *Self, node: *DeferredNode) void) !void {
-        try self.deferred_hooks.append(hook);
+        try self.deferred_hooks.append(self.allocator, hook);
     }
 
     /// 添加 tick 钩子，每轮 IO 循环必触发（有/无 deferred 节点都跑）。
@@ -1194,7 +1204,7 @@ pub const AsyncServer = struct {
     /// - 钩子**不应 panic**（用 log 记录错误）
     /// - tick 钩子在 IO 线程执行，应保持轻量（不做重计算，可用 Next.submit 卸货）
     pub fn addHookTick(self: *Self, hook: *const fn (self: *Self) void) !void {
-        try self.tick_hooks.append(hook);
+        try self.tick_hooks.append(self.allocator, hook);
     }
 
     fn drainTick(self: *Self) void {

@@ -24,6 +24,14 @@ pub const Next = @import("next/next.zig").Next;
 /// 同一范式适用于 DB、Redis、NATS、HTTP Client。
 pub const Fiber = @import("next/fiber.zig").Fiber;
 
+/// IO 线程 TCP 出站客户端（io_uring 驱动），用于集成 NATS / Redis / HTTP client 等
+pub const ClientStream = @import("next/client.zig").ClientStream;
+/// ClientStream 注册表，供 AsyncServer 和 ClientStream 共用
+pub const ClientRegistry = @import("client_registry.zig").ClientRegistry;
+/// 将 ClientStream 推模型适配为读写拉模型（通过 fiber yield/resume），
+/// 使同步风格的协议库（pgz/myqzl 等）可直接跑在 IO 线程
+pub const Pipe = @import("next/pipe.zig").Pipe;
+
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {
         const q = try server.allocator.create(SubmitQueue);

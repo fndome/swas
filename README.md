@@ -237,6 +237,71 @@ Next.submit(Ctx, ctx, exec);   // worker pool (CPU-heavy)
 
 Both are static. `Next.go` works out of the box (auto `setDefault` on first route). `Next.submit` requires `server.initPool4NextSubmit(n)`.
 
+### ClientStream
+
+io_uring-driven outbound TCP client. Glue layer for integrating NATS / Redis / HTTP client
+libraries into swas's IO thread — no separate runtime, no locks.
+
+```zig
+const ClientStream = @import("swas").ClientStream;
+
+fn onData(ctx: ?*anyopaque, data: []u8) void {
+    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
+    nats.feed(data);
+}
+
+fn onClose(ctx: ?*anyopaque) void {
+    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
+    nats.discard();
+}
+
+// Create + connect
+var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, nats_ctx);
+defer cs.deinit();
+try cs.connect("127.0.0.1", 4222);
+
+// Send data (queued, submitted via io_uring)
+try cs.write("PUB subject 5\r\nhello\r\n");
+cs.close();  // graceful
+```
+
+- All I/O on swas IO thread — `onData` / `onClose` run in the same context as hooks
+- `write()` queues data; pending writes auto-flushed as io_uring CQEs arrive
+- Protocol layer (NATS / Redis / HTTP) only needs `feed([]u8)` and `write([]const u8)`
+- Multiple clients per server; user_data uses a dedicated high bit to avoid collisions
+
+### Pipe
+
+Adapts ClientStream's push model to a pull model (`reader.read` / `writer.write`).
+Enables synchronous-protocol libraries (pgz, myzql) to run directly on the IO thread
+via fiber yield/resume — no worker threads, no locks.
+
+```zig
+const Pipe = @import("swas").Pipe;
+
+fn onData(ctx: ?*anyopaque, data: []u8) void {
+    const p: *Pipe = @ptrCast(@alignCast(ctx));
+    p.feed(data) catch {};
+}
+
+var cs = try ClientStream.init(allocator, &server.ring, &server.client_registry, onData, onClose, &pipe);
+var pipe = try Pipe.init(allocator, cs);
+defer pipe.deinit();
+
+try cs.connect("localhost", 5432);
+// ... wait for connect (yield) ...
+
+// Now any protocol lib with anytype reader/writer works:
+// var conn = try pgz.Connection.init(allocator, pipe.reader(), pipe.writer());
+// var result = try conn.query("SELECT 1", struct { u8 });
+```
+
+- `feed(data)` pushes bytes from ClientStream → read buffer, resumes waiting fiber
+- `reader.read()` blocks the fiber (via yield) until data arrives — looks synchronous to caller
+- `writer.write()` queues into buffer; `flushWrite()` sends via ClientStream
+- `reset()` clears buffers on disconnect/reconnect
+- Requires protocol library to accept `anytype` reader/writer (pgz needs 1-line patch on `WriteBuffer.send`)
+
 ### Fiber
 
 Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre-allocated stack buffer** — sequential execution, no per-request stack allocation, zero contention.
