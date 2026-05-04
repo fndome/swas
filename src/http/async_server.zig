@@ -87,12 +87,24 @@ fn executeUserComplete(caller_ctx: ?*anyopaque, data: []const u8) void {
 }
 
 const DeferredNode = struct {
-    next: ?*DeferredNode,
+    server: *AsyncServer,
     conn_id: u64,
     status: u16,
     ct: Context.ContentType,
     body: []u8,
 };
+
+fn deferredRespond(allocator: Allocator, node: *DeferredNode) void {
+    const self = node.server;
+    for (self.deferred_hooks.items) |hook| {
+        hook(self, node);
+    }
+    if (self.connections.getPtr(node.conn_id)) |conn| {
+        self.respondZeroCopy(conn, node.status, node.ct, node.body, "");
+    } else {
+        allocator.free(node.body);
+    }
+}
 
 pub const AsyncServer = struct {
     allocator: Allocator,
@@ -121,11 +133,9 @@ pub const AsyncServer = struct {
 
     cfg: Config,
 
-    /// 线程安全：worker 线程通过 CAS push，IO 线程 swap 清空
-    deferred_head: ?*DeferredNode align(@alignOf(usize)) = null,
     /// 通用跨线程 IO 回调队列
     invoke_queue: InvokeQueue,
-    /// 钩子列表：在 drainDeferred 发送响应前依次调用（IO 线程内执行）
+    /// 钩子列表：在 deferred 响应发送前依次调用（IO 线程内执行）
     deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
     /// tick 钩子列表：每轮 IO 循环必触发（有/无 deferred 节点都跑）
     tick_hooks: std.ArrayList(*const fn (self: *Self) void),
@@ -319,15 +329,6 @@ pub const AsyncServer = struct {
 
         self.invoke_queue.drain(self.allocator);
 
-        // Drain any pending deferred responses (worker threads already joined)
-        var node = @atomicRmw(?*DeferredNode, &self.deferred_head, .Xchg, null, .acquire);
-        while (node) |n| {
-            self.allocator.free(n.body);
-            const next = n.next;
-            self.allocator.destroy(n);
-            node = next;
-        }
-
         var it = self.connections.iterator();
 
         while (it.next()) |entry| {
@@ -508,23 +509,6 @@ pub const AsyncServer = struct {
         comptime execFn: fn (allocator: Allocator, ctx_ptr: *T) void,
     ) !void {
         try self.invoke_queue.push(self.allocator, T, ctx, execFn);
-    }
-
-    pub fn createClientStream(
-        self: *Self,
-        on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
-        on_close: *const fn (ctx: ?*anyopaque) void,
-        callback_ctx: ?*anyopaque,
-    ) !*@import("../next/client.zig").ClientStream {
-        return @import("../next/client.zig").ClientStream.init(
-            self.allocator,
-            &self.ring,
-            &self.io_registry,
-            on_data,
-            on_close,
-            callback_ctx,
-            &self.dns_resolver,
-        );
     }
 
     fn nextUserData(self: *Self) u64 {
@@ -997,8 +981,6 @@ pub const AsyncServer = struct {
                 self.drainNextTasks();
                 // tick 钩子: 每轮必触发（倒计时、超时检测等）
                 self.drainTick();
-                // worker 线程异步回调
-                self.drainDeferred();
                 // 处理中可能产生新 SQE → 下一轮 submit 带出去
                 continue;
             }
@@ -1021,7 +1003,6 @@ pub const AsyncServer = struct {
             self.drainNextTasks();
             // tick 钩子: 每轮必触发
             self.drainTick();
-            self.drainDeferred();
 
             // 提交 + 阻塞等至少 1 个完成事件
             _ = try self.ring.submit_and_wait(1);
@@ -1256,19 +1237,19 @@ pub const AsyncServer = struct {
     }
 
     pub fn sendDeferredResponse(self: *Self, conn_id: u64, status: u16, ct: Context.ContentType, body: []u8) void {
-        const node = self.allocator.create(DeferredNode) catch {
-            self.allocator.free(body);
-            return;
+        const node = DeferredNode{
+            .server = self,
+            .conn_id = conn_id,
+            .status = status,
+            .ct = ct,
+            .body = body,
         };
-        node.* = .{ .next = null, .conn_id = conn_id, .status = status, .ct = ct, .body = body };
-        var head = @atomicLoad(?*DeferredNode, &self.deferred_head, .monotonic);
-        while (true) {
-            node.next = head;
-            head = @cmpxchgWeak(?*DeferredNode, &self.deferred_head, head, node, .release, .monotonic) orelse break;
-        }
+        self.invokeOnIoThread(DeferredNode, node, deferredRespond) catch {
+            self.allocator.free(body);
+        };
     }
 
-    /// 添加 deferred 钩子，在 drainDeferred 发送响应前调用。
+    /// 添加 deferred 钩子，在 deferred 响应发送前调用。
     ///
     /// 钩子按注册顺序在 IO 线程执行，可安全访问 IO 线程独占数据。
     ///
@@ -1296,26 +1277,6 @@ pub const AsyncServer = struct {
         self.invoke_queue.drain(self.allocator);
         for (self.tick_hooks.items) |hook| {
             hook(self);
-        }
-    }
-
-    fn drainDeferred(self: *Self) void {
-        const head = @atomicRmw(?*DeferredNode, &self.deferred_head, .Xchg, null, .acquire);
-        var node = head;
-        while (node) |n| {
-            defer {
-                const next = n.next;
-                self.allocator.destroy(n);
-                node = next;
-            }
-            for (self.deferred_hooks.items) |hook| {
-                hook(self, n);
-            }
-            if (self.connections.getPtr(n.conn_id)) |conn| {
-                self.respondZeroCopy(conn, n.status, n.ct, n.body, "");
-            } else {
-                self.allocator.free(n.body);
-            }
         }
     }
 

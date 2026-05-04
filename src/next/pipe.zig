@@ -1,21 +1,21 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Fiber = @import("fiber.zig").Fiber;
-const ClientStream = @import("client.zig").ClientStream;
+const RingSharedClient = @import("client.zig").RingSharedClient;
 
-/// Pipe: 将 ClientStream 的推模型（on_data 回调）适配为拉模型（reader.read/writer.write）。
+/// Pipe: 将 RingSharedClient 的推模型（on_data 回调）适配为拉模型（reader.read/writer.write）。
 ///
 /// 协议库（pgz / myzql / nats）在 fiber 内调用 reader.read()，
-/// 无数据时通过 fiber yield 挂起，ClientStream.on_data → feed() → fiber resume。
+/// 无数据时通过 fiber yield 挂起，RingSharedClient.on_data → feed() → fiber resume。
 /// 全程跑在 IO 线程，零锁，零 worker 线程。
 pub const Pipe = struct {
     allocator: Allocator,
-    stream: *ClientStream,
+    stream: *RingSharedClient,
 
     read_buf: std.ArrayList(u8),
     write_buf: std.ArrayList(u8),
 
-    pub fn init(allocator: Allocator, stream: *ClientStream) !Pipe {
+    pub fn init(allocator: Allocator, stream: *RingSharedClient) !Pipe {
         return Pipe{
             .allocator = allocator,
             .stream = stream,
@@ -37,7 +37,7 @@ pub const Pipe = struct {
         return Writer{ .pipe = self };
     }
 
-    /// ClientStream.on_data 回调入口：喂数据进读缓冲区，唤醒等待的 reader
+    /// RingSharedClient.on_data 回调入口：喂数据进读缓冲区，唤醒等待的 reader
     pub fn feed(self: *Pipe, data: []const u8) !void {
         try self.read_buf.appendSlice(self.allocator, data);
         if (Fiber.isYielded()) {
@@ -45,7 +45,7 @@ pub const Pipe = struct {
         }
     }
 
-    /// 冲刷写缓冲区到 ClientStream
+    /// 冲刷写缓冲区到 RingSharedClient
     pub fn flushWrite(self: *Pipe) !void {
         if (self.write_buf.items.len == 0) return;
         try self.stream.write(self.write_buf.items);
@@ -68,13 +68,13 @@ pub const Pipe = struct {
                 self.pipe.read_buf.replaceRange(self.pipe.allocator, 0, n, &.{}) catch unreachable;
                 return n;
             }
-            // 无数据 → yield fiber，等 ClientStream feed() 唤醒
+            // 无数据 → yield fiber，等 RingSharedClient feed() 唤醒
             Fiber.currentYield();
             // 醒来后缓冲区必有数据（feed 已填充）
             if (self.pipe.read_buf.items.len == 0) return error.Closed;
             const n = @min(dest.len, self.pipe.read_buf.items.len);
             @memcpy(dest[0..n], self.pipe.read_buf.items[0..n]);
-            self.pipe.read_buf.replaceRange(0, n, &.{}) catch unreachable;
+            self.pipe.read_buf.replaceRange(self.pipe.allocator, 0, n, &.{}) catch unreachable;
             return n;
         }
 

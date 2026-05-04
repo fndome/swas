@@ -128,9 +128,9 @@ pub const DnsResolver = struct {
 
         const result = self.results.fetchRemove(txid) orelse return error.DnsTimeout;
 
-        if (result.len > 0) {
-            try self.cache.put(hostname, result.addrs[0..result.len], self.cacheDefaultTtl(), self.nowMs(), false);
-            return result.addrs[0];
+        if (result.value.len > 0) {
+            try self.cache.put(hostname, result.value.addrs[0..result.value.len], self.cacheDefaultTtl(), self.nowMs(), false);
+            return result.value.addrs[0];
         }
         return error.DomainNotFound;
     }

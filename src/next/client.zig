@@ -8,11 +8,11 @@ const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 pub const CLIENT_READ_BUF = 16384;
 
 fn clientDispatch(ptr: *anyopaque, res: i32) void {
-    const self: *ClientStream = @ptrCast(@alignCast(ptr));
+    const self: *RingSharedClient = @ptrCast(@alignCast(ptr));
     self.dispatchCqeRes(res);
 }
 
-pub const ClientStream = struct {
+pub const RingSharedClient = struct {
     allocator: Allocator,
     ring: *linux.IoUring,
     registry: *IORegistry,
@@ -50,8 +50,8 @@ pub const ClientStream = struct {
         on_close: *const fn (ctx: ?*anyopaque) void,
         callback_ctx: ?*anyopaque,
         dns: ?*DnsResolver,
-    ) !*ClientStream {
-        const self = try allocator.create(ClientStream);
+    ) !*RingSharedClient {
+        const self = try allocator.create(RingSharedClient);
         errdefer allocator.destroy(self);
 
         self.* = .{
@@ -73,7 +73,7 @@ pub const ClientStream = struct {
         return self;
     }
 
-    pub fn deinit(self: *ClientStream) void {
+    pub fn deinit(self: *RingSharedClient) void {
         if (self.id != 0) {
             self.registry.remove(self.id);
         }
@@ -87,7 +87,7 @@ pub const ClientStream = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn connect(self: *ClientStream, host: []const u8, port: u16) !void {
+    pub fn connect(self: *RingSharedClient, host: []const u8, port: u16) !void {
         const ip = parseIpv4(host) catch blk: {
             if (self.dns) |dns| {
                 break :blk dns.resolve(host) catch return error.InvalidHost;
@@ -97,7 +97,7 @@ pub const ClientStream = struct {
         self.connectRaw(ip, port) catch |err| return err;
     }
 
-    fn connectRaw(self: *ClientStream, ip: u32, port: u16) !void {
+    fn connectRaw(self: *RingSharedClient, ip: u32, port: u16) !void {
         const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
         const fd: i32 = @intCast(raw_fd);
         if (fd < 0) return error.SocketFailed;
@@ -123,7 +123,7 @@ pub const ClientStream = struct {
         try self.submitPollOut();
     }
 
-    fn submitPollOut(self: *ClientStream) !void {
+    fn submitPollOut(self: *RingSharedClient) !void {
         const sqe = try self.ring.nop(self.id);
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
@@ -131,7 +131,7 @@ pub const ClientStream = struct {
         sqe.off = self._connect_addrlen;
     }
 
-    pub fn write(self: *ClientStream, data: []const u8) !void {
+    pub fn write(self: *RingSharedClient, data: []const u8) !void {
         if (self.state != .connected) return error.NotConnected;
         try self.write_buf.appendSlice(self.allocator, data);
         if (!self.writing) {
@@ -139,7 +139,7 @@ pub const ClientStream = struct {
         }
     }
 
-    fn flushWrite(self: *ClientStream) !void {
+    fn flushWrite(self: *RingSharedClient) !void {
         if (self.write_offset >= self.write_buf.items.len) {
             self.write_offset = 0;
             self.write_buf.clearRetainingCapacity();
@@ -153,21 +153,21 @@ pub const ClientStream = struct {
         self.writing = true;
     }
 
-    fn submitRead(self: *ClientStream) !void {
+    fn submitRead(self: *RingSharedClient) !void {
         const sqe = try self.ring.read(self.id, self.fd, .{ .buffer = self.read_buf }, 0);
         _ = sqe;
     }
 
-    pub fn close(self: *ClientStream) void {
+    pub fn close(self: *RingSharedClient) void {
         if (self.state == .closing or self.state == .closed) return;
         self.state = .closing;
     }
 
-    pub fn dispatchCqe(self: *ClientStream, cqe: *const linux.io_uring_cqe) void {
+    pub fn dispatchCqe(self: *RingSharedClient, cqe: *const linux.io_uring_cqe) void {
         self.dispatchCqeRes(cqe.res);
     }
 
-    fn dispatchCqeRes(self: *ClientStream, res: i32) void {
+    fn dispatchCqeRes(self: *RingSharedClient, res: i32) void {
         switch (self.state) {
             .connecting => {
                 if (res < 0) {
@@ -214,7 +214,7 @@ pub const ClientStream = struct {
         }
     }
 
-    fn onClose(self: *ClientStream) void {
+    fn onClose(self: *RingSharedClient) void {
         if (self.state == .closed) return;
         self.state = .closed;
         if (self.fd >= 0) {
