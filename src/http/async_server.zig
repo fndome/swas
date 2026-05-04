@@ -605,12 +605,23 @@ pub const AsyncServer = struct {
 
     fn closeConn(self: *Self, conn_id: u64, fd: i32) void {
         self.ws_server.removeActive(conn_id);
-        // Clean up connection resources regardless of fd validity
+
         if (self.connections.getPtr(conn_id)) |conn| {
-            if (conn.write_body) |b| self.allocator.free(b);
-            if (conn.ws_token) |t| self.allocator.free(t);
-            if (conn.response_buf) |buf| self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+            if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
+            if (conn.ws_token) |t| { self.allocator.free(t); conn.ws_token = null; }
+            if (conn.response_buf) |buf| {
+                self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                conn.response_buf = null;
+            }
+
+            if (conn.state == .closing) {
+                _ = self.connections.remove(conn_id);
+                return;
+            }
+
+            conn.state = .closing;
         }
+
         if (self.use_fixed_files) {
             if (self.connections.getPtr(conn_id)) |conn| {
                 const idx = conn.fixed_index;
@@ -618,7 +629,7 @@ pub const AsyncServer = struct {
                 self.freeFixedIndex(idx);
             }
         }
-        _ = self.connections.remove(conn_id);
+
         if (fd > 0) {
             const rc = linux.close(fd);
             if (rc != 0) logErr("close fd={d} failed: {d}", .{ fd, rc });
@@ -1067,6 +1078,13 @@ pub const AsyncServer = struct {
                     self.onWsFrame(conn_id, res, user_data, cqe.flags);
                 } else if (conn.state == .ws_writing) {
                     self.onWsWriteComplete(conn_id, res, user_data);
+                } else if (conn.state == .closing) {
+                    // Recycle provided buffer for orphaned read CQE after fd close
+                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        const bid = @as(u16, @truncate(cqe.flags >> 16));
+                        self.buffer_pool.markReplenish(bid);
+                    }
+                    self.closeConn(conn_id, conn.fd);
                 } else {
                     self.closeConn(conn_id, conn.fd);
                 }
