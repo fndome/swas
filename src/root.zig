@@ -32,6 +32,9 @@ pub const IORegistry = @import("io_registry.zig").IORegistry;
 /// 使同步风格的协议库（pgz/myqzl 等）可直接跑在 IO 线程
 pub const Pipe = @import("next/pipe.zig").Pipe;
 
+pub const DnsCache = @import("dns/cache.zig").DnsCache;
+pub const DnsResolver = @import("dns/resolver.zig").DnsResolver;
+
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {
         const q = try server.allocator.create(SubmitQueue);

@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
 const IORegistry = @import("../io_registry.zig").IORegistry;
+const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 
 pub const CLIENT_READ_BUF = 16384;
 
@@ -14,7 +15,7 @@ fn clientDispatch(ptr: *anyopaque, res: i32) void {
 pub const ClientStream = struct {
     allocator: Allocator,
     ring: *linux.IoUring,
-        registry: *IORegistry,
+    registry: *IORegistry,
     id: u64,
     fd: i32,
     state: State,
@@ -24,12 +25,14 @@ pub const ClientStream = struct {
     callback_ctx: ?*anyopaque,
 
     read_buf: []u8,
-    connect_addr: std.net.Address = undefined,
-    _connect_sockaddr: [@sizeOf(linux.sockaddr_storage)]u8 = undefined,
+    connect_addr: linux.sockaddr = undefined,
+    _connect_addrlen: u32 = 0,
 
     write_buf: std.ArrayList(u8),
     write_offset: usize,
     writing: bool,
+
+    dns: ?*DnsResolver,
 
     pub const State = enum(u8) {
         idle,
@@ -42,10 +45,11 @@ pub const ClientStream = struct {
     pub fn init(
         allocator: Allocator,
         ring: *linux.IoUring,
-    registry: *IORegistry,
+        registry: *IORegistry,
         on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
         on_close: *const fn (ctx: ?*anyopaque) void,
         callback_ctx: ?*anyopaque,
+        dns: ?*DnsResolver,
     ) !*ClientStream {
         const self = try allocator.create(ClientStream);
         errdefer allocator.destroy(self);
@@ -64,8 +68,8 @@ pub const ClientStream = struct {
             .write_buf = std.ArrayList(u8).empty,
             .write_offset = 0,
             .writing = false,
+            .dns = dns,
         };
-        // 已移除此处的 dispatch_fn 设置——register 时传入
         return self;
     }
 
@@ -84,37 +88,47 @@ pub const ClientStream = struct {
     }
 
     pub fn connect(self: *ClientStream, host: []const u8, port: u16) !void {
-        const addr = try std.net.Address.resolveIp(self.allocator, host, port);
+        const ip = parseIpv4(host) catch blk: {
+            if (self.dns) |dns| {
+                break :blk dns.resolve(host) catch return error.InvalidHost;
+            }
+            return error.InvalidHost;
+        };
+        self.connectRaw(ip, port) catch |err| return err;
+    }
 
-        const fd = try std.posix.socket(
-            @intFromEnum(addr.getFamily()),
-            linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
-            0,
-        );
+    fn connectRaw(self: *ClientStream, ip: u32, port: u16) !void {
+        const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        const fd: i32 = @intCast(raw_fd);
+        if (fd < 0) return error.SocketFailed;
         errdefer _ = linux.close(fd);
+
+        var addr_in = linux.sockaddr.in{
+            .family = linux.AF.INET,
+            .port = @byteSwap(port),
+            .addr = ip,
+            .zero = [_]u8{0} ** 8,
+        };
+        const addr: *linux.sockaddr = @ptrCast(&addr_in);
 
         self.fd = fd;
         self.id = self.registry.allocUserData();
-        self.connect_addr = addr;
+        self.connect_addr = addr.*;
+        self._connect_addrlen = @sizeOf(linux.sockaddr.in);
 
         try self.registry.register(self.id, @ptrCast(self), &clientDispatch);
         self.state = .connecting;
 
-        _ = std.posix.connect(fd, addr) catch |e| {
-            if (e != error.WouldBlock) return e;
-        };
+        _ = linux.connect(fd, @ptrCast(&addr_in), @sizeOf(linux.sockaddr.in));
         try self.submitPollOut();
     }
 
     fn submitPollOut(self: *ClientStream) !void {
-        const sqe = self.ring.nop(self.id);
-        sqe.opcode = .IORING_OP_CONNECT;
+        const sqe = try self.ring.nop(self.id);
+        sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
-        // Copy sockaddr to struct-local buffer so io_uring can read it async
-        const sock_addr = self.connect_addr.toSockAddr();
-        @memcpy(self._connect_sockaddr[0..sock_addr.len], sock_addr.bytes[0..sock_addr.len]);
-        sqe.addr = @intFromPtr(&self._connect_sockaddr);
-        sqe.off = self.connect_addr.getOsSockLen();
+        sqe.addr = @intFromPtr(&self.connect_addr);
+        sqe.off = self._connect_addrlen;
     }
 
     pub fn write(self: *ClientStream, data: []const u8) !void {
@@ -178,20 +192,17 @@ pub const ClientStream = struct {
                     return;
                 }
                 if (self.writing) {
-                    // 写完成 → 继续写或切回读
                     self.write_offset += @intCast(res);
                     self.flushWrite() catch {
                         self.onClose();
                     };
                 } else {
-                    // 读完成 → 回调 → 冲刷写（如果有）或继续读
                     if (res == 0) {
                         self.onClose();
                         return;
                     }
                     self.on_data(self.callback_ctx, self.read_buf[0..@intCast(res)]);
                     if (self.state != .connected) return;
-                    // on_data 可能已触发了 write，若未触发则继续读
                     if (!self.writing) {
                         self.submitRead() catch {
                             self.onClose();
@@ -216,3 +227,18 @@ pub const ClientStream = struct {
         self.on_close(self.callback_ctx);
     }
 };
+
+fn parseIpv4(ip_str: []const u8) !u32 {
+    var parts = std.mem.splitScalar(u8, ip_str, '.');
+    var octets: [4]u8 = undefined;
+    var i: usize = 0;
+    while (parts.next()) |part| : (i += 1) {
+        if (i >= 4) return error.InvalidHost;
+        octets[i] = try std.fmt.parseInt(u8, part, 10);
+    }
+    if (i != 4) return error.InvalidHost;
+    return (@as(u32, octets[0]) << 24) |
+        (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) |
+        (@as(u32, octets[3]));
+}

@@ -128,4 +128,31 @@ pub const Fiber = struct {
         // saved_call should already be set by the caller or stored alongside
         resumeYielded("");
     }
+
+    /// DNS resolver 在 IO 线程上使用的 fiber yield/resume 槽位。
+    pub const DnsYieldSlot = struct {
+        ctx: IoFiber.Context,
+        call: FiberCall,
+    };
+
+    /// DNS resolver: 挂起当前 fiber，将状态保存到 slot.ctx 中。
+    /// 上下文会切换回 caller_context（exec 设置的调用者）。
+    /// 调用者必须在 dnsYield 返回后立即将控制权交还给 IO 事件循环。
+    pub fn dnsYield(slot: *DnsYieldSlot) void {
+        slot.call = active_call.?;
+        _ = IoFiber.contextSwitch(&.{ .old = &slot.ctx, .new = caller_context.? });
+    }
+
+    /// DNS resolver CQE handler: 恢复由 dnsYield 挂起的 fiber。
+    /// dnsYield 直接保存寄存器状态到 slot.ctx，故可跨 exec 栈帧安全恢复。
+    pub fn dnsResume(slot: *const DnsYieldSlot) void {
+        saved_call = slot.call;
+        active_call = slot.call;
+        current_context = @constCast(&slot.ctx);
+        var resume_caller: IoFiber.Context = undefined;
+        caller_context = &resume_caller;
+        _ = IoFiber.contextSwitch(&.{ .old = &resume_caller, .new = @constCast(&slot.ctx) });
+        current_context = null;
+        caller_context = null;
+    }
 };

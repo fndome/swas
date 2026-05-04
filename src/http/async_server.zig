@@ -46,9 +46,36 @@ const Opcode = @import("../ws/types.zig").Opcode;
 const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
 
+const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
+const DNS_USER_DATA_FLAG = @import("../dns/resolver.zig").DNS_USER_DATA_FLAG;
+
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
     return @as(i64, @intCast(@divTrunc(ts.nanoseconds, @as(i96, std.time.ns_per_ms))));
+}
+
+fn readResolvConfNameserver() !u32 {
+    const path = "/etc/resolv.conf\x00";
+    const flags: linux.O = @bitCast(@as(u32, 0));
+    const raw_fd = linux.open(@ptrCast(path), flags, 0);
+    if (raw_fd < 0) return error.FileNotFound;
+    const fd: i32 = @intCast(raw_fd);
+    defer _ = linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (n == 0) return error.FileNotFound;
+    const content = buf[0..n];
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver ")) {
+            const ip_str = std.mem.trim(u8, trimmed["nameserver ".len..], " \t\r");
+            if (helpers.parseIpv4(ip_str)) |ip| return ip else |_| continue;
+        }
+    }
+    return error.NoNameserverFound;
 }
 
 threadlocal var pending_user_item: ?*const Item = null;
@@ -105,6 +132,9 @@ pub const AsyncServer = struct {
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
+
+    /// DNS 解析器 (io_uring 异步 UDP DNS)
+    dns_resolver: DnsResolver,
 
     /// HTTP 请求 fiber 执行器
     next: ?Next = null,
@@ -233,6 +263,10 @@ pub const AsyncServer = struct {
         const shared_stack = try allocator.alloc(u8, stack_size);
         errdefer allocator.free(shared_stack);
 
+        const ns_ip = readResolvConfNameserver() catch @as(u32, 0x0a60000a);
+        var dns_resolver = try DnsResolver.init(allocator, &ring, io, ns_ip);
+        errdefer dns_resolver.deinit();
+
         var server = Self{
             .allocator = allocator,
             .io = io,
@@ -260,6 +294,7 @@ pub const AsyncServer = struct {
             .http_ctx_pool = std.heap.MemoryPool(HttpTaskCtx).empty,
             .ws_ctx_pool = std.heap.MemoryPool(WsTaskCtx).empty,
             .shared_fiber_stack = shared_stack,
+            .dns_resolver = dns_resolver,
         };
 
         server.ws_server.ctx = &server;
@@ -318,6 +353,7 @@ pub const AsyncServer = struct {
         self.http_ctx_pool.deinit(self.allocator);
         self.ws_ctx_pool.deinit(self.allocator);
         self.allocator.free(self.shared_fiber_stack);
+        self.dns_resolver.deinit();
         self.cfg = undefined;
     }
 
@@ -453,6 +489,23 @@ pub const AsyncServer = struct {
 
     pub fn ws(self: *Self, path: []const u8, handler: WsHandler) !void {
         try self.ws_server.register(path, handler);
+    }
+
+    pub fn createClientStream(
+        self: *Self,
+        on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
+        on_close: *const fn (ctx: ?*anyopaque) void,
+        callback_ctx: ?*anyopaque,
+    ) !*@import("../next/client.zig").ClientStream {
+        return @import("../next/client.zig").ClientStream.init(
+            self.allocator,
+            &self.ring,
+            &self.io_registry,
+            on_data,
+            on_close,
+            callback_ctx,
+            &self.dns_resolver,
+        );
     }
 
     fn nextUserData(self: *Self) u64 {
@@ -970,6 +1023,9 @@ pub const AsyncServer = struct {
             if (user_data == ACCEPT_USER_DATA) {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
+            } else if ((user_data & DNS_USER_DATA_FLAG) != 0) {
+                defer self.ring.cqe_seen(&cqes[i]);
+                self.dns_resolver.handleCqe(res);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
                 defer self.ring.cqe_seen(&cqes[i]);
                 self.io_registry.dispatch(user_data, res);
@@ -1208,6 +1264,7 @@ pub const AsyncServer = struct {
     }
 
     fn drainTick(self: *Self) void {
+        self.dns_resolver.tick();
         for (self.tick_hooks.items) |hook| {
             hook(self);
         }
