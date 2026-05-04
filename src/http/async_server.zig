@@ -285,10 +285,8 @@ pub const AsyncServer = struct {
         var io_registry = IORegistry.init(allocator);
         errdefer io_registry.deinit();
 
-        const rs = RingShared.init(&ring, &io_registry);
-
         const ns_ip = readResolvConfNameserver() catch @as(u32, 0x0a60000a);
-        var dns_resolver = try DnsResolver.init(allocator, rs, io, ns_ip);
+        var dns_resolver = try DnsResolver.init(allocator, &ring, &io_registry, io, ns_ip);
         errdefer dns_resolver.deinit();
 
         var server = Self{
@@ -301,7 +299,7 @@ pub const AsyncServer = struct {
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
             .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
             .io_registry = io_registry,
-            .rs = rs,
+            .rs = undefined,
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -322,6 +320,7 @@ pub const AsyncServer = struct {
             .dns_resolver = dns_resolver,
             .invoke_queue = .{},
         };
+        server.rs = RingShared.bind(&server.ring, &server.io_registry);
 
         server.ws_server.ctx = &server;
         try server.buffer_pool.provideAllReads(&server.ring);

@@ -8,7 +8,7 @@ pub const RingShared = struct {
     ring: *linux.IoUring,
     registry: *IORegistry,
 
-    pub fn init(ring: *linux.IoUring, registry: *IORegistry) RingShared {
+    pub fn bind(ring: *linux.IoUring, registry: *IORegistry) RingShared {
         return .{ .ring = ring, .registry = registry };
     }
 

@@ -46,7 +46,8 @@ pub const DnsResolver = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        rs: RingShared,
+        ring: *linux.IoUring,
+        registry: *@import("../io_registry.zig").IORegistry,
         io: std.Io,
         nameserver_ip: u32,
     ) !DnsResolver {
@@ -69,6 +70,7 @@ pub const DnsResolver = struct {
             return error.BindFailed;
         }
 
+        const rs = RingShared.bind(ring, registry);
         const dns_ud = try rs.alloc(@ptrCast(@constCast(&fd)), &dnsDispatch);
 
         return DnsResolver{
