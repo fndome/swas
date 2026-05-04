@@ -557,7 +557,10 @@ pub const AsyncServer = struct {
     }
 
     fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
-        conn.write_start_ms = milliTimestamp(self.io);
+        if (conn.write_offset == 0) {
+            conn.write_start_ms = milliTimestamp(self.io);
+            conn.write_retries = 0;
+        }
         const user_data = conn_id;
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
 
@@ -903,6 +906,7 @@ pub const AsyncServer = struct {
         conn.write_offset += @as(usize, @intCast(res));
         const total = conn.write_headers_len + if (conn.write_body) |b| b.len else 0;
         if (conn.write_offset >= total) {
+            conn.write_retries = 0;
             if (conn.write_body) |b| {
                 self.allocator.free(b);
                 conn.write_body = null;
@@ -935,6 +939,12 @@ pub const AsyncServer = struct {
                 self.closeConn(conn_id, conn.fd);
             }
         } else {
+            conn.write_retries += 1;
+            if (conn.write_retries > maxWriteRetries(total)) {
+                logErr("write retries exceeded for fd {} ({} attempts, {} bytes total)", .{ conn.fd, conn.write_retries, total });
+                self.closeConn(conn_id, conn.fd);
+                return;
+            }
             self.submitWrite(conn_id, conn) catch |err| {
                 logErr("submitWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
                 self.closeConn(conn_id, conn.fd);
@@ -1537,6 +1547,7 @@ fn executeNext(self: *Self, req: *const Item) void {
         const conn = self.connections.getPtr(conn_id) orelse return;
         conn.write_offset += @as(usize, @intCast(res));
         if (conn.write_offset >= conn.write_headers_len) {
+            conn.write_retries = 0;
             if (conn.response_buf) |buf| {
                 self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
                 conn.response_buf = null;
@@ -1548,6 +1559,12 @@ fn executeNext(self: *Self, req: *const Item) void {
                 self.closeConn(conn_id, conn.fd);
             };
         } else {
+            conn.write_retries += 1;
+            if (conn.write_retries > maxWriteRetries(conn.write_headers_len)) {
+                logErr("ws write retries exceeded for fd {} ({} attempts)", .{ conn.fd, conn.write_retries });
+                self.closeConn(conn_id, conn.fd);
+                return;
+            }
             self.submitWrite(conn_id, conn) catch {
                 self.closeConn(conn_id, conn.fd);
             };
@@ -1561,7 +1578,7 @@ fn executeNext(self: *Self, req: *const Item) void {
 
     pub fn sendWsFrame(self: *Self, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
         const conn = self.connections.getPtr(conn_id) orelse return;
-        if (conn.state != .ws_reading) return;
+        if (conn.state != .ws_reading) return error.WriteBusy;
         const total = ws_frame.frameSize(payload.len);
         if (!self.ensureWriteBuf(conn, total)) {
             self.closeConn(conn_id, conn.fd);
@@ -1784,6 +1801,14 @@ fn statusText(code: u16) []const u8 {
         101 => "Switching Protocols",
         else => "",
     };
+}
+
+/// 梯度写重试上限：小包 3 次，大包按 total/4096 动态计算，上限 64。
+fn maxWriteRetries(total: usize) u8 {
+    if (total <= 1460) return 3;
+    const base: usize = total / 4096;
+    const retries: usize = if (base < 4) @as(usize, 4) else if (base > 64) @as(usize, 64) else base;
+    return @intCast(retries);
 }
 
 /// Wrapper for Next.push dispatching: takes ownership of HttpTaskCtx,
