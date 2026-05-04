@@ -631,8 +631,14 @@ pub const AsyncServer = struct {
         }
 
         if (fd > 0) {
-            const rc = linux.close(fd);
-            if (rc != 0) logErr("close fd={d} failed: {d}", .{ fd, rc });
+            // IORING_OP_CLOSE: sequenced after all in-flight SQEs for this fd
+            const close_ud = conn_id | (1 << 61);
+            const sqe = self.ring.nop(close_ud) catch {
+                _ = linux.close(fd);
+                return;
+            };
+            sqe.opcode = @enumFromInt(19); // IORING_OP_CLOSE
+            sqe.fd = fd;
         }
     }
 
@@ -1059,6 +1065,11 @@ pub const AsyncServer = struct {
             if (user_data == ACCEPT_USER_DATA) {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
+            } else if ((user_data & (1 << 61)) != 0) {
+                // IORING_OP_CLOSE completed — final cleanup
+                const close_conn_id = user_data & ~(@as(u64, 1) << 61);
+                _ = self.connections.remove(close_conn_id);
+                self.ring.cqe_seen(&cqes[i]);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
                 defer self.ring.cqe_seen(&cqes[i]);
                 self.io_registry.dispatch(user_data, res);
