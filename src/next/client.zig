@@ -124,7 +124,7 @@ pub const RingSharedClient = struct {
     }
 
     fn submitPollOut(self: *RingSharedClient) !void {
-        const sqe = self.rs.ring.nop(self.id) catch return;
+        const sqe = self.rs.ringPtr().nop(self.id) catch return;
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
         sqe.addr = @intFromPtr(&self.connect_addr);
@@ -148,7 +148,7 @@ pub const RingSharedClient = struct {
             return;
         }
         const to_send = self.write_buf.items[self.write_offset..];
-        _ = self.rs.ring.write(self.id, self.fd, to_send, 0) catch {
+        _ = self.rs.ringPtr().write(self.id, self.fd, to_send, 0) catch {
             self.onClose();
             return;
         };
@@ -156,7 +156,7 @@ pub const RingSharedClient = struct {
     }
 
     fn submitRead(self: *RingSharedClient) !void {
-        _ = self.rs.ring.read(self.id, self.fd, .{ .buffer = self.read_buf }, 0) catch {
+        _ = self.rs.ringPtr().read(self.id, self.fd, .{ .buffer = self.read_buf }, 0) catch {
             self.onClose();
             return;
         };

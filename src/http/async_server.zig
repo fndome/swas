@@ -133,8 +133,7 @@ pub const AsyncServer = struct {
 
     cfg: Config,
 
-    /// 通用跨线程 IO 回调队列
-    invoke_queue: InvokeQueue,
+    /// 通用跨线程 IO 回调队列 (在 RingShared 内)
     /// 钩子列表：在 deferred 响应发送前依次调用（IO 线程内执行）
     deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
     /// tick 钩子列表：每轮 IO 循环必触发（有/无 deferred 节点都跑）
@@ -318,7 +317,6 @@ pub const AsyncServer = struct {
             .ws_ctx_pool = std.heap.MemoryPool(WsTaskCtx).empty,
             .shared_fiber_stack = shared_stack,
             .dns_resolver = dns_resolver,
-            .invoke_queue = .{},
         };
         server.rs = RingShared.bind(&server.ring, &server.io_registry);
 
@@ -335,7 +333,7 @@ pub const AsyncServer = struct {
     pub fn deinit(self: *Self) void {
         if (self.next) |*n| n.deinit();
 
-        self.invoke_queue.drain(self.allocator);
+        self.rs.invoke.drain(self.allocator);
 
         var it = self.connections.iterator();
 
@@ -516,7 +514,7 @@ pub const AsyncServer = struct {
         ctx: T,
         comptime execFn: fn (allocator: Allocator, ctx_ptr: *T) void,
     ) !void {
-        try self.invoke_queue.push(self.allocator, T, ctx, execFn);
+        try self.rs.invoke.push(self.allocator, T, ctx, execFn);
     }
 
     fn nextUserData(self: *Self) u64 {
@@ -1279,7 +1277,7 @@ pub const AsyncServer = struct {
 
     fn drainTick(self: *Self) void {
         self.dns_resolver.tick();
-        self.invoke_queue.drain(self.allocator);
+        self.rs.invoke.drain(self.allocator);
         for (self.tick_hooks.items) |hook| {
             hook(self);
         }
