@@ -47,8 +47,8 @@ const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
-const DNS_USER_DATA_FLAG = @import("../dns/resolver.zig").DNS_USER_DATA_FLAG;
 const InvokeQueue = @import("../io_invoke.zig").InvokeQueue;
+const RingShared = @import("../ring_shared.zig").RingShared;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -142,6 +142,9 @@ pub const AsyncServer = struct {
 
     /// 客户端出站连接注册表（io_uring TCP client）
     io_registry: IORegistry,
+
+    /// 注入的 ring 共享资源（DNS / Client / ... 均等使用）
+    rs: RingShared,
 
     /// IO 线程已绑核标记
     io_pinned: bool = false,
@@ -279,8 +282,13 @@ pub const AsyncServer = struct {
         const shared_stack = try allocator.alloc(u8, stack_size);
         errdefer allocator.free(shared_stack);
 
+        var io_registry = IORegistry.init(allocator);
+        errdefer io_registry.deinit();
+
+        const rs = RingShared.init(&ring, &io_registry);
+
         const ns_ip = readResolvConfNameserver() catch @as(u32, 0x0a60000a);
-        var dns_resolver = try DnsResolver.init(allocator, &ring, io, ns_ip);
+        var dns_resolver = try DnsResolver.init(allocator, rs, io, ns_ip);
         errdefer dns_resolver.deinit();
 
         var server = Self{
@@ -292,7 +300,8 @@ pub const AsyncServer = struct {
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
             .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
-            .io_registry = IORegistry.init(allocator),
+            .io_registry = io_registry,
+            .rs = rs,
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
@@ -1026,9 +1035,6 @@ pub const AsyncServer = struct {
             if (user_data == ACCEPT_USER_DATA) {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
-            } else if ((user_data & DNS_USER_DATA_FLAG) != 0) {
-                defer self.ring.cqe_seen(&cqes[i]);
-                self.dns_resolver.handleCqe(res);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
                 defer self.ring.cqe_seen(&cqes[i]);
                 self.io_registry.dispatch(user_data, res);

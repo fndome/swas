@@ -25,6 +25,7 @@ pub const Next = @import("next/next.zig").Next;
 pub const Fiber = @import("next/fiber.zig").Fiber;
 
 /// IO 线程 TCP 出站客户端（io_uring 驱动），用于集成 NATS / Redis / HTTP client 等
+pub const RingShared = @import("ring_shared.zig").RingShared;
 pub const RingSharedClient = @import("next/client.zig").RingSharedClient;
 /// RingSharedClient / FileRead 等 io_uring 句柄的统一注册表
 pub const IORegistry = @import("io_registry.zig").IORegistry;

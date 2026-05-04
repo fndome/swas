@@ -2,7 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
-const IORegistry = @import("../io_registry.zig").IORegistry;
+const RingShared = @import("../ring_shared.zig").RingShared;
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 
 pub const CLIENT_READ_BUF = 16384;
@@ -14,8 +14,7 @@ fn clientDispatch(ptr: *anyopaque, res: i32) void {
 
 pub const RingSharedClient = struct {
     allocator: Allocator,
-    ring: *linux.IoUring,
-    registry: *IORegistry,
+    rs: RingShared,
     id: u64,
     fd: i32,
     state: State,
@@ -44,8 +43,7 @@ pub const RingSharedClient = struct {
 
     pub fn init(
         allocator: Allocator,
-        ring: *linux.IoUring,
-        registry: *IORegistry,
+        rs: RingShared,
         on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
         on_close: *const fn (ctx: ?*anyopaque) void,
         callback_ctx: ?*anyopaque,
@@ -56,8 +54,7 @@ pub const RingSharedClient = struct {
 
         self.* = .{
             .allocator = allocator,
-            .ring = ring,
-            .registry = registry,
+            .rs = rs,
             .id = 0,
             .fd = -1,
             .state = .idle,
@@ -75,7 +72,7 @@ pub const RingSharedClient = struct {
 
     pub fn deinit(self: *RingSharedClient) void {
         if (self.id != 0) {
-            self.registry.remove(self.id);
+            self.rs.remove(self.id);
         }
         if (self.fd >= 0) {
             _ = linux.close(self.fd);
@@ -112,11 +109,14 @@ pub const RingSharedClient = struct {
         const addr: *linux.sockaddr = @ptrCast(&addr_in);
 
         self.fd = fd;
-        self.id = self.registry.allocUserData();
+        self.id = self.rs.allocUserData();
         self.connect_addr = addr.*;
         self._connect_addrlen = @sizeOf(linux.sockaddr.in);
 
-        try self.registry.register(self.id, @ptrCast(self), &clientDispatch);
+        self.rs.register(self.id, @ptrCast(self), &clientDispatch) catch {
+            self.rs.remove(self.id);
+            return error.RegisterFailed;
+        };
         self.state = .connecting;
 
         _ = linux.connect(fd, @ptrCast(&addr_in), @sizeOf(linux.sockaddr.in));
@@ -124,7 +124,7 @@ pub const RingSharedClient = struct {
     }
 
     fn submitPollOut(self: *RingSharedClient) !void {
-        const sqe = try self.ring.nop(self.id);
+        const sqe = self.rs.ring.nop(self.id) catch return;
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
         sqe.addr = @intFromPtr(&self.connect_addr);
@@ -148,14 +148,18 @@ pub const RingSharedClient = struct {
             return;
         }
         const to_send = self.write_buf.items[self.write_offset..];
-        const sqe = try self.ring.write(self.id, self.fd, to_send, 0);
-        _ = sqe;
+        _ = self.rs.ring.write(self.id, self.fd, to_send, 0) catch {
+            self.onClose();
+            return;
+        };
         self.writing = true;
     }
 
     fn submitRead(self: *RingSharedClient) !void {
-        const sqe = try self.ring.read(self.id, self.fd, .{ .buffer = self.read_buf }, 0);
-        _ = sqe;
+        _ = self.rs.ring.read(self.id, self.fd, .{ .buffer = self.read_buf }, 0) catch {
+            self.onClose();
+            return;
+        };
     }
 
     pub fn close(self: *RingSharedClient) void {
@@ -222,7 +226,7 @@ pub const RingSharedClient = struct {
             self.fd = -1;
         }
         if (self.id != 0) {
-            self.registry.remove(self.id);
+            self.rs.remove(self.id);
         }
         self.on_close(self.callback_ctx);
     }

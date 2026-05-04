@@ -6,8 +6,7 @@ const packet = @import("packet.zig");
 const cache_mod = @import("cache.zig");
 const DnsCache = cache_mod.DnsCache;
 const Fiber = @import("../next/fiber.zig").Fiber;
-
-pub const DNS_USER_DATA_FLAG: u64 = 1 << 61;
+const RingShared = @import("../ring_shared.zig").RingShared;
 
 const DNS_TIMEOUT_MS: i64 = 2000;
 const MAX_RETRIES: u8 = 2;
@@ -25,9 +24,14 @@ const QueryResult = struct {
     len: u8,
 };
 
+fn dnsDispatch(ptr: *anyopaque, res: i32) void {
+    const self: *DnsResolver = @ptrCast(@alignCast(ptr));
+    self.handleCqe(res);
+}
+
 pub const DnsResolver = struct {
-    allocator: Allocator,
-    ring: *linux.IoUring,
+    allocator: std.mem.Allocator,
+    rs: RingShared,
     io: std.Io,
     udp_fd: i32,
     dns_ud: u64,
@@ -41,8 +45,8 @@ pub const DnsResolver = struct {
     recv_outstanding: bool,
 
     pub fn init(
-        allocator: Allocator,
-        ring: *linux.IoUring,
+        allocator: std.mem.Allocator,
+        rs: RingShared,
         io: std.Io,
         nameserver_ip: u32,
     ) !DnsResolver {
@@ -60,18 +64,19 @@ pub const DnsResolver = struct {
             .addr = 0,
             .zero = [_]u8{0} ** 8,
         };
-        const rc = linux.bind(fd, @ptrCast(&addr_any), @sizeOf(linux.sockaddr.in));
-        if (rc != 0) {
+        if (linux.bind(fd, @ptrCast(&addr_any), @sizeOf(linux.sockaddr.in)) != 0) {
             _ = linux.close(fd);
             return error.BindFailed;
         }
 
+        const dns_ud = try rs.alloc(@ptrCast(@constCast(&fd)), &dnsDispatch);
+
         return DnsResolver{
             .allocator = allocator,
-            .ring = ring,
+            .rs = rs,
             .io = io,
             .udp_fd = fd,
-            .dns_ud = DNS_USER_DATA_FLAG,
+            .dns_ud = dns_ud,
             .nameserver_ip = nameserver_ip,
             .nameserver_port = packet.DNS_PORT,
             .cache = DnsCache.init(allocator),
@@ -87,6 +92,7 @@ pub const DnsResolver = struct {
         self.cache.deinit();
         self.pending.deinit();
         self.results.deinit();
+        self.rs.remove(self.dns_ud);
         if (self.udp_fd >= 0) {
             _ = linux.close(self.udp_fd);
             self.udp_fd = -1;
@@ -113,6 +119,8 @@ pub const DnsResolver = struct {
 
         const txid = self.nextTxid();
 
+        try self.sendQuery(hostname, txid);
+
         const pq = PendingQuery{
             .txid = txid,
             .hostname = hostname,
@@ -120,8 +128,6 @@ pub const DnsResolver = struct {
             .retries = 0,
             .slot = undefined,
         };
-
-        try self.sendQuery(hostname, txid);
         try self.pending.put(txid, pq);
 
         Fiber.dnsYield(&self.pending.getPtr(txid).?.slot);
@@ -129,15 +135,10 @@ pub const DnsResolver = struct {
         const result = self.results.fetchRemove(txid) orelse return error.DnsTimeout;
 
         if (result.value.len > 0) {
-            try self.cache.put(hostname, result.value.addrs[0..result.value.len], self.cacheDefaultTtl(), self.nowMs(), false);
+            try self.cache.put(hostname, result.value.addrs[0..result.value.len], cache_mod.DEFAULT_TTL_SECS, self.nowMs(), false);
             return result.value.addrs[0];
         }
         return error.DomainNotFound;
-    }
-
-    fn cacheDefaultTtl(self: *DnsResolver) u32 {
-        _ = self;
-        return cache_mod.DEFAULT_TTL_SECS;
     }
 
     fn sendQuery(self: *DnsResolver, hostname: []const u8, txid: u16) !void {
@@ -154,8 +155,8 @@ pub const DnsResolver = struct {
 
     fn submitRecv(self: *DnsResolver) void {
         if (self.recv_outstanding) return;
-        const sqe = self.ring.nop(self.dns_ud) catch return;
-        sqe.opcode = @enumFromInt(28);
+        const sqe = self.rs.ring.nop(self.dns_ud) catch return;
+        sqe.opcode = @enumFromInt(28); // IORING_OP_RECV
         sqe.fd = self.udp_fd;
         sqe.addr = @intFromPtr(&self.recv_buf);
         sqe.len = self.recv_buf.len;
