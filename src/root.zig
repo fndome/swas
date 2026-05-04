@@ -34,6 +34,7 @@ pub const Pipe = @import("next/pipe.zig").Pipe;
 
 pub const DnsCache = @import("dns/cache.zig").DnsCache;
 pub const DnsResolver = @import("dns/resolver.zig").DnsResolver;
+pub const InvokeQueue = @import("io_invoke.zig").InvokeQueue;
 
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {

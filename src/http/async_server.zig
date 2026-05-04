@@ -48,6 +48,7 @@ const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const DNS_USER_DATA_FLAG = @import("../dns/resolver.zig").DNS_USER_DATA_FLAG;
+const InvokeQueue = @import("../io_invoke.zig").InvokeQueue;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -122,6 +123,8 @@ pub const AsyncServer = struct {
 
     /// 线程安全：worker 线程通过 CAS push，IO 线程 swap 清空
     deferred_head: ?*DeferredNode align(@alignOf(usize)) = null,
+    /// 通用跨线程 IO 回调队列
+    invoke_queue: InvokeQueue,
     /// 钩子列表：在 drainDeferred 发送响应前依次调用（IO 线程内执行）
     deferred_hooks: std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void),
     /// tick 钩子列表：每轮 IO 循环必触发（有/无 deferred 节点都跑）
@@ -298,6 +301,7 @@ pub const AsyncServer = struct {
             .ws_ctx_pool = std.heap.MemoryPool(WsTaskCtx).empty,
             .shared_fiber_stack = shared_stack,
             .dns_resolver = dns_resolver,
+            .invoke_queue = .{},
         };
 
         server.ws_server.ctx = &server;
@@ -312,6 +316,8 @@ pub const AsyncServer = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.next) |*n| n.deinit();
+
+        self.invoke_queue.drain(self.allocator);
 
         // Drain any pending deferred responses (worker threads already joined)
         var node = @atomicRmw(?*DeferredNode, &self.deferred_head, .Xchg, null, .acquire);
@@ -492,6 +498,16 @@ pub const AsyncServer = struct {
 
     pub fn ws(self: *Self, path: []const u8, handler: WsHandler) !void {
         try self.ws_server.register(path, handler);
+    }
+
+    /// 跨线程安全投递回调到 IO 线程执行。execFn 负责释放 ctx 内部资源。
+    pub fn invokeOnIoThread(
+        self: *Self,
+        comptime T: type,
+        ctx: T,
+        comptime execFn: fn (allocator: Allocator, ctx_ptr: *T) void,
+    ) !void {
+        try self.invoke_queue.push(self.allocator, T, ctx, execFn);
     }
 
     pub fn createClientStream(
@@ -1277,6 +1293,7 @@ pub const AsyncServer = struct {
 
     fn drainTick(self: *Self) void {
         self.dns_resolver.tick();
+        self.invoke_queue.drain(self.allocator);
         for (self.tick_hooks.items) |hook| {
             hook(self);
         }
