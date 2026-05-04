@@ -33,21 +33,19 @@ const MiddlewareStore = @import("middleware_store.zig").MiddlewareStore;
 const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 
 const helpers = @import("http_helpers.zig");
-const getMethodFromNextuest = helpers.getMethodFromRequest;
-const getPathFromNextuest = helpers.getPathFromRequest;
+const getMethodFromRequest = helpers.getMethodFromRequest;
+const getPathFromRequest = helpers.getPathFromRequest;
 const isKeepAliveConnection = helpers.isKeepAliveConnection;
 const parseIpv4 = helpers.parseIpv4;
 const logErr = helpers.logErr;
 
 const WsServer = @import("../ws/server.zig").WsServer;
 const WsHandler = @import("../ws/server.zig").WsHandler;
-const Frame = @import("../ws/types.zig").Frame;
 const Opcode = @import("../ws/types.zig").Opcode;
 const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
-const InvokeQueue = @import("../io_invoke.zig").InvokeQueue;
 const RingShared = @import("../ring_shared.zig").RingShared;
 
 fn milliTimestamp(io: std.Io) i64 {
@@ -722,7 +720,7 @@ pub const AsyncServer = struct {
 
         conn.keep_alive = isKeepAliveConnection(read_buf[0..nread]);
 
-        const path = getPathFromNextuest(read_buf[0..nread]) orelse {
+        const path = getPathFromRequest(read_buf[0..nread]) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 400, "Bad Request");
@@ -850,7 +848,7 @@ pub const AsyncServer = struct {
         if (has_async) {
             const selected_buf = self.buffer_pool.getReadBuf(conn.read_bid);
             const read_len = conn.read_len;
-            const method_str = getMethodFromNextuest(selected_buf[0..read_len]) orelse "GET";
+            const method_str = getMethodFromRequest(selected_buf[0..read_len]) orelse "GET";
 
             const t = self.http_ctx_pool.create(self.allocator) catch {
                 self.respond(conn, 500, "Internal Server Error");
