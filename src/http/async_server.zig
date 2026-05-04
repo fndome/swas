@@ -163,6 +163,7 @@ pub const AsyncServer = struct {
         max_fixed_files: u32 = constants.MAX_FIXED_FILES,
         max_path_length: u32 = constants.MAX_PATH_LENGTH,
         idle_timeout_ms: u64 = constants.IDLE_TIMEOUT_MS,
+        write_timeout_ms: u64 = constants.WRITE_TIMEOUT_MS,
         fiber_stack_size_kb: u16 = 64,
         io_cpu: ?u6 = null,
     };
@@ -179,6 +180,7 @@ pub const AsyncServer = struct {
         max_fixed_files,
         max_path_length,
         idle_timeout_ms,
+        write_timeout_ms,
         io_cpu,
     };
 
@@ -195,6 +197,7 @@ pub const AsyncServer = struct {
             .max_fixed_files => self.cfg.max_fixed_files = @intCast(value),
             .max_path_length => self.cfg.max_path_length = @intCast(value),
             .idle_timeout_ms => self.cfg.idle_timeout_ms = @intCast(value),
+            .write_timeout_ms => self.cfg.write_timeout_ms = @intCast(value),
             .io_cpu => self.cfg.io_cpu = if (value < 0) null else @intCast(value),
         }
     }
@@ -554,6 +557,7 @@ pub const AsyncServer = struct {
     }
 
     fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
+        conn.write_start_ms = milliTimestamp(self.io);
         const user_data = conn_id;
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
 
@@ -891,6 +895,7 @@ pub const AsyncServer = struct {
                 self.allocator.free(b);
                 conn.write_body = null;
             }
+            conn.write_start_ms = 0;
             if (conn.response_buf) |buf| {
                 self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
                 conn.response_buf = null;
@@ -904,6 +909,7 @@ pub const AsyncServer = struct {
                     self.closeConn(conn_id, conn.fd);
                 };
             } else if (conn.keep_alive) {
+                conn.write_start_ms = 0;
                 conn.state = .reading;
                 conn.read_len = 0;
                 conn.write_offset = 0;
@@ -1088,6 +1094,12 @@ pub const AsyncServer = struct {
             if (conn.state == .reading and conn.last_active_ms > 0) {
                 const idle_ms = now - conn.last_active_ms;
                 if (idle_ms >= @as(i64, @intCast(self.cfg.idle_timeout_ms))) {
+                    to_remove.append(self.allocator, entry.key_ptr.*) catch {};
+                }
+            }
+            if (conn.state == .writing and conn.write_start_ms > 0) {
+                const write_ms = now - conn.write_start_ms;
+                if (write_ms >= @as(i64, @intCast(self.cfg.write_timeout_ms))) {
                     to_remove.append(self.allocator, entry.key_ptr.*) catch {};
                 }
             }

@@ -23,5 +23,6 @@ pub const Connection = struct {
     write_body: ?[]u8 = null,
     keep_alive: bool = false,
     last_active_ms: i64 = 0,
+    write_start_ms: i64 = 0,
     ws_token: ?[]const u8 = null,
 };
