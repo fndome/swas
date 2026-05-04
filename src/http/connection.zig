@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const ConnState = enum(u8) {
     reading,
     processing,
@@ -26,4 +28,6 @@ pub const Connection = struct {
     write_start_ms: i64 = 0,
     ws_token: ?[]const u8 = null,
     write_retries: u8 = 0,
+    /// iovec 数组存 Connection 里，保证 writev SQE 处理期间内存不失效
+    write_iovs: [2]std.posix.iovec_const = undefined,
 };

@@ -570,11 +570,10 @@ pub const AsyncServer = struct {
             const total = conn.write_headers_len + body.len;
             if (conn.write_offset >= total) return;
 
-            var iovs: [2]std.posix.iovec_const = undefined;
             var count: usize = 0;
 
             if (conn.write_offset < conn.write_headers_len) {
-                iovs[count] = .{
+                conn.write_iovs[count] = .{
                     .base = resp_buf.ptr + conn.write_offset,
                     .len = conn.write_headers_len - conn.write_offset,
                 };
@@ -586,14 +585,14 @@ pub const AsyncServer = struct {
             else
                 0;
             if (body_start < body.len) {
-                iovs[count] = .{
+                conn.write_iovs[count] = .{
                     .base = body.ptr + body_start,
                     .len = body.len - body_start,
                 };
                 count += 1;
             }
 
-            const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
+            const sqe = try self.ring.writev(user_data, fd, conn.write_iovs[0..count], 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         } else {
             if (conn.write_offset >= conn.write_headers_len) return;
@@ -607,14 +606,15 @@ pub const AsyncServer = struct {
         self.ws_server.removeActive(conn_id);
 
         if (self.connections.getPtr(conn_id)) |conn| {
-            if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
             if (conn.ws_token) |t| { self.allocator.free(t); conn.ws_token = null; }
-            if (conn.response_buf) |buf| {
-                self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                conn.response_buf = null;
-            }
 
             if (conn.state == .closing) {
+                // Second pass: close CQE arrived, safe to free write buffers
+                if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
+                if (conn.response_buf) |buf| {
+                    self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                    conn.response_buf = null;
+                }
                 _ = self.connections.remove(conn_id);
                 return;
             }
@@ -631,7 +631,6 @@ pub const AsyncServer = struct {
         }
 
         if (fd > 0) {
-            // IORING_OP_CLOSE: sequenced after all in-flight SQEs for this fd
             const close_ud = conn_id | (1 << 61);
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
