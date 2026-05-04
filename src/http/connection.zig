@@ -30,4 +30,6 @@ pub const Connection = struct {
     write_retries: u8 = 0,
     /// iovec 数组存 Connection 里，保证 writev SQE 处理期间内存不失效
     write_iovs: [2]std.posix.iovec_const = undefined,
+    /// 防止 io_uring 异步竞态导致 buffer 二次回收
+    buf_recycled: bool = false,
 };

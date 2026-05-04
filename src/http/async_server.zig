@@ -610,10 +610,13 @@ pub const AsyncServer = struct {
 
             if (conn.state == .closing) {
                 // Second pass: close CQE arrived, safe to free write buffers
-                if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
-                if (conn.response_buf) |buf| {
-                    self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                    conn.response_buf = null;
+                if (!conn.buf_recycled) {
+                    conn.buf_recycled = true;
+                    if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
+                    if (conn.response_buf) |buf| {
+                        self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                        conn.response_buf = null;
+                    }
                 }
                 _ = self.connections.remove(conn_id);
                 return;
@@ -1090,7 +1093,8 @@ pub const AsyncServer = struct {
                     self.onWsWriteComplete(conn_id, res, user_data);
                 } else if (conn.state == .closing) {
                     // Recycle provided buffer for orphaned read CQE after fd close
-                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                    if (!conn.buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        conn.buf_recycled = true;
                         const bid = @as(u16, @truncate(cqe.flags >> 16));
                         self.buffer_pool.markReplenish(bid);
                     }
@@ -1658,8 +1662,11 @@ fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     std.debug.assert(t.tag == 0x57530001);
     t.server.shared_fiber_active = false;
     t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
-    t.server.buffer_pool.markReplenish(t.read_bid);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
+        if (!conn.buf_recycled) {
+            conn.buf_recycled = true;
+            t.server.buffer_pool.markReplenish(t.read_bid);
+        }
         conn.read_len = 0;
     }
     t.server.ws_ctx_pool.destroy(t);
@@ -1850,8 +1857,11 @@ fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x48540001);
     t.server.shared_fiber_active = false;
-    t.server.buffer_pool.markReplenish(t.read_bid);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
+        if (!conn.buf_recycled) {
+            conn.buf_recycled = true;
+            t.server.buffer_pool.markReplenish(t.read_bid);
+        }
         conn.read_len = 0;
     }
     t.server.http_ctx_pool.destroy(t);
