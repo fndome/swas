@@ -62,9 +62,10 @@ fn readResolvConfNameserver() !u32 {
     defer _ = linux.close(fd);
 
     var buf: [4096]u8 = undefined;
-    const n = linux.read(fd, &buf, buf.len);
-    if (n == 0) return error.FileNotFound;
-    const content = buf[0..n];
+    const raw = linux.read(fd, &buf, buf.len);
+    const n_signed: isize = @bitCast(raw);
+    if (n_signed <= 0) return error.FileNotFound;
+    const content = buf[0..@as(usize, @intCast(n_signed))];
 
     var it = std.mem.splitScalar(u8, content, '\n');
     while (it.next()) |line| {
@@ -75,13 +76,6 @@ fn readResolvConfNameserver() !u32 {
         }
     }
     return error.NoNameserverFound;
-}
-
-threadlocal var pending_user_item: ?*const Item = null;
-
-fn executeUserComplete(caller_ctx: ?*anyopaque, data: []const u8) void {
-    const item = pending_user_item.?;
-    item.on_complete(caller_ctx, data);
 }
 
 const DeferredNode = struct {
@@ -159,6 +153,8 @@ pub const AsyncServer = struct {
     ws_ctx_pool: std.heap.MemoryPool(WsTaskCtx),
     /// 预分配的 fiber 共享栈（单 IO 线程串行复用）
     shared_fiber_stack: []u8,
+    /// 标记共享栈是否有活跃的 fiber（保护 yield 场景下的栈安全）
+    shared_fiber_active: bool = false,
 
     worker_orig_cpu_mask: usize = 0,
 
@@ -868,12 +864,24 @@ pub const AsyncServer = struct {
             @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
             @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
 
-            var fiber = Fiber.init(self.shared_fiber_stack);
-            fiber.exec(.{
-                .userCtx = t,
-                .complete = httpTaskComplete,
-                .execFn = httpTaskExec,
-            });
+            if (self.shared_fiber_active) {
+                // Stack is busy with a yielded fiber — dispatch via per-task stack
+                // to avoid corrupting the shared stack.
+                if (self.next) |*n| {
+                    n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                } else {
+                    self.http_ctx_pool.destroy(t);
+                    self.respond(conn, 503, "Service Unavailable");
+                }
+            } else {
+                var fiber = Fiber.init(self.shared_fiber_stack);
+                self.shared_fiber_active = true;
+                fiber.exec(.{
+                    .userCtx = t,
+                    .complete = httpTaskComplete,
+                    .execFn = httpTaskExec,
+                });
+            }
 
             conn.read_len = 0;
             return;
@@ -1065,12 +1073,10 @@ pub const AsyncServer = struct {
     }
 
     /// 消费用户 Next，调 execute。
-    fn executeNext(self: *Self, req: *const Item) void {
-        _ = self;
-        pending_user_item = req;
-        defer pending_user_item = null;
-        req.execute(req.ctx, executeUserComplete);
-    }
+fn executeNext(self: *Self, req: *const Item) void {
+    _ = self;
+    req.execute(req.ctx, req.on_complete);
+}
 
     fn submitIdleTimeout(self: *Self) !void {
         const user_data = self.nextUserData();
@@ -1605,6 +1611,7 @@ fn wsTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const
 fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x57530001);
+    t.server.shared_fiber_active = false;
     t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
     t.server.buffer_pool.markReplenish(t.read_bid);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
@@ -1779,9 +1786,17 @@ fn statusText(code: u16) []const u8 {
     };
 }
 
+/// Wrapper for Next.push dispatching: takes ownership of HttpTaskCtx,
+/// runs httpTaskExec and calls httpTaskComplete when done.
+fn httpTaskExecWrapperWithOwnership(t: *HttpTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
+    httpTaskExec(t, complete);
+    httpTaskComplete(t, "");
+}
+
 fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x48540001);
+    t.server.shared_fiber_active = false;
     t.server.buffer_pool.markReplenish(t.read_bid);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
         conn.read_len = 0;

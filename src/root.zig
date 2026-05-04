@@ -37,6 +37,12 @@ pub const DnsCache = @import("dns/cache.zig").DnsCache;
 pub const DnsResolver = @import("dns/resolver.zig").DnsResolver;
 pub const InvokeQueue = @import("io_invoke.zig").InvokeQueue;
 
+/// 独立 HTTP 客户端 Ring (Ring B) + HttpClient + c-ares DNS
+pub const HttpRing = @import("httpclient/ring.zig").HttpRing;
+pub const HttpClient = @import("httpclient/client.zig").HttpClient;
+pub const HttpCaresDns = @import("httpclient/dns.zig").CaresDns;
+pub const DNS_FD_MAGIC = @import("httpclient/dns.zig").DNS_FD_MAGIC;
+
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {
         const q = try server.allocator.create(SubmitQueue);

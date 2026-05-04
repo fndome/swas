@@ -2,7 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const SubmitQueue = @import("queue.zig").SubmitQueue;
 const Item = @import("queue.zig").Item;
-const Fiber = @import("fiber.zig").Fiber;
+const fiber_mod = @import("fiber.zig");
+const Fiber = fiber_mod.Fiber;
 
 const TaskCtx = struct {
     next: *Next,
@@ -326,11 +327,6 @@ pub const Next = struct {
                         g.next.allocator.destroy(g);
                         return;
                     };
-                    defer g.next.allocator.free(stack);
-                    defer {
-                        g.next.allocator.destroy(u);
-                        g.next.allocator.destroy(g);
-                    }
 
                     var temp_fiber = Fiber.init(stack);
                     temp_fiber.exec(.{
@@ -342,6 +338,38 @@ pub const Next = struct {
                             }
                         }.call,
                     });
+
+                    if (Fiber.isYielded()) {
+                        const CleanupData = struct {
+                            g: *TaskCtx,
+                            u: *T,
+                            stack: []u8,
+                            allocator: Allocator,
+
+                            fn free(ptr: *anyopaque) void {
+                                const data: *@This() = @ptrCast(@alignCast(ptr));
+                                data.allocator.destroy(data.u);
+                                data.allocator.free(data.stack);
+                                data.allocator.destroy(data.g);
+                                data.allocator.destroy(data);
+                            }
+                        };
+                        const cd = g.next.allocator.create(CleanupData) catch {
+                            g.next.allocator.destroy(u);
+                            g.next.allocator.free(stack);
+                            g.next.allocator.destroy(g);
+                            return;
+                        };
+                        cd.* = .{ .g = g, .u = u, .stack = stack, .allocator = g.next.allocator };
+                        fiber_mod.yield_cleanup = .{
+                            .data = @ptrCast(cd),
+                            .free_fn = CleanupData.free,
+                        };
+                    } else {
+                        g.next.allocator.destroy(u);
+                        g.next.allocator.free(stack);
+                        g.next.allocator.destroy(g);
+                    }
                 }
             }.exec,
             .on_complete = struct {

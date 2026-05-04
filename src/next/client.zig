@@ -32,6 +32,7 @@ pub const RingSharedClient = struct {
     writing: bool,
 
     dns: ?*DnsResolver,
+    fixed_index: u16 = 0xFFFF,
 
     pub const State = enum(u8) {
         idle,
@@ -148,18 +149,18 @@ pub const RingSharedClient = struct {
             return;
         }
         const to_send = self.write_buf.items[self.write_offset..];
-        _ = self.rs.ringPtr().write(self.id, self.fd, to_send, 0) catch {
-            self.onClose();
-            return;
-        };
+        const use_fixed = self.fixed_index != 0xFFFF;
+        const fd_or_idx = if (use_fixed) @as(i32, @intCast(self.fixed_index)) else self.fd;
+        const sqe = try self.rs.ringPtr().write(self.id, fd_or_idx, to_send, 0);
+        if (use_fixed) sqe.flags |= linux.IOSQE_FIXED_FILE;
         self.writing = true;
     }
 
     fn submitRead(self: *RingSharedClient) !void {
-        _ = self.rs.ringPtr().read(self.id, self.fd, .{ .buffer = self.read_buf }, 0) catch {
-            self.onClose();
-            return;
-        };
+        const use_fixed = self.fixed_index != 0xFFFF;
+        const fd_or_idx = if (use_fixed) @as(i32, @intCast(self.fixed_index)) else self.fd;
+        const sqe = try self.rs.ringPtr().read(self.id, fd_or_idx, .{ .buffer = self.read_buf }, 0);
+        if (use_fixed) sqe.flags |= linux.IOSQE_FIXED_FILE;
     }
 
     pub fn close(self: *RingSharedClient) void {
@@ -186,6 +187,15 @@ pub const RingSharedClient = struct {
                     return;
                 }
                 self.state = .connected;
+                // Disable Nagle — low-latency microservice calls
+                const one: i32 = 1;
+                _ = linux.setsockopt(self.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(i32));
+                // Register as fixed file to avoid kernel fd lookup per I/O
+                if (self.rs.ringPtr().register_files_sparse(1)) {
+                    if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
+                        self.fixed_index = 0;
+                    } else |_| {}
+                } else |_| {}
                 self.submitRead() catch {
                     self.onClose();
                 };
@@ -221,6 +231,9 @@ pub const RingSharedClient = struct {
     fn onClose(self: *RingSharedClient) void {
         if (self.state == .closed) return;
         self.state = .closed;
+        if (self.fixed_index != 0xFFFF) {
+            _ = self.rs.ringPtr().register_files_update(self.fixed_index, &[_]linux.fd_t{-1}) catch {};
+        }
         if (self.fd >= 0) {
             _ = linux.close(self.fd);
             self.fd = -1;

@@ -25,6 +25,14 @@ pub threadlocal var parked_call: ?FiberCall = null;
 pub threadlocal var parked_poll: ?*const fn (*anyopaque) bool = null;
 pub threadlocal var parked_poll_ctx: ?*anyopaque = null;
 
+/// ── yield 清理回调：fiber 完全完成（resume 后未再 yield）时调用 ──
+pub const YieldCleanup = struct {
+    data: *anyopaque,
+    free_fn: *const fn (*anyopaque) void,
+};
+
+pub threadlocal var yield_cleanup: ?YieldCleanup = null;
+
 fn trampoline() void {
     const c = active_call.?;
     c.execFn(c.userCtx, c.complete);
@@ -96,6 +104,10 @@ pub const Fiber = struct {
             yielded_result = null;
             active_call = null;
             saved_call = null;
+            if (yield_cleanup) |cleanup| {
+                yield_cleanup = null;
+                cleanup.free_fn(cleanup.data);
+            }
         } else {
             current_context = null;
             caller_context = null;

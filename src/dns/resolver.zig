@@ -22,6 +22,7 @@ const PendingQuery = struct {
 const QueryResult = struct {
     addrs: [packet.AddrList.MAX_ADDRS]u32,
     len: u8,
+    ttl: u32,
 };
 
 fn dnsDispatch(ptr: *anyopaque, res: i32) void {
@@ -137,7 +138,7 @@ pub const DnsResolver = struct {
         const result = self.results.fetchRemove(txid) orelse return error.DnsTimeout;
 
         if (result.value.len > 0) {
-            try self.cache.put(hostname, result.value.addrs[0..result.value.len], cache_mod.DEFAULT_TTL_SECS, self.nowMs(), false);
+            try self.cache.put(hostname, result.value.addrs[0..result.value.len], result.value.ttl, self.nowMs(), false);
             return result.value.addrs[0];
         }
         return error.DomainNotFound;
@@ -184,6 +185,7 @@ pub const DnsResolver = struct {
         var result = QueryResult{
             .addrs = [_]u32{0} ** packet.AddrList.MAX_ADDRS,
             .len = parsed.addrs.len,
+            .ttl = parsed.ttl,
         };
         if (parsed.rcode == .NOERROR and parsed.addrs.len > 0) {
             @memcpy(result.addrs[0..parsed.addrs.len], parsed.addrs.addrs[0..parsed.addrs.len]);
@@ -223,6 +225,7 @@ pub const DnsResolver = struct {
                 const empty_result = QueryResult{
                     .addrs = [_]u32{0} ** packet.AddrList.MAX_ADDRS,
                     .len = 0,
+                    .ttl = 0,
                 };
                 self.results.put(txid, empty_result) catch {};
                 Fiber.dnsResume(&removed.value.slot);

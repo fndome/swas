@@ -5,12 +5,12 @@
 ```
 IO 线程（io_uring + fiber）:
   ├── accept/read/write CQE → fiber → handler → 发响应
-  ├── drain 用户 SubmitQueues
-  ├── drain Next.go() ringbuffer 任务
-  └── drain DeferredResponse → 发响应
+  ├── drainNextTasks（Next.go ringbuffer 任务）
+  ├── drainTick（DNS 超时检测 + rs.invoke.drain + tick_hooks）
+  └── DNS 客户端 / RingSharedClient / Pipe（全部同线程 io_uring）
 
 Worker 线程池（可选，仅 CPU 密集任务）:
-  └── Next.submit() → worker 线程 → 计算 → DeferredResponse → IO 线程 drain
+  └── Next.submit() → worker 线程 → 计算 → rs.invoke.push → IO 线程回调
 ```
 
 Handler 默认作为 **fiber 运行在 IO 线程上**。
@@ -56,7 +56,7 @@ IO 线程（单线程）:
     → CQE 分发
     → fiber → handler → ctx.text/json/html
     → drainNextTasks（Next.go ringbuffer 任务）
-    → drainDeferred（DeferredResponse）
+    → drainTick（rs.invoke.drain + DNS tick + hooks）
     → 循环
 ```
 
@@ -295,12 +295,12 @@ Next.submit(GpuCtx, ctx, struct {
 GPU 驱动内置异步执行，1 个 worker + fiber 即可提交 N 个 stream 并轮询完成，
 无需额外线程池。
 
-### ClientStream
+### RingSharedClient
 
-基于 io_uring 的出站 TCP 客户端胶水层。用于将 NATS / Redis / HTTP client 等第三方库集成到 swas 的 IO 线程——无需独立运行时，全程零锁。
+基于 io_uring 的出站 TCP 客户端。同享 `RingShared`（ring + registry + invoke），用于将 NATS / Redis / HTTP client 等第三方库集成到 swas 的 IO 线程——无需独立运行时，全程零锁。
 
 ```zig
-const ClientStream = @import("swas").ClientStream;
+const RingSharedClient = @import("swas").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const nats: *NatsClient = @ptrCast(@alignCast(ctx));
@@ -312,31 +312,69 @@ fn onClose(ctx: ?*anyopaque) void {
     nats.discard();
 }
 
-// 在 main() 里，server.run() 之前：
-var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, nats_ctx);
+var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, nats_ctx);
 defer cs.deinit();
 try cs.connect("127.0.0.1", 4222);
 
-// 发送数据（排队，经由 io_uring 异步发送）
 try cs.write("PUB subject 5\r\nhello\r\n");
-cs.close();  // 优雅关闭
+cs.close();
 ```
 
-- 所有 I/O 跑在 swas IO 线程 — `onData` / `onClose` 与 hook 在同一上下文执行
-- `write()` 排队发送；待发数据在 io_uring CQE 到达时自动冲刷
-- 协议层（NATS / Redis / HTTP）只需实现 `feed([]u8)` 和 `write([]const u8)`
-- 支持多个 client 实例；user_data 用专属高位 bit 避免碰撞
+- `server.rs` 是 `RingShared` 实例——内含 ring、registry、invoke 队列，注入到各个 client
+- 所有 I/O 跑在 swas IO 线程 — `onData` / `onClose` 与 handler 在同一上下文执行
+
+### RingShared
+
+`RingShared` 是 io_uring 单 ring + 单线程的物化——注入到 server 和任意 client，表示一切平等。
+
+```zig
+const rs = server.rs;  // { ring, registry, invoke }
+// 任何 client 平等注入:
+var client = try RingSharedClient.init(alloc, rs, ...);
+var http   = try HttpClient.init(alloc, rs, dns);
+```
+
+- `rs.ringPtr()` / `rs.registryPtr()` — IO 线程断言保护（非 IO 线程调用直接 @panic）
+- `rs.invoke.push()` — 任意线程安全 CAS 回调（worker → IO 线程）
+
+### DNS 解析
+
+内置 io_uring 异步 DNS 解析 + TTL 缓存。
+
+```zig
+// RingSharedClient.connect("redis.svc.local", 6379)
+//   → DNS 缓存命中 → 直接连接
+//   → 未命中 → fiber yield → io_uring UDP DNS → resume → 连接
+```
+
+- 自动读取 `/etc/resolv.conf` 获取 K8s CoreDNS nameserver
+- TTL 缓存（5s ~ 300s），最多 256 条目
+
+### invokeOnIoThread
+
+任意线程安全回调到 IO 线程执行。
+
+```zig
+server.invokeOnIoThread(MyCtx, ctx, struct {
+    fn run(allocator, c: *MyCtx) void {
+        // IO 线程执行 — 安全访问 ring/registry
+        c.client.write("PUB ...");
+        allocator.free(c.data);
+    }
+}.run);
+```
+
+底层是 `rs.invoke` (CAS 无锁链表)，`drainTick` 自动清空。
 
 ### Pipe
 
-将 ClientStream 的推模型适配为拉模型（`reader.read` / `writer.write`）。
+将 RingSharedClient 的推模型适配为拉模型（`reader.read` / `writer.write`）。
 使同步风格的协议库（pgz、myzql）通过 fiber yield/resume 直接跑在 IO 线程——
 无需 worker 线程，全程零锁。
 
 ```zig
-// 在 main() 里，AsyncServer.init() 之后、server.run() 之前：
 const Pipe = @import("swas").Pipe;
-const ClientStream = @import("swas").ClientStream;
+const RingSharedClient = @import("swas").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const p: *Pipe = @ptrCast(@alignCast(ctx));
@@ -348,23 +386,21 @@ fn onClose(ctx: ?*anyopaque) void {
     p.reset();
 }
 
-var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, &pipe);
+var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, &pipe);
 var pipe = try Pipe.init(allocator, cs);
 defer pipe.deinit();
 
 try cs.connect("localhost", 5432);
-// ... wait for connect (yield) ...
 
 // 任何接受 anytype reader/writer 的协议库直接可用：
 // var conn = try pgz.Connection.init(allocator, pipe.reader(), pipe.writer());
 // var result = try conn.query("SELECT 1", struct { u8 });
 ```
 
-- `feed(data)` 将 ClientStream 字节推入读缓冲区，唤醒等待中的 fiber
+- `feed(data)` 将 RingSharedClient 字节推入读缓冲区，唤醒等待中的 fiber
 - `reader.read()` 在无数据时通过 fiber yield 挂起——对调用方表现为同步阻塞
-- `writer.write()` 写入缓冲区；`flushWrite()` 通过 ClientStream 发出
+- `writer.write()` 写入缓冲区；`flushWrite()` 通过 RingSharedClient 发出
 - `reset()` 在断开/重连时清空缓冲区
-- 要求协议库接受 `anytype` reader/writer（pgz 需改 `WriteBuffer.send` 一行）
 
 ### Fiber
 
@@ -470,6 +506,7 @@ WS handler 可将帧数据异步卸出，因此帧负载在 handler 返回后仍
 | `fiber_stack_size_kb` | 64 | fiber 栈大小（KB），0 自动变 64 |
 | `io_cpu` | null | IO 线程绑核 |
 | `idle_timeout_ms` | 30000 | 关闭空闲连接 |
+| `write_timeout_ms` | 5000 | 写超时关闭连接 |
 | `buffer_size` | 4096 | io_uring 缓冲区块大小 |
 | `buffer_pool_size` | 16384 | 缓冲区块数量 |
 
@@ -485,6 +522,56 @@ handler（IO 线程上的 fiber）:
 ```
 
 连接池只需维护已连接 TCP fd 集合（ringbuffer 或 free list）。handler 拿 fd → io_uring 发 `write(sql)` + `read()` → 解析结果 → 放回 fd。
+
+## HttpRing + HttpClient（Ring B，独立出站 Ring）
+
+```
+HttpRing（独立 io_uring Ring B）
+  ├── DnsResolver（内置异步 DNS，也支持 c-ares 切换）
+  ├── IORegistry（客户端连接注册表）
+  ├── InvokeQueue（跨线程回调队列）
+  └── ATTACH_WQ → 共享 Ring A 的内核 io-wq 线程池
+
+HttpClient
+  ├── get(url) — 阻塞 API，内部异步
+  └── tinyCache — 同 host:port 的连接 1s 内复用（TTL 固定，不自增）
+```
+
+**用法：**
+
+```zig
+const client = try swas.HttpClient.init(allocator, io, server.ring.fd, 1000);
+defer client.deinit();
+const resp = try client.get("http://api.example.com/data");
+defer resp.deinit();
+```
+
+### c-ares 异步 DNS（可选）
+
+内置 `DnsResolver` 满足基本需求（A 记录 + 缓存）。如需处理截断 UDP（TC 位 → TCP 重试）或 SRV 记录，可切换到 c-ares：
+
+```bash
+# Linux
+sudo apt install libc-ares-dev
+
+# 源码编译
+git clone https://github.com/c-ares/c-ares && cd c-ares
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) && sudo make install
+```
+
+安装后在 `build.zig` 添加链接：
+
+```zig
+exe.linkSystemLibrary("cares");
+```
+
+切换代码（将 `HttpRing` 的 `DnsResolver` 替换为 `CaresDns`）：
+
+```zig
+const HttpCaresDns = swas.HttpCaresDns;
+// ring.dns = HttpCaresDns.init(alloc, ring.rs);
+```
 
 ## License
 

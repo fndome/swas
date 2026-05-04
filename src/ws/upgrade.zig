@@ -12,7 +12,7 @@ pub fn isUpgradeRequest(data: []const u8) bool {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (std.ascii.startsWithIgnoreCase(line, "Upgrade:")) {
-            const value = std.mem.trim(u8, line[7..], " \t");
+            const value = std.mem.trim(u8, line["Upgrade:".len..], " \t");
             if (std.ascii.eqlIgnoreCase(value, "websocket")) {
                 has_upgrade = true;
             }

@@ -299,13 +299,13 @@ GPU drivers are async internally — one worker + fiber can submit N streams
 and poll for completion. No extra thread pool needed. io_uring not yet
 supported for GPU compute (kernel driver gap).
 
-### ClientStream
+### RingSharedClient
 
 io_uring-driven outbound TCP client. Glue layer for integrating NATS / Redis / HTTP client
 libraries into swas's IO thread — no separate runtime, no locks.
 
 ```zig
-const ClientStream = @import("swas").ClientStream;
+const RingSharedClient = @import("swas").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const nats: *NatsClient = @ptrCast(@alignCast(ctx));
@@ -318,7 +318,7 @@ fn onClose(ctx: ?*anyopaque) void {
 }
 
 // In main(), before server.run():
-var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, nats_ctx);
+var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, nats_ctx);
 defer cs.deinit();
 try cs.connect("127.0.0.1", 4222);
 
@@ -334,14 +334,14 @@ cs.close();  // graceful
 
 ### Pipe
 
-Adapts ClientStream's push model to a pull model (`reader.read` / `writer.write`).
+Adapts RingSharedClient's push model to a pull model (`reader.read` / `writer.write`).
 Enables synchronous-protocol libraries (pgz, myzql) to run directly on the IO thread
 via fiber yield/resume — no worker threads, no locks.
 
 ```zig
 // In main(), after AsyncServer.init() and before server.run():
 const Pipe = @import("swas").Pipe;
-const ClientStream = @import("swas").ClientStream;
+const RingSharedClient = @import("swas").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const p: *Pipe = @ptrCast(@alignCast(ctx));
@@ -353,7 +353,7 @@ fn onClose(ctx: ?*anyopaque) void {
     p.reset();
 }
 
-var cs = try ClientStream.init(allocator, &server.ring, &server.io_registry, onData, onClose, &pipe);
+var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, &pipe);
 var pipe = try Pipe.init(allocator, cs);
 defer pipe.deinit();
 
