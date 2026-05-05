@@ -659,8 +659,19 @@ pub const AsyncServer = struct {
             }
 
             if (conn.state == .closing or fd == 0) {
-                // Second pass (close CQE arrived) or fd==0 (already closed elsewhere):
-                // safe to remove from map.
+                // Second pass: release pool slot and live list entry
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    if (self.pool.liveRemove(conn.active_list_pos)) |swapped_idx| {
+                        // Update the swapped-in slot's list position
+                        const slot = &self.pool.slots[swapped_idx];
+                        slot.line2.active_list_pos = conn.active_list_pos;
+                        // Also update the Connection's active_list_pos if in hashmap
+                        if (self.connections.getPtr(slot.line2.conn_id)) |swapped_conn| {
+                            swapped_conn.active_list_pos = conn.active_list_pos;
+                        }
+                    }
+                    self.pool.release(conn.pool_idx);
+                }
                 _ = self.connections.remove(conn_id);
                 return;
             }
@@ -727,6 +738,7 @@ pub const AsyncServer = struct {
             slot.line1.state = .reading;
             slot.line2.last_active_ms = milliTimestamp(self.io);
             slot.line2.conn_id = conn_id;
+            slot.line2.active_list_pos = self.pool.liveAdd(pool_idx);
         }
 
         var conn = Connection{
@@ -735,6 +747,7 @@ pub const AsyncServer = struct {
             .last_active_ms = milliTimestamp(self.io),
             .pool_idx = pool_idx,
             .gen_id = gen_id,
+            .active_list_pos = self.pool.slots[pool_idx].line2.active_list_pos,
         };
 
         if (self.use_fixed_files) {

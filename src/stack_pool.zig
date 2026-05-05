@@ -12,6 +12,8 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
         slots: []T,
         freelist: []u32,
         freelist_top: u32,
+        /// 活跃槽位索引表，O(1) swap-remove。TTL 扫描只遍历此项。
+        live: std.ArrayList(u32),
 
         pub fn init(allocator: Allocator) !Self {
             const slots = try allocator.alloc(T, capacity);
@@ -25,10 +27,12 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
                 .slots = slots,
                 .freelist = freelist,
                 .freelist_top = @intCast(capacity),
+                .live = try std.ArrayList(u32).initCapacity(allocator, capacity),
             };
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.live.deinit(allocator);
             allocator.free(self.slots);
             allocator.free(self.freelist);
         }
@@ -37,6 +41,24 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
             if (self.freelist_top == 0) return null;
             self.freelist_top -= 1;
             return self.freelist[self.freelist_top];
+        }
+
+        /// 将 idx 写入活跃表，返回在 live 中的位置。
+        /// 调用方需将返回值写入 slot.active_list_pos。
+        pub fn liveAdd(self: *Self, idx: u32) u32 {
+            self.live.appendAssumeCapacity(idx);
+            return @intCast(self.live.items.len - 1);
+        }
+
+        /// swap-remove：用最后一个元素覆盖 list_pos，O(1)。
+        /// 返回被移过来的 idx，调用方需更新其 slot.active_list_pos = list_pos。
+        pub fn liveRemove(self: *Self, list_pos: u32) ?u32 {
+            if (list_pos >= self.live.items.len) return null;
+            const last = self.live.getLast();
+            self.live.items[list_pos] = last;
+            self.live.items.len -= 1;
+            if (list_pos < self.live.items.len) return last;
+            return null;
         }
 
         pub fn release(self: *Self, idx: u32) void {
@@ -92,7 +114,8 @@ const CacheLine2 = extern struct {
     write_start_ms: i64 = 0,
     is_writing: bool = false,
     conn_id: u64 = 0,
-    _fill: [16]u8 = [_]u8{0} ** 16,
+    active_list_pos: u32 = 0xFFFFFFFF,
+    _fill: [12]u8 = [_]u8{0} ** 12,
 };
 
 comptime {

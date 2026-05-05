@@ -45,6 +45,8 @@ pub const Connection = struct {
     pool_idx: u32 = 0xFFFFFFFF,
     /// Generation ID for ghost-event defense (synced with pool slot)
     gen_id: u32 = 0,
+    /// Position in pool.live list (for O(1) swap-remove)
+    active_list_pos: u32 = 0xFFFFFFFF,
 };
 
 /// WebSocket 写队列节点（单 IO 线程，无需原子操作）
