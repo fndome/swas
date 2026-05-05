@@ -6,7 +6,7 @@ const packet = @import("packet.zig");
 const cache_mod = @import("cache.zig");
 const DnsCache = cache_mod.DnsCache;
 const Fiber = @import("../next/fiber.zig").Fiber;
-const RingShared = @import("../ring_shared.zig").RingShared;
+const RingShared = @import("../shared/ring_shared.zig").RingShared;
 
 const DNS_TIMEOUT_MS: i64 = 2000;
 const MAX_RETRIES: u8 = 2;
@@ -48,7 +48,7 @@ pub const DnsResolver = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ring: *linux.IoUring,
-        registry: *@import("../io_registry.zig").IORegistry,
+        registry: *@import("../shared/io_registry.zig").IORegistry,
         io: std.Io,
         nameserver_ip: u32,
     ) !DnsResolver {

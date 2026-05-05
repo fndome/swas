@@ -10,8 +10,8 @@ const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
 const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
 const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
 const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
-const CLIENT_USER_DATA_FLAG = @import("../io_registry.zig").CLIENT_USER_DATA_FLAG;
-const IORegistry = @import("../io_registry.zig").IORegistry;
+const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_DATA_FLAG;
+const IORegistry = @import("../shared/io_registry.zig").IORegistry;
 
 const USER_TASK_BATCH = constants.USER_TASK_BATCH;
 const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
@@ -47,7 +47,7 @@ const ws_frame = @import("../ws/frame.zig");
 const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
-const RingShared = @import("../ring_shared.zig").RingShared;
+const RingShared = @import("../shared/ring_shared.zig").RingShared;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);

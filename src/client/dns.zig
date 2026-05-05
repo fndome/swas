@@ -2,7 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
-const RingShared = @import("../ring_shared.zig").RingShared;
+const RingShared = @import("../shared/ring_shared.zig").RingShared;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
 const c = @cImport({

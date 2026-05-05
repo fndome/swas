@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const HttpRing = @import("ring.zig").HttpRing;
-const RingSharedClient = @import("../tcp_stream.zig").RingSharedClient;
+const RingSharedClient = @import("../shared/tcp_stream.zig").RingSharedClient;
 const Pipe = @import("../next/pipe.zig").Pipe;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
@@ -131,9 +131,48 @@ pub const HttpClient = struct {
 
     /// 阻塞调用：GET 请求，完整 Response。
     pub fn get(self: *HttpClient, url: []const u8) !Response {
+        return self.request("GET", url, null, null);
+    }
+
+    /// 阻塞调用：POST 请求，body 须为完整序列化内容（调用方负责 Content-Type / 编码）。
+    pub fn post(self: *HttpClient, url: []const u8, body: []const u8) !Response {
+        return self.request("POST", url, null, body);
+    }
+
+    /// 阻塞调用：PUT 请求。
+    pub fn put(self: *HttpClient, url: []const u8, body: []const u8) !Response {
+        return self.request("PUT", url, null, body);
+    }
+
+    /// 阻塞调用：PATCH 请求。
+    pub fn patch(self: *HttpClient, url: []const u8, body: []const u8) !Response {
+        return self.request("PATCH", url, null, body);
+    }
+
+    /// 阻塞调用：DELETE 请求。
+    pub fn delete(self: *HttpClient, url: []const u8) !Response {
+        return self.request("DELETE", url, null, null);
+    }
+
+    /// 通用 HTTP 请求（POST/PUT 自动附带 Content-Length，headers 可设 Content-Type 等）。
+    pub fn request(self: *HttpClient, method: []const u8, url: []const u8, headers: ?[]const u8, body: ?[]const u8) !Response {
+        // Dup body/headers here (caller's thread) so they survive the invoke queue crossing.
+        const headers_dup: ?[]u8 = if (headers) |h| self.allocator.dupe(u8, h) catch null else null;
+        errdefer if (headers_dup) |h| self.allocator.free(h);
+        const body_dup: ?[]u8 = if (body) |b| self.allocator.dupe(u8, b) catch {
+            if (headers_dup) |h| self.allocator.free(h);
+            return error.OutOfMemory;
+        } else null;
+        errdefer if (body_dup) |b| self.allocator.free(b);
+
         const ctx = try self.allocator.create(RequestContext);
+        errdefer self.allocator.destroy(ctx);
+
         ctx.* = .{
+            .method = method,
             .url = url,
+            .headers = headers_dup,
+            .body = body_dup,
             .response = undefined,
             .done = false,
             .mutex = .{},
@@ -152,7 +191,10 @@ pub const HttpClient = struct {
 };
 
 const RequestContext = struct {
+    method: []const u8,
     url: []const u8,
+    headers: ?[]const u8,
+    body: ?[]const u8,
     response: Response,
     done: bool,
     mutex: std.Thread.Mutex,
@@ -165,6 +207,11 @@ const RequestContext = struct {
         self.done = true;
         self.cond.signal();
         self.mutex.unlock();
+    }
+
+    fn cleanup(self: *RequestContext) void {
+        if (self.headers) |h| self.allocator.free(h);
+        if (self.body) |b| self.allocator.free(b);
     }
 };
 
@@ -191,6 +238,40 @@ fn handleRequest(allocator: Allocator, ctx_ptr: *RequestContext) void {
             }
         }.run,
     });
+}
+
+fn buildRequest(
+    buf: []u8,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    headers: ?[]const u8,
+    body: ?[]const u8,
+) ![]const u8 {
+    if (body) |b| {
+        const content_len = b.len;
+        if (headers) |h| {
+            return std.fmt.bufPrint(buf,
+                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+                .{ method, path, host, h, content_len, b },
+            );
+        }
+        return std.fmt.bufPrint(buf,
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+            .{ method, path, host, content_len, b },
+        );
+    } else {
+        if (headers) |h| {
+            return std.fmt.bufPrint(buf,
+                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Connection: keep-alive\r\n\r\n",
+                .{ method, path, host, h },
+            );
+        }
+        return std.fmt.bufPrint(buf,
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
+            .{ method, path, host },
+        );
+    }
 }
 
 fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
@@ -281,19 +362,19 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
 
     // Send request
     var req_buf: [4096]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
-        .{ parsed.path, parsed.host },
-    ) catch {
+    const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
+        ctx.cleanup();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "request too large");
         ctx.notify();
         return;
     };
     stream.write(req) catch {
+        ctx.cleanup();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
         ctx.notify();
         return;
     };
+    ctx.cleanup();
 
     // Read response
     var resp_buf: [65536]u8 = undefined;

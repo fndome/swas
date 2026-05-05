@@ -2,11 +2,11 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
-const IORegistry = @import("../io_registry.zig").IORegistry;
-const RingShared = @import("../ring_shared.zig").RingShared;
-const InvokeQueue = @import("../io_invoke.zig").InvokeQueue;
+const IORegistry = @import("../shared/io_registry.zig").IORegistry;
+const RingShared = @import("../shared/ring_shared.zig").RingShared;
+const InvokeQueue = @import("../shared/io_invoke.zig").InvokeQueue;
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
-const CLIENT_USER_DATA_FLAG = @import("../io_registry.zig").CLIENT_USER_DATA_FLAG;
+const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_DATA_FLAG;
 
 /// 独立 HTTP 客户端 io_uring Ring (Ring B)。
 ///

@@ -3,7 +3,7 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
 const RingShared = @import("ring_shared.zig").RingShared;
-const DnsResolver = @import("dns/resolver.zig").DnsResolver;
+const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 
 pub const CLIENT_READ_BUF = 16384;
 
