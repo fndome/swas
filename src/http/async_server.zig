@@ -1563,6 +1563,10 @@ fn executeNext(self: *Self, req: *const Item) void {
         conn.write_headers_len = len;
         conn.write_offset = 0;
         conn.state = .writing;
+        // Clear HTTP workspace before switching to WebSocket protocol
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            @memset(sticker.rawWorkspace(&self.pool.slots[conn.pool_idx]), 0);
+        }
         // The response buffer already has the upgrade response.
         // onWriteComplete will detect ws_writing_complete by checking ws_active.
         self.submitWrite(conn_id, conn) catch {

@@ -147,6 +147,9 @@ comptime {
 }
 
 const CacheLine4_6 = extern struct {
+    /// NOTE: write_iovs live here (Line4), NOT in workspace (Line5).
+    /// This guarantees in-flight write iovecs are never corrupted
+    /// by workspace union state switches (http→ws, ws→compute).
     response_buf_ptr: u64 = 0,
     response_buf_tier: u8 = 0,
     _pad: [3]u8 = [_]u8{0} ** 3,
