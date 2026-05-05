@@ -88,18 +88,19 @@ pub const Fiber = struct {
 /// 队列存储 slot_idx 用于 resume 前对 workspace 做 prefetch。
 pub const ResumeEntry = struct {
     slot_idx: u32,
+    gen_id: u32,
     data: []const u8,
 };
 
 const RESUME_QUEUE_CAP = 16;
-pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .data = "" }} ** RESUME_QUEUE_CAP;
+pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
 pub threadlocal var resume_head: u8 = 0;
 pub threadlocal var resume_tail: u8 = 0;
 
-pub fn pushResume(slot_idx: u32, data: []const u8) void {
+pub fn pushResume(slot_idx: u32, gen_id: u32, data: []const u8) void {
     const next = resume_tail +% 1;
-    if (next == resume_head) return; // queue full, drop (shouldn't happen in 1C)
-    resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .data = data };
+    if (next == resume_head) return;
+    resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .gen_id = gen_id, .data = data };
     resume_tail = next;
 }
 

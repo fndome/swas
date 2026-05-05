@@ -1103,12 +1103,13 @@ pub const AsyncServer = struct {
         self.should_stop = true;
     }
 
-    fn drainPendingResumes() void {
+    fn drainPendingResumes(self: *Self) void {
         while (Fiber.popResume()) |entry| {
-            // Prefetch workspace into L1 before fiber touches it
-            // Fiber resume path typically reads workspace early
-            if (entry.slot_idx != 0) {
-                // Future: prefetch slot workspace by slot_idx
+            // Ghost fiber defense: slot may have been released and reused.
+            // Verify gen_id matches before allowing resume.
+            if (entry.slot_idx != 0 and entry.gen_id != 0) {
+                const slot = &self.pool.slots[entry.slot_idx];
+                if (slot.line1.gen_id != entry.gen_id) continue;
             }
             Fiber.resumeYielded(entry.data);
         }
@@ -1150,7 +1151,7 @@ pub const AsyncServer = struct {
             if (n > 0) {
                 // 高速路径: 有事件就处理，不阻塞
                 self.dispatchCqes(&cqes, n);
-                drainPendingResumes();
+                self.drainPendingResumes();
                 // Next.go() 任务: 同一线程 fiber 执行
                 self.drainNextTasks();
                 // tick 钩子: 每轮必触发（倒计时、超时检测等）
@@ -1190,7 +1191,7 @@ pub const AsyncServer = struct {
             _ = try self.ring.submit_and_wait(1);
             const n2 = try self.ring.copy_cqes(&cqes, 0);
             self.dispatchCqes(&cqes, n2);
-            drainPendingResumes();
+            self.drainPendingResumes();
             if (self.fiber_shared) |fs| fs.tick();
             self.ttlScanTick();
         }
