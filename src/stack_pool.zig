@@ -195,13 +195,14 @@ pub const HttpWork = extern struct {
     method: u8 = 0,
     version: u8 = 0,
     content_length: u64 = 0,
-    /// 路径在原始 buffer 中的起始偏移
     path_offset: u16 = 0,
-    /// 路径字节长度（不含 query string 时指向 ? 之前）
     path_len: u16 = 0,
-    /// headers 结束偏移（\r\n\r\n 的字节位置，不含结尾 CRLF）
     headers_end: u16 = 0,
-    _fill: [34]u8 = [_]u8{0} ** 34,
+    /// 上次短读的 buffer ID（用于跨 TCP 分片的 header 拼包）
+    pending_bid: u16 = 0,
+    /// 上次短读已累积的字节数
+    pending_len: u16 = 0,
+    _fill: [30]u8 = [_]u8{0} ** 30,
 };
 
 pub const WsWork = extern struct {

@@ -887,53 +887,94 @@ pub const AsyncServer = struct {
         const read_buf = self.buffer_pool.getReadBuf(bid);
         const nread = @as(usize, @intCast(res));
 
-        if (conn.read_len > 0) self.buffer_pool.markReplenish(conn.read_bid);
-        conn.read_bid = bid;
-        conn.read_len = nread;
+        // ── Short-read reassembly: combine with pending partial header ──
+        var effective_buf: []const u8 = read_buf[0..nread];
+        var effective_nread = nread;
+        var pending_to_free: u16 = 0;
 
-        const has_header_end = std.mem.indexOf(u8, read_buf[0..nread], "\r\n\r\n") != null or
-            std.mem.indexOf(u8, read_buf[0..nread], "\n\n") != null;
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+            if (hw.pending_len > 0 and hw.pending_bid != 0) {
+                // Combine pending buffer with current read
+                const prev_buf = self.buffer_pool.getReadBuf(hw.pending_bid);
+                // Stack-local combo buffer (8KB max header)
+                var combo: [8192]u8 = undefined;
+                const prev_len = @min(hw.pending_len, combo.len);
+                const cur_len = @min(nread, combo.len - prev_len);
+                @memcpy(combo[0..prev_len], prev_buf[0..prev_len]);
+                @memcpy(combo[prev_len..][0..cur_len], read_buf[0..cur_len]);
+                effective_buf = combo[0 .. prev_len + cur_len];
+                effective_nread = prev_len + cur_len;
+                pending_to_free = hw.pending_bid;
+                hw.pending_bid = 0;
+                hw.pending_len = 0;
+            }
+        }
+
+        // Recycle previous read buffer (if not a pending one we just combined)
+        if (conn.read_len > 0 and conn.read_bid != pending_to_free) {
+            self.buffer_pool.markReplenish(conn.read_bid);
+        }
+        if (pending_to_free != 0) {
+            self.buffer_pool.markReplenish(pending_to_free);
+        }
+        conn.read_bid = bid;
+        conn.read_len = effective_nread;
+
+        const has_header_end = std.mem.indexOf(u8, effective_buf, "\r\n\r\n") != null or
+            std.mem.indexOf(u8, effective_buf, "\n\n") != null;
         if (!has_header_end) {
-            self.buffer_pool.markReplenish(bid);
+            if (effective_nread > self.cfg.max_header_buffer_size) {
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                self.respond(conn, 431, "Request Header Fields Too Large");
+                return;
+            }
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+                hw.pending_bid = bid;
+                hw.pending_len = @intCast(effective_nread);
+            }
             conn.read_len = 0;
-            self.respond(conn, 431, "Request Header Fields Too Large");
+            self.submitRead(conn_id, conn) catch |err| {
+                logErr("submitRead failed during header reassembly: {s}", .{@errorName(err)});
+                self.closeConn(conn_id, conn.fd);
+            };
             return;
         }
         conn.state = .processing;
 
-        conn.keep_alive = isKeepAliveConnection(read_buf[0..nread]);
+        conn.keep_alive = isKeepAliveConnection(effective_buf);
 
-        // Store parse metadata in workspace for downstream use (short-read reassembly, fiber state)
+        // Store parse metadata in workspace
         if (conn.pool_idx != 0xFFFFFFFF) {
             const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
-            hw.header_len = @intCast(@min(nread, 65535));
-            hw.method = if (nread > 0) read_buf[0] else 'G';
-            // Locate path start (after method + space)
-            if (std.mem.indexOfScalar(u8, read_buf[0..nread], ' ')) |sp1| {
+            hw.header_len = @intCast(@min(effective_nread, 65535));
+            hw.method = if (effective_nread > 0) effective_buf[0] else 'G';
+            hw.pending_bid = 0;
+            hw.pending_len = 0;
+            if (std.mem.indexOfScalar(u8, effective_buf, ' ')) |sp1| {
                 const after_method = sp1 + 1;
-                if (after_method < nread) {
+                if (after_method < effective_nread) {
                     const path_start = after_method;
-                    if (std.mem.indexOfScalar(u8, read_buf[path_start..nread], ' ')) |sp2| {
+                    if (std.mem.indexOfScalar(u8, effective_buf[path_start..effective_nread], ' ')) |sp2| {
                         hw.path_offset = @intCast(path_start);
                         hw.path_len = @intCast(sp2);
                     }
                 }
             }
-            // Locate headers end
-            if (std.mem.indexOf(u8, read_buf[0..nread], "\r\n\r\n")) |pos| {
+            if (std.mem.indexOf(u8, effective_buf, "\r\n\r\n")) |pos| {
                 hw.headers_end = @intCast(pos);
-            } else if (std.mem.indexOf(u8, read_buf[0..nread], "\n\n")) |pos| {
+            } else if (std.mem.indexOf(u8, effective_buf, "\n\n")) |pos| {
                 hw.headers_end = @intCast(pos);
             }
-            // Parse Content-Length if present
-            if (std.mem.indexOf(u8, read_buf[0..nread], "Content-Length:")) |cl_pos| {
+            if (std.mem.indexOf(u8, effective_buf, "Content-Length:")) |cl_pos| {
                 const val_start = cl_pos + "Content-Length:".len;
                 var end = val_start;
-                while (end < nread and read_buf[end] != '\r' and read_buf[end] != '\n') : (end += 1) {}
-                const val = std.mem.trim(u8, read_buf[val_start..end], " \t");
+                while (end < effective_nread and effective_buf[end] != '\r' and effective_buf[end] != '\n') : (end += 1) {}
+                const val = std.mem.trim(u8, effective_buf[val_start..end], " \t");
                 hw.content_length = std.fmt.parseInt(u64, val, 10) catch 0;
             }
-            // Oversized detection: flag slot for Worker Pool handoff
             if (hw.content_length > OVERSIZED_THRESHOLD) {
                 self.pool.slots[conn.pool_idx].line1.oversized = true;
             }
@@ -944,11 +985,11 @@ pub const AsyncServer = struct {
             const slot = &self.pool.slots[conn.pool_idx];
             const hw = sticker.httpWork(slot);
             const headers_end = if (hw.headers_end > 0) hw.headers_end + 4 else nread; // +4 for \r\n\r\n
-            if (headers_end >= nread) {
+            if (headers_end >= effective_nread) {
                 // Body hasn't started yet — keep reading normally until we have body data
                 // fall through to normal read path
             } else {
-                const body_fragment = read_buf[headers_end..nread];
+                const body_fragment = effective_buf[headers_end..effective_nread];
                 const large_buf = self.large_pool.acquire() orelse {
                     self.buffer_pool.markReplenish(bid);
                     conn.read_len = 0;
@@ -979,23 +1020,23 @@ pub const AsyncServer = struct {
 
         const path = if (conn.pool_idx != 0xFFFFFFFF) blk: {
             const hw2 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
-            if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= nread)
-                break :blk read_buf[hw2.path_offset..][0..hw2.path_len];
-            break :blk getPathFromRequest(read_buf[0..nread]) orelse {
+            if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= effective_nread)
+                break :blk effective_buf[hw2.path_offset..][0..hw2.path_len];
+            break :blk getPathFromRequest(effective_buf) orelse {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
                 self.respond(conn, 400, "Bad Request");
                 return;
             };
-        } else getPathFromRequest(read_buf[0..nread]) orelse {
+        } else getPathFromRequest(effective_buf) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 400, "Bad Request");
             return;
         };
 
-        if (self.ws_server.hasHandlers() and ws_upgrade.isUpgradeRequest(read_buf[0..nread])) {
-            self.tryWsUpgrade(conn_id, conn, path, read_buf[0..nread], bid);
+        if (self.ws_server.hasHandlers() and ws_upgrade.isUpgradeRequest(effective_buf)) {
+            self.tryWsUpgrade(conn_id, conn, path, effective_buf, bid);
             return;
         }
 
@@ -1004,7 +1045,7 @@ pub const AsyncServer = struct {
             self.respond_middlewares.wildcard.items.len > 0)
         {
             var temp_ctx = Context{
-                .request_data = read_buf[0..nread],
+                .request_data = effective_buf,
                 .path = path,
                 .app_ctx = self.app_ctx,
                 .allocator = self.allocator,
@@ -1113,9 +1154,8 @@ pub const AsyncServer = struct {
             self.middlewares.wildcard.items.len > 0 or
             self.handlers.count() > 0;
         if (has_async) {
-            const selected_buf = self.buffer_pool.getReadBuf(conn.read_bid);
-            const read_len = conn.read_len;
-            const method_str = getMethodFromRequest(selected_buf[0..read_len]) orelse "GET";
+            const selected_buf = effective_buf;
+            const method_str = getMethodFromRequest(selected_buf) orelse "GET";
 
             const t = self.http_ctx_pool.create(self.allocator) catch {
                 self.respond(conn, 500, "Internal Server Error");
@@ -1130,7 +1170,7 @@ pub const AsyncServer = struct {
                 .read_bid = conn.read_bid,
                 .method_len = method_cap,
                 .path_len = path_cap,
-                .request_data = selected_buf[0..read_len],
+                .request_data = @constCast(selected_buf),
             };
             @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
             @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
