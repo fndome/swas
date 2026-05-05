@@ -86,4 +86,12 @@ pub const TinyCache = struct {
     pub fn touch(self: *TinyCache, now_ms: i64) void {
         self.last_used_ms = now_ms;
     }
+
+    /// 周期调用（如 server.addHookTick），TTL 过期时主动淘汰空闲连接。
+    /// 零成本：无缓存或未过期时仅一次时间戳比较。
+    pub fn tick(self: *TinyCache, now_ms: i64) void {
+        if (self.stream != null and now_ms - self.last_used_ms >= self.ttl_ms) {
+            self.evict();
+        }
+    }
 };
