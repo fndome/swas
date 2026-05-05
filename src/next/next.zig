@@ -492,6 +492,7 @@ pub const Next = struct {
                 }
             }.run,
         );
+        alloc.destroy(w);
     }
 
     const DeferredResponse = @import("../root.zig").DeferredResponse;

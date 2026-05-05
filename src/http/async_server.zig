@@ -691,12 +691,10 @@ pub const AsyncServer = struct {
         const slot = &self.pool.slots[conn.pool_idx];
         slot.line3.large_buf_offset += @intCast(res);
         if (slot.line3.large_buf_offset >= slot.line3.large_buf_len) {
-            // Body complete. Set processing state — this implicitly
-            // suspends further reads on this FD until the handler finishes.
+            // Body 收齐 → 运行 handler
             conn.state = .processing;
             const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-            // Body complete — run normal handler path
-            self.processOversizedRequest(conn_id, conn, buf);
+            self.processBodyRequest(conn_id, conn, buf);
         } else {
             const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
             self.submitBodyRead(conn, buf, slot) catch {
@@ -707,12 +705,179 @@ pub const AsyncServer = struct {
         }
     }
 
-    fn processOversizedRequest(self: *Self, conn_id: u64, conn: *Connection, body: []u8) void {
-        _ = self;
-        _ = conn_id;
-        _ = conn;
-        _ = body;
-        // TODO: invoke handler with pre-received large body
+    fn processBodyRequest(self: *Self, conn_id: u64, conn: *Connection, body_buf: []u8) void {
+        const bid = conn.read_bid;
+        const header_buf = self.buffer_pool.getReadBuf(bid);
+        const effective_buf = header_buf;
+        const path = getPathFromRequest(effective_buf) orelse {
+            self.buffer_pool.markReplenish(bid);
+            self.large_pool.release(body_buf);
+            conn.read_len = 0;
+            self.respond(conn, 400, "Bad Request");
+            return;
+        };
+
+        if (self.respond_middlewares.has_global or
+            self.respond_middlewares.precise.count() > 0 or
+            self.respond_middlewares.wildcard.items.len > 0)
+        {
+            var temp_ctx = Context{
+                .request_data = effective_buf,
+                .path = path,
+                .app_ctx = self.app_ctx,
+                .allocator = self.allocator,
+                .status = 200,
+                .content_type = .plain,
+                .body = null,
+                .headers = null,
+                .conn_id = conn_id,
+                .server = @ptrCast(self),
+            };
+            defer temp_ctx.deinit();
+
+            if (self.respond_middlewares.has_global) {
+                for (self.respond_middlewares.global.items) |mw| {
+                    _ = mw(self.allocator, &temp_ctx) catch |err| {
+                        logErr("respond middleware error: {s}", .{@errorName(err)});
+                        break;
+                    };
+                    if (temp_ctx.body != null) break;
+                }
+            }
+
+            if (temp_ctx.body == null) {
+                if (self.respond_middlewares.precise.get(path)) |list| {
+                    for (list.items) |mw| {
+                        _ = mw(self.allocator, &temp_ctx) catch |err| {
+                            logErr("respond middleware error: {s}", .{@errorName(err)});
+                            break;
+                        };
+                        if (temp_ctx.body != null) break;
+                    }
+                }
+            }
+
+            if (temp_ctx.body == null) {
+                for (self.respond_middlewares.wildcard.items) |entry| {
+                    if (entry.rule.match(path)) {
+                        for (entry.list.items) |mw| {
+                            _ = mw(self.allocator, &temp_ctx) catch |err| {
+                                logErr("respond middleware error: {s}", .{@errorName(err)});
+                                break;
+                            };
+                            if (temp_ctx.body != null) break;
+                        }
+                        if (temp_ctx.body != null) break;
+                    }
+                }
+            }
+
+            self.large_pool.release(body_buf);
+            conn.read_len = 0;
+
+            const extra_headers = if (temp_ctx.headers) |h| h.items else "";
+
+            if (temp_ctx.body) |body| {
+                if (!self.ensureWriteBuf(conn, 512 + body.len + extra_headers.len)) {
+                    self.allocator.free(body);
+                    temp_ctx.body = null;
+                    self.closeConn(conn_id, conn.fd);
+                    return;
+                }
+                const buf = conn.response_buf.?;
+                const mime = switch (temp_ctx.content_type) {
+                    .plain => "text/plain",
+                    .json => "application/json",
+                    .html => "text/html",
+                };
+                const reason = statusText(temp_ctx.status);
+                const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
+                const len = std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n{s}", .{ temp_ctx.status, reason, mime, extra_headers, body.len, conn_hdr, body }) catch {
+                    self.respondError(conn);
+                    return;
+                };
+                conn.write_headers_len = len.len;
+                conn.write_offset = 0;
+                conn.write_body = null;
+                conn.state = .writing;
+                self.submitWrite(conn_id, conn) catch {
+                    self.closeConn(conn_id, conn.fd);
+                };
+            } else if (extra_headers.len > 0) {
+                if (!self.ensureWriteBuf(conn, 256 + extra_headers.len)) {
+                    self.closeConn(conn_id, conn.fd);
+                    return;
+                }
+                const buf = conn.response_buf.?;
+                const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
+                const len = std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n{s}Content-Length: 0\r\nConnection: {s}\r\n\r\n", .{ extra_headers, conn_hdr }) catch {
+                    self.respondError(conn);
+                    return;
+                };
+                conn.write_headers_len = len.len;
+                conn.write_offset = 0;
+                conn.state = .writing;
+                self.submitWrite(conn_id, conn) catch {
+                    self.closeConn(conn_id, conn.fd);
+                };
+            } else {
+                self.respond(conn, 200, "OK");
+            }
+            return;
+        }
+
+        const has_async = self.middlewares.has_global or
+            self.middlewares.precise.count() > 0 or
+            self.middlewares.wildcard.items.len > 0 or
+            self.handlers.count() > 0;
+        if (has_async) {
+            const method_str = getMethodFromRequest(effective_buf) orelse "POST";
+            const t = self.http_ctx_pool.create(self.allocator) catch {
+                self.buffer_pool.markReplenish(bid);
+                self.large_pool.release(body_buf);
+                self.respond(conn, 500, "Internal Server Error");
+                return;
+            };
+            const method_cap: u4 = @intCast(@min(method_str.len, 15));
+            const path_cap: u8 = @intCast(@min(path.len, 255));
+            t.* = .{
+                .tag = 0x48540001,
+                .server = self,
+                .conn_id = conn_id,
+                .read_bid = conn.read_bid,
+                .method_len = method_cap,
+                .path_len = path_cap,
+                .request_data = @constCast(body_buf), // body_buf now serves as request_data
+            };
+            @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
+            @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
+
+            if (self.shared_fiber_active) {
+                if (self.next) |*n| {
+                    n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                } else {
+                    self.http_ctx_pool.destroy(t);
+                    self.buffer_pool.markReplenish(bid);
+                    self.large_pool.release(body_buf);
+                    self.respond(conn, 503, "Service Unavailable");
+                }
+            } else {
+                var fiber = Fiber.init(self.shared_fiber_stack);
+                self.shared_fiber_active = true;
+                fiber.exec(.{
+                    .userCtx = t,
+                    .complete = httpTaskComplete,
+                    .execFn = httpTaskExec,
+                });
+            }
+            conn.read_len = 0;
+            return;
+        }
+
+            self.large_pool.release(body_buf);
+            self.buffer_pool.markReplenish(bid);
+            conn.read_len = 0;
+        self.respond(conn, 404, "Not Found");
     }
 
     /// 统一连接查找：先走 sticker (pool slot)，再走 hashmap 兜底。
@@ -980,38 +1145,48 @@ pub const AsyncServer = struct {
             }
         }
 
-        // ── Oversized body: switch to explicit buffer reads ──
-        if (conn.pool_idx != 0xFFFFFFFF and self.pool.slots[conn.pool_idx].line1.oversized) {
+        // ── Body 跨多个 io_uring buffer：切到 LargeBufferPool 逐块收 ──
+        const body_incomplete = brk: {
+            if (conn.pool_idx == 0xFFFFFFFF) break :brk false;
+            const hw3 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+            if (hw3.content_length == 0) break :brk false;
+            const headers_end = if (hw3.headers_end > 0) hw3.headers_end + 4 else effective_nread;
+            const body_avail: usize = if (effective_nread > headers_end) effective_nread - headers_end else 0;
+            break :brk body_avail < hw3.content_length;
+        };
+
+        if (body_incomplete) {
             const slot = &self.pool.slots[conn.pool_idx];
-            const hw = sticker.httpWork(slot);
-            const headers_end = if (hw.headers_end > 0) hw.headers_end + 4 else nread; // +4 for \r\n\r\n
+            const hw4 = sticker.httpWork(slot);
+            const headers_end = if (hw4.headers_end > 0) hw4.headers_end + 4 else effective_nread;
             if (headers_end >= effective_nread) {
-                // Body hasn't started yet — keep reading normally until we have body data
-                // fall through to normal read path
+                // 未达到 Body，等待继续读
             } else {
+                // 保存请求头元数据到 StackSlot（供 body 收齐后 handler 使用）
+                slot.line5.ws.compute.job_id = conn_id;
+                slot.line5.ws.compute.buffer_ptr = hw4.content_length; // 复用：存 content_length
+
                 const body_fragment = effective_buf[headers_end..effective_nread];
-                const large_buf = self.large_pool.acquire() orelse {
+                var large_buf = self.large_pool.acquire() orelse {
                     self.buffer_pool.markReplenish(bid);
                     conn.read_len = 0;
                     self.respond(conn, 413, "Content Too Large");
                     return;
                 };
                 slot.line3.large_buf_ptr = @intFromPtr(large_buf.ptr);
-                slot.line3.large_buf_len = @intCast(@min(hw.content_length, large_buf.len));
+                slot.line3.large_buf_len = @intCast(@min(hw4.content_length, large_buf.len));
                 slot.line3.large_buf_offset = 0;
 
-                // Copy body fragment from provided buffer to large_buf
                 @memcpy(large_buf[0..body_fragment.len], body_fragment);
                 slot.line3.large_buf_offset = @intCast(body_fragment.len);
 
-                // Return provided buffer
-                self.buffer_pool.markReplenish(bid);
+                // 不释放 bid — 保留 header buffer 供 body 收齐后 handler 使用
                 conn.read_len = 0;
 
-                // Submit explicit read for remaining body
                 conn.state = .receiving_body;
                 self.submitBodyRead(conn, large_buf, slot) catch {
                     self.large_pool.release(large_buf);
+                    slot.line3.large_buf_ptr = 0;
                     self.closeConn(conn_id, conn.fd);
                 };
                 return;
