@@ -56,6 +56,8 @@ const unpackGenId = @import("../stack_pool.zig").unpackGenId;
 const unpackIdx = @import("../stack_pool.zig").unpackIdx;
 const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
 const sticker = @import("../stack_pool_sticker.zig");
+const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
+const LargeBufferPool = @import("../shared/large_buffer_pool.zig").LargeBufferPool;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -125,6 +127,8 @@ pub const AsyncServer = struct {
 
     should_stop: bool = false,
     buffer_pool: BufferPool,
+    /// 大报文专用缓冲池（每块 1MB），content_length > 32KB 时触发
+    large_pool: LargeBufferPool(64),
 
     /// Set when submitAccept fails; cleared on successful submission.
     /// Used by the event loop to detect and recover broken accept chains.
@@ -313,6 +317,9 @@ pub const AsyncServer = struct {
         errdefer conn_pool.deinit(allocator);
         conn_pool.warmup();
 
+        var large_pool = try LargeBufferPool(64).init(allocator);
+        errdefer large_pool.deinit(allocator);
+
         var user_map = std.AutoHashMap(u64, u32).init(allocator);
         errdefer user_map.deinit();
 
@@ -332,6 +339,7 @@ pub const AsyncServer = struct {
             .next_user_data = 1,
             .app_ctx = app_ctx,
             .buffer_pool = bp,
+            .large_pool = large_pool,
             .use_fixed_files = use_ff,
             .fixed_file_freelist = ff_freelist,
             .fixed_file_next = 0,
@@ -391,6 +399,7 @@ pub const AsyncServer = struct {
         self.submit_registry.deinit();
         self.ring.deinit();
         self.buffer_pool.deinit();
+        self.large_pool.deinit(self.allocator);
         self.fixed_file_freelist.deinit(self.allocator);
         self.ws_server.closeAllActive();
         self.ws_server.deinit();
@@ -655,6 +664,55 @@ pub const AsyncServer = struct {
         }
     }
 
+    fn submitBodyRead(self: *Self, conn: *Connection, large_buf: []u8, slot: *StackSlot) !void {
+        const remaining = slot.line3.large_buf_len - slot.line3.large_buf_offset;
+        if (remaining == 0) return;
+        const user_data = packUserData(conn.gen_id, conn.pool_idx);
+        const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
+        const dest = large_buf[slot.line3.large_buf_offset..][0..@min(remaining, large_buf.len - slot.line3.large_buf_offset)];
+        const sqe = try self.ring.read(user_data, fd, .{ .buffer = dest }, 0);
+        if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+
+    fn onBodyChunk(self: *Self, conn_id: u64, res: i32) void {
+        const conn = self.getConn(conn_id) orelse return;
+        if (res <= 0) {
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                const slot = &self.pool.slots[conn.pool_idx];
+                if (slot.line3.large_buf_ptr != 0) {
+                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+                    self.large_pool.release(buf);
+                    slot.line3.large_buf_ptr = 0;
+                }
+            }
+            self.closeConn(conn_id, conn.fd);
+            return;
+        }
+        const slot = &self.pool.slots[conn.pool_idx];
+        slot.line3.large_buf_offset += @intCast(res);
+        if (slot.line3.large_buf_offset >= slot.line3.large_buf_len) {
+            conn.state = .processing;
+            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+            // Body complete — run normal handler path
+            self.processOversizedRequest(conn_id, conn, buf);
+        } else {
+            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+            self.submitBodyRead(conn, buf, slot) catch {
+                self.large_pool.release(buf);
+                slot.line3.large_buf_ptr = 0;
+                self.closeConn(conn_id, conn.fd);
+            };
+        }
+    }
+
+    fn processOversizedRequest(self: *Self, conn_id: u64, conn: *Connection, body: []u8) void {
+        _ = self;
+        _ = conn_id;
+        _ = conn;
+        _ = body;
+        // TODO: invoke handler with pre-received large body
+    }
+
     /// 统一连接查找：先走 sticker (pool slot)，再走 hashmap 兜底。
     fn getConn(self: *Self, conn_id: u64) ?*Connection {
         if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
@@ -848,6 +906,73 @@ pub const AsyncServer = struct {
             const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
             hw.header_len = @intCast(@min(nread, 65535));
             hw.method = if (nread > 0) read_buf[0] else 'G';
+            // Locate path start (after method + space)
+            if (std.mem.indexOfScalar(u8, read_buf[0..nread], ' ')) |sp1| {
+                const after_method = sp1 + 1;
+                if (after_method < nread) {
+                    const path_start = after_method;
+                    if (std.mem.indexOfScalar(u8, read_buf[path_start..nread], ' ')) |sp2| {
+                        hw.path_offset = @intCast(path_start);
+                        hw.path_len = @intCast(sp2);
+                    }
+                }
+            }
+            // Locate headers end
+            if (std.mem.indexOf(u8, read_buf[0..nread], "\r\n\r\n")) |pos| {
+                hw.headers_end = @intCast(pos);
+            } else if (std.mem.indexOf(u8, read_buf[0..nread], "\n\n")) |pos| {
+                hw.headers_end = @intCast(pos);
+            }
+            // Parse Content-Length if present
+            if (std.mem.indexOf(u8, read_buf[0..nread], "Content-Length:")) |cl_pos| {
+                const val_start = cl_pos + "Content-Length:".len;
+                var end = val_start;
+                while (end < nread and read_buf[end] != '\r' and read_buf[end] != '\n') : (end += 1) {}
+                const val = std.mem.trim(u8, read_buf[val_start..end], " \t");
+                hw.content_length = std.fmt.parseInt(u64, val, 10) catch 0;
+            }
+            // Oversized detection: flag slot for Worker Pool handoff
+            if (hw.content_length > OVERSIZED_THRESHOLD) {
+                self.pool.slots[conn.pool_idx].line1.oversized = true;
+            }
+        }
+
+        // ── Oversized body: switch to explicit buffer reads ──
+        if (conn.pool_idx != 0xFFFFFFFF and self.pool.slots[conn.pool_idx].line1.oversized) {
+            const slot = &self.pool.slots[conn.pool_idx];
+            const hw = sticker.httpWork(slot);
+            const headers_end = if (hw.headers_end > 0) hw.headers_end + 4 else nread; // +4 for \r\n\r\n
+            if (headers_end >= nread) {
+                // Body hasn't started yet — keep reading normally until we have body data
+                // fall through to normal read path
+            } else {
+                const body_fragment = read_buf[headers_end..nread];
+                const large_buf = self.large_pool.acquire() orelse {
+                    self.buffer_pool.markReplenish(bid);
+                    conn.read_len = 0;
+                    self.respond(conn, 413, "Content Too Large");
+                    return;
+                };
+                slot.line3.large_buf_ptr = @intFromPtr(large_buf.ptr);
+                slot.line3.large_buf_len = @intCast(@min(hw.content_length, large_buf.len));
+                slot.line3.large_buf_offset = 0;
+
+                // Copy body fragment from provided buffer to large_buf
+                @memcpy(large_buf[0..body_fragment.len], body_fragment);
+                slot.line3.large_buf_offset = @intCast(body_fragment.len);
+
+                // Return provided buffer
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+
+                // Submit explicit read for remaining body
+                conn.state = .receiving_body;
+                self.submitBodyRead(conn, large_buf, slot) catch {
+                    self.large_pool.release(large_buf);
+                    self.closeConn(conn_id, conn.fd);
+                };
+                return;
+            }
         }
 
         const path = getPathFromRequest(read_buf[0..nread]) orelse {
@@ -1236,6 +1361,8 @@ pub const AsyncServer = struct {
 
                 if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
                     self.onReadComplete(conn_id, res, user_data, cqe.flags);
+                } else if (conn_ptr.state == .receiving_body) {
+                    self.onBodyChunk(conn_id, res);
                 } else if (conn_ptr.state == .writing) {
                     self.onWriteComplete(conn_id, res, user_data);
                 } else if (conn_ptr.state == .ws_reading) {

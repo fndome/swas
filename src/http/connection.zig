@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub const ConnState = enum(u8) {
     reading,
+    /// 接收超大 body（>32KB），走显式 buffer 逐块收
+    receiving_body,
     processing,
     writing,
     closing,

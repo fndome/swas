@@ -195,7 +195,13 @@ pub const HttpWork = extern struct {
     method: u8 = 0,
     version: u8 = 0,
     content_length: u64 = 0,
-    _fill: [40]u8 = [_]u8{0} ** 40,
+    /// 路径在原始 buffer 中的起始偏移
+    path_offset: u16 = 0,
+    /// 路径字节长度（不含 query string 时指向 ? 之前）
+    path_len: u16 = 0,
+    /// headers 结束偏移（\r\n\r\n 的字节位置，不含结尾 CRLF）
+    headers_end: u16 = 0,
+    _fill: [34]u8 = [_]u8{0} ** 34,
 };
 
 pub const WsWork = extern struct {
