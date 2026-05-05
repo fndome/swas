@@ -7,80 +7,100 @@ const RingShared = @import("../shared/ring_shared.zig").RingShared;
 const InvokeQueue = @import("../shared/io_invoke.zig").InvokeQueue;
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_DATA_FLAG;
+const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
+const RingTrait = @import("../shared/fiber_shared.zig").RingTrait;
 
-/// 独立 HTTP 客户端 io_uring Ring (Ring B)。
+const MAX_CQES_TICK = 64;
+
+/// ── Ring B ────────────────────────────────────────────────
 ///
-/// 一根线程一个 Ring，所有外发 HTTP 请求共享同一个 Ring B。
-/// 与 Server Ring (Ring A) 通过 ATTACH_WQ 共享内核 io-wq。
-pub const HttpRing = struct {
+/// 出站 HTTP 客户端 IO 归口。
+/// 持有 ring + RingShared + IORegistry + DnsResolver + InvokeQueue。
+/// 通过 registerWith() 注入 FiberShared 调度胶水，零额外线程。
+///
+/// 用法：
+///   const ring_b = try RingB.init(alloc, io, server.ring.fd);
+///   defer ring_b.deinit();
+///   try ring_b.registerWith(&fiber_shared);
+///   const client = try HttpClient.init(alloc, &ring_b, 1000);
+pub const RingB = struct {
     allocator: Allocator,
     ring: linux.IoUring,
     registry: IORegistry,
     rs: RingShared,
     dns: DnsResolver,
     invoke: InvokeQueue,
-    stop_flag: bool,
 
-    pub fn init(allocator: Allocator, io: std.Io, entries: u16, attach_ring_fd: ?i32) !HttpRing {
+    pub fn init(allocator: Allocator, io: std.Io, attach_ring_fd: i32) !RingB {
         const ns_ip = readResolvConfNameserver() catch @as(u32, 0x08080808);
 
-        var ring = if (attach_ring_fd) |fd| brk: {
+        var ring = brk: {
             var params = std.mem.zeroes(linux.io_uring_params);
-            params.flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_ATTACH_WQ;
-            params.wq_fd = @intCast(fd);
-            break :brk try linux.IoUring.init_params(entries, &params);
-        } else try linux.IoUring.init(entries, 0);
+            params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
+                linux.IORING_SETUP_DEFER_TASKRUN |
+                linux.IORING_SETUP_ATTACH_WQ;
+            params.wq_fd = @intCast(attach_ring_fd);
+            break :brk try linux.IoUring.init_params(256, &params);
+        };
         errdefer ring.deinit();
 
         var registry = IORegistry.init(allocator);
         errdefer registry.deinit();
 
         const rs = RingShared.bind(&ring, &registry);
-
         const dns = try DnsResolver.init(allocator, &ring, &registry, io, ns_ip);
         errdefer dns.deinit();
 
-        return HttpRing{
+        return RingB{
             .allocator = allocator,
             .ring = ring,
             .registry = registry,
             .rs = rs,
             .dns = dns,
             .invoke = .{},
-            .stop_flag = false,
         };
     }
 
-    pub fn deinit(self: *HttpRing) void {
+    pub fn deinit(self: *RingB) void {
+        self.invoke.drain(self.allocator);
         self.dns.deinit();
         self.registry.deinit();
         self.ring.deinit();
     }
 
-    pub fn stop(self: *HttpRing) void {
-        self.stop_flag = true;
+    /// 注入 FiberShared 调度胶水
+    pub fn registerWith(self: *RingB, fs: *FiberShared) !void {
+        try fs.register(RingTrait{
+            .ptr = self,
+            .tickFn = tickCb,
+        });
     }
 
-    /// 事件循环 — 驱动 Ring B 上所有 I/O（DNS + HTTP TCP 连接）。
-    pub fn runLoop(self: *HttpRing) void {
-        var cqes: [64]linux.io_uring_cqe = undefined;
-        while (!self.stop_flag) {
-            self.dns.tick();
-            self.invoke.drain(self.allocator);
-            _ = self.ring.submit() catch {};
-            const n = self.ring.copy_cqes(&cqes, 0) catch continue;
+    fn tickCb(ptr: *anyopaque) void {
+        const self: *RingB = @ptrCast(@alignCast(ptr));
+        self.tick();
+    }
 
-            for (cqes[0..n]) |*cqe| {
-                defer self.ring.cqe_seen(cqe);
-                const ud = cqe.user_data;
-                const res = cqe.res;
-                if (ud & CLIENT_USER_DATA_FLAG != 0) {
-                    self.registry.dispatch(ud, res);
-                }
+    /// 非阻塞收割 Ring B 的 CQE 并分发
+    pub fn tick(self: *RingB) void {
+        self.dns.tick();
+        self.invoke.drain(self.allocator);
+        _ = self.ring.submit() catch {};
+
+        var cqes: [MAX_CQES_TICK]linux.io_uring_cqe = undefined;
+        const n = self.ring.copy_cqes(&cqes, 0) catch return;
+        for (cqes[0..n]) |*cqe| {
+            defer self.ring.cqe_seen(cqe);
+            const ud = cqe.user_data;
+            if (ud & CLIENT_USER_DATA_FLAG != 0) {
+                self.registry.dispatch(ud, cqe.res);
             }
         }
     }
 };
+
+/// 保留向下兼容别名
+pub const HttpRing = RingB;
 
 fn readResolvConfNameserver() !u32 {
     const path = "/etc/resolv.conf\x00";

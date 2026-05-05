@@ -1,8 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const HttpRing = @import("ring.zig").HttpRing;
+const RingB = @import("ring.zig").RingB;
 const RingSharedClient = @import("../shared/tcp_stream.zig").RingSharedClient;
+const TinyCache = @import("tiny_cache.zig").TinyCache;
 const Pipe = @import("../next/pipe.zig").Pipe;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
@@ -73,90 +74,53 @@ fn onData(ctx: ?*anyopaque, data: []u8) void {
 }
 
 fn onClose(ctx: ?*anyopaque) void {
-    _ = ctx;
+    if (ctx) |ptr| {
+        const cache: *TinyCache = @ptrCast(@alignCast(ptr));
+        cache.evict();
+    }
     if (Fiber.isYielded()) Fiber.resumeYielded("");
 }
 
-/// 连接缓存：最近一个连接保持 1 秒，同目的地址可复用。
-const CachedConn = struct {
-    stream: *RingSharedClient,
-    pipe: Pipe,
-    host: []const u8,
-    port: u16,
-    last_used_ms: i64,
-};
-
-/// HTTP 客户端 — 阻塞 get() API，内部异步（独立 Ring B）。
-///
-/// 用法：
-///   const client = try HttpClient.init(alloc);
-///   defer client.deinit();
-///   const resp = try client.get("http://example.com/api/data");
-///   defer resp.deinit();
 pub const HttpClient = struct {
     allocator: Allocator,
-    ring: *HttpRing,
-    thread: std.Thread,
-    cache: ?CachedConn = null,
-    cache_ttl_ms: i64,
+    ring_b: *RingB,
+    cache: *TinyCache,
 
-    pub fn init(allocator: Allocator, io: std.Io, attach_ring_fd: ?i32, cache_ttl_ms: i64) !*HttpClient {
+    pub fn init(allocator: Allocator, ring_b: *RingB, cache: *TinyCache) !*HttpClient {
         const self = try allocator.create(HttpClient);
-        errdefer allocator.destroy(self);
-
-        const ring = try allocator.create(HttpRing);
-        ring.* = try HttpRing.init(allocator, io, 256, attach_ring_fd);
-
         self.* = .{
             .allocator = allocator,
-            .ring = ring,
-            .thread = try std.Thread.spawn(.{}, HttpRing.runLoop, .{ring}),
-            .cache_ttl_ms = cache_ttl_ms,
+            .ring_b = ring_b,
+            .cache = cache,
         };
         return self;
     }
 
     pub fn deinit(self: *HttpClient) void {
-        self.ring.stop();
-        self.thread.join();
-        if (self.cache) |*c| {
-            c.stream.deinit();
-            c.pipe.deinit();
-            self.allocator.free(c.host);
-        }
-        self.ring.deinit();
-        self.allocator.destroy(self.ring);
         self.allocator.destroy(self);
     }
 
-    /// 阻塞调用：GET 请求，完整 Response。
     pub fn get(self: *HttpClient, url: []const u8) !Response {
         return self.request("GET", url, null, null);
     }
 
-    /// 阻塞调用：POST 请求，body 须为完整序列化内容（调用方负责 Content-Type / 编码）。
     pub fn post(self: *HttpClient, url: []const u8, body: []const u8) !Response {
         return self.request("POST", url, null, body);
     }
 
-    /// 阻塞调用：PUT 请求。
     pub fn put(self: *HttpClient, url: []const u8, body: []const u8) !Response {
         return self.request("PUT", url, null, body);
     }
 
-    /// 阻塞调用：PATCH 请求。
     pub fn patch(self: *HttpClient, url: []const u8, body: []const u8) !Response {
         return self.request("PATCH", url, null, body);
     }
 
-    /// 阻塞调用：DELETE 请求。
     pub fn delete(self: *HttpClient, url: []const u8) !Response {
         return self.request("DELETE", url, null, null);
     }
 
-    /// 通用 HTTP 请求（POST/PUT 自动附带 Content-Length，headers 可设 Content-Type 等）。
     pub fn request(self: *HttpClient, method: []const u8, url: []const u8, headers: ?[]const u8, body: ?[]const u8) !Response {
-        // Dup body/headers here (caller's thread) so they survive the invoke queue crossing.
         const headers_dup: ?[]u8 = if (headers) |h| self.allocator.dupe(u8, h) catch null else null;
         errdefer if (headers_dup) |h| self.allocator.free(h);
         const body_dup: ?[]u8 = if (body) |b| self.allocator.dupe(u8, b) catch {
@@ -180,7 +144,7 @@ pub const HttpClient = struct {
             .allocator = self.allocator,
             .client = self,
         };
-        try self.ring.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
+        try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
         ctx.mutex.lock();
         while (!ctx.done) ctx.cond.wait(&ctx.mutex);
         ctx.mutex.unlock();
@@ -286,36 +250,20 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     defer ctx.allocator.free(parsed.host);
 
-    const ip = client.ring.dns.resolve(parsed.host) catch {
+    const ip = client.ring_b.dns.resolve(parsed.host) catch {
         ctx.response = makeErrorResponse(ctx.allocator, 502, "DNS resolution failed");
         ctx.notify();
         return;
     };
 
-    // ── 连接缓存：1s TTL，同 host:port 可复用 ──
     const now = nowMs();
     var stream: *RingSharedClient = undefined;
-    var reuse_pipe = false;
 
-    if (client.cache) |*c| {
-        if (c.port == parsed.port and
-            std.mem.eql(u8, c.host, parsed.host) and
-            now - c.last_used_ms < client.cache_ttl_ms)
-        {
-            stream = c.stream;
-            c.pipe.reset();
-            active_pipe = &c.pipe;
-            reuse_pipe = true;
-        } else {
-            c.stream.deinit();
-            c.pipe.deinit();
-            client.allocator.free(c.host);
-            client.cache = null;
-        }
-    }
-
-    if (!reuse_pipe) {
-        stream = RingSharedClient.init(ctx.allocator, client.ring.rs, onData, onClose, null, null) catch {
+    if (client.cache.getPipe(parsed.host, parsed.port, now)) |pipe| {
+        active_pipe = pipe;
+        stream = client.cache.stream.?;
+    } else {
+        stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(&client.cache)), null) catch {
             ctx.response = makeErrorResponse(ctx.allocator, 502, "client init failed");
             ctx.notify();
             return;
@@ -334,33 +282,19 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             return;
         };
 
-        // Store in cache
-        if (client.cache) |*c| {
-            c.stream.deinit();
-            c.pipe.deinit();
-            client.allocator.free(c.host);
-        }
-        const host_dup = ctx.allocator.dupe(u8, parsed.host) catch {
+        client.cache.store(stream, pipe, parsed.host, parsed.port, now) catch {
             pipe.deinit();
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
             ctx.notify();
             return;
         };
-        client.cache = .{
-            .stream = stream,
-            .pipe = pipe,
-            .host = host_dup,
-            .port = parsed.port,
-            .last_used_ms = now,
-        };
-        active_pipe = &client.cache.?.pipe;
+        active_pipe = client.cache.pipe orelse unreachable;
     }
     defer active_pipe = null;
 
-    const reader = if (client.cache) |*c| c.pipe.reader() else unreachable;
+    const reader = client.cache.pipe.?.reader();
 
-    // Send request
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
         ctx.cleanup();
@@ -370,26 +304,38 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     stream.write(req) catch {
         ctx.cleanup();
+        client.cache.evict();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
         ctx.notify();
         return;
     };
     ctx.cleanup();
 
-    // Read response
     var resp_buf: [65536]u8 = undefined;
     var total: usize = 0;
-    while (true) {
-        const n = reader.read(resp_buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-        if (total >= resp_buf.len) break;
+    const read_ok = blk: {
+        while (true) {
+            const n = reader.read(resp_buf[total..]) catch break :blk false;
+            if (n == 0) break;
+            total += n;
+            if (total >= resp_buf.len) break;
+        }
+        break :blk true;
+    };
+    if (!read_ok) {
+        client.cache.evict();
+        ctx.response = makeErrorResponse(ctx.allocator, 502, "read failed");
+        ctx.notify();
+        return;
     }
 
-    ctx.response = parseResponse(ctx.allocator, resp_buf[0..total]) catch
-        makeErrorResponse(ctx.allocator, 502, "invalid response");
-    ctx.notify();
-
-    // Update cache timestamp
-    if (client.cache) |*c| c.last_used_ms = nowMs();
+    if (parseResponse(ctx.allocator, resp_buf[0..total])) |resp| {
+        ctx.response = resp;
+        ctx.notify();
+        client.cache.touch(nowMs());
+    } else |_| {
+        client.cache.evict();
+        ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
+        ctx.notify();
+    }
 }

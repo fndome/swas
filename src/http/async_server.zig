@@ -48,6 +48,7 @@ const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const RingShared = @import("../shared/ring_shared.zig").RingShared;
+const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -147,6 +148,10 @@ pub const AsyncServer = struct {
 
     /// DNS 解析器 (io_uring 异步 UDP DNS)
     dns_resolver: DnsResolver,
+
+    /// 出站协议统一调度胶水（Ring B / Ring C / ... 注册于此）。
+    /// IO 线程每轮 tick 遍历所有出站 ring 收割 CQE，零额外线程。
+    fiber_shared: ?*FiberShared = null,
 
     /// HTTP 请求 fiber 执行器
     next: ?Next = null,
@@ -1069,6 +1074,8 @@ pub const AsyncServer = struct {
                 self.drainNextTasks();
                 // tick 钩子: 每轮必触发（倒计时、超时检测等）
                 self.drainTick();
+                // 出站 ring CQE 收割（HTTP client / NATS / MySQL 等）
+                if (self.fiber_shared) |fs| fs.tick();
                 // 处理中可能产生新 SQE → 下一轮 submit 带出去
                 continue;
             }
@@ -1091,11 +1098,14 @@ pub const AsyncServer = struct {
             self.drainNextTasks();
             // tick 钩子: 每轮必触发
             self.drainTick();
+            // 出站 ring CQE 收割
+            if (self.fiber_shared) |fs| fs.tick();
 
             // 提交 + 阻塞等至少 1 个完成事件
             _ = try self.ring.submit_and_wait(1);
             const n2 = try self.ring.copy_cqes(&cqes, 0);
             self.dispatchCqes(&cqes, n2);
+            if (self.fiber_shared) |fs| fs.tick();
         }
     }
 

@@ -42,6 +42,9 @@ pub const HttpRing = @import("client/ring.zig").HttpRing;
 pub const HttpClient = @import("client/http_client.zig").HttpClient;
 pub const HttpCaresDns = @import("client/dns.zig").CaresDns;
 pub const DNS_FD_MAGIC = @import("client/dns.zig").DNS_FD_MAGIC;
+pub const TinyCache = @import("client/tiny_cache.zig").TinyCache;
+pub const FiberShared = @import("shared/fiber_shared.zig").FiberShared;
+pub const RingTrait = @import("shared/fiber_shared.zig").RingTrait;
 
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {
