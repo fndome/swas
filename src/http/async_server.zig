@@ -846,6 +846,13 @@ pub const AsyncServer = struct {
 
         conn.keep_alive = isKeepAliveConnection(read_buf[0..nread]);
 
+        // Store parse metadata in workspace for downstream use (short-read reassembly, fiber state)
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+            hw.header_len = @intCast(@min(nread, 65535));
+            hw.method = if (nread > 0) read_buf[0] else 'G';
+        }
+
         const path = getPathFromRequest(read_buf[0..nread]) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
@@ -1590,6 +1597,13 @@ fn executeNext(self: *Self, req: *const Item) void {
             self.closeConn(conn_id, conn.fd);
             return;
         };
+
+        // Store WS frame metadata in workspace for fragmented frame reassembly
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            const ww = sticker.wsWork(&self.pool.slots[conn.pool_idx]);
+            ww.payload_len = frame.payload.len;
+            ww.is_final = frame.fin;
+        }
 
         switch (frame.opcode) {
             .close => {

@@ -9,6 +9,10 @@ const unpackGenId = @import("stack_pool.zig").unpackGenId;
 const unpackIdx = @import("stack_pool.zig").unpackIdx;
 const CLOSE_USER_DATA_FLAG = @import("stack_pool.zig").CLOSE_USER_DATA_FLAG;
 const OVERSIZED_THRESHOLD = @import("stack_pool.zig").OVERSIZED_THRESHOLD;
+const SlotWorkspace = @import("stack_pool.zig").SlotWorkspace;
+const HttpWork = @import("stack_pool.zig").HttpWork;
+const WsWork = @import("stack_pool.zig").WsWork;
+const ComputeWork = @import("stack_pool.zig").ComputeWork;
 
 pub fn logErr(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
@@ -143,19 +147,39 @@ pub fn closeToken(slot: *const StackSlot, idx: u32) u64 {
 
 /// ── Workspace 访问 ────────────────────────────────────
 
-/// 获取工作区的最大连续块（Line5 workspace: 60B）
-pub fn workspace(slot: *StackSlot) []u8 {
-    return &slot.line5.workspace;
+/// 二级计算区原始字节（60B），用于短读拼包等通用操作
+pub fn rawWorkspace(slot: *StackSlot) []u8 {
+    return &slot.line5.ws.raw;
 }
 
-/// Worker Pool 预解析暂存区（Line3: 24B）
-pub fn workerScratch(slot: *StackSlot) []u8 {
-    return &slot.line3.worker_scratch;
+/// HTTP 协议解析工作区：存 header 解析中间态，避免重复扫描
+pub fn httpWork(slot: *StackSlot) *HttpWork {
+    return &slot.line5.ws.http;
 }
 
-/// 写路径临时暂存区（Line4: 48B）
-pub fn writeScratch(slot: *StackSlot) []u8 {
-    return &slot.line4.write_scratch;
+/// WebSocket 帧解析工作区：掩码 + 分片状态
+pub fn wsWork(slot: *StackSlot) *WsWork {
+    return &slot.line5.ws.websocket;
+}
+
+/// Worker Pool 移交工作区：存大块内存指针 + 计算结果
+pub fn computeWork(slot: *StackSlot) *ComputeWork {
+    return &slot.line5.ws.compute;
+}
+
+/// ── Worker Pool 零拷贝移交 ────────────────────────────
+/// 将大块 buffer 指针和 slot index 存入 workspace.compute，
+/// Worker 处理完后通过 index 找回 slot 写入 result_code。
+
+pub fn dispatchCompute(slot: *StackSlot, job_id: u64, buf_ptr: u64) void {
+    const cw = &slot.line5.ws.compute;
+    cw.job_id = job_id;
+    cw.buffer_ptr = buf_ptr;
+    cw.result_code = 0;
+}
+
+pub fn completeCompute(slot: *StackSlot, result_code: i32) void {
+    slot.line5.ws.compute.result_code = result_code;
 }
 
 /// ── 哨兵校验 ──────────────────────────────────────────

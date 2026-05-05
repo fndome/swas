@@ -166,19 +166,56 @@ const CacheLine4_6 = extern struct {
 const CacheLine5 = extern struct {
     /// 哨兵魔数 0x53574153 ("SWAS")，debug 时检测内存越界
     sentinel: u32 = 0x53574153,
-    /// 二级计算区：短读拼包区 + 通用临时暂存 (最大连续块)
-    workspace: [60]u8 = [_]u8{0} ** 60,
+    /// 二级计算区：协议解析 / Worker Pool 移交 / Fiber 虚拟寄存器
+    ws: SlotWorkspace = .{ .raw = [_]u8{0} ** 56 },
 };
 
-comptime {
-    if (@sizeOf(CacheLine5) != 64) {
-        @compileError("CacheLine5 must be 64 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(CacheLine5)}));
-    }
-}
+/// ── 二级计算区联合体 ───────────────────────────────────
+pub const SlotWorkspace = extern union {
+    http: HttpWork,
+    websocket: WsWork,
+    compute: ComputeWork,
+    raw: [56]u8,
+};
+
+pub const HttpWork = extern struct {
+    header_len: u16 = 0,
+    method: u8 = 0,
+    version: u8 = 0,
+    content_length: u64 = 0,
+    _fill: [40]u8 = [_]u8{0} ** 40,
+};
+
+pub const WsWork = extern struct {
+    mask: [4]u8 = [_]u8{0} ** 4,
+    payload_len: u64 = 0,
+    is_final: bool = false,
+    _fill: [39]u8 = [_]u8{0} ** 39,
+};
+
+pub const ComputeWork = extern struct {
+    job_id: u64 = 0,
+    buffer_ptr: u64 = 0,
+    result_code: i32 = 0,
+    _fill: [36]u8 = [_]u8{0} ** 36,
+};
 
 comptime {
     if (@sizeOf(CacheLine4_6) != 128) {
         @compileError("CacheLine4_6 must be 128 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(CacheLine4_6)}));
+    }
+    if (@sizeOf(CacheLine5) != 64) {
+        @compileError("CacheLine5 must be 64 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(CacheLine5)}));
+    }
+    // Verify workspace variants are exactly 56 bytes
+    if (@sizeOf(HttpWork) != 56) {
+        @compileError("HttpWork must be 56 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(HttpWork)}));
+    }
+    if (@sizeOf(WsWork) != 56) {
+        @compileError("WsWork must be 56 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(WsWork)}));
+    }
+    if (@sizeOf(ComputeWork) != 56) {
+        @compileError("ComputeWork must be 56 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(ComputeWork)}));
     }
 }
 
