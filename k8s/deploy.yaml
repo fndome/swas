@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: swas-app
+  name: sws-app
 spec:
   securityContext:
     seccompProfile:
@@ -22,18 +22,18 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: swas-app
+  name: sws-app
   labels:
-    app: swas-app
+    app: sws-app
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: swas-app
+      app: sws-app
   template:
     metadata:
       labels:
-        app: swas-app
+        app: sws-app
     spec:
       securityContext:
         seccompProfile:
@@ -77,10 +77,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: swas-app-svc
+  name: sws-app-svc
 spec:
   selector:
-    app: swas-app
+    app: sws-app
   ports:
     - name: http
       protocol: TCP
