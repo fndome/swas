@@ -10,11 +10,11 @@
 
 const std = @import("std");
 
-const swas = @import("swas");
-const Context = swas.Context;
-const DeferredResponse = swas.DeferredResponse;
-const AsyncServer = swas.AsyncServer;
-const Next = swas.Next;
+const sws = @import("sws");
+const Context = sws.Context;
+const DeferredResponse = sws.DeferredResponse;
+const AsyncServer = sws.AsyncServer;
+const Next = sws.Next;
 
 const InferCtx = struct {
     allocator: std.mem.Allocator,

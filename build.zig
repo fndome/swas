@@ -28,13 +28,13 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("swas", .{
+    const mod = b.addModule("sws", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
 
     const exe = b.addExecutable(.{
-        .name = "swas",
+        .name = "sws",
         .root_module = b.createModule(.{
             .link_libc = true,
             // b.createModule defines a new module just like b.addModule but,
@@ -50,12 +50,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "swas" is the name you will use in your source code to
-                // import this module (e.g. `@import("swas")`). The name is
+                // Here "sws" is the name you will use in your source code to
+                // import this module (e.g. `@import("sws")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "swas", .module = mod },
+                .{ .name = "sws", .module = mod },
             },
         }),
     });
@@ -72,13 +72,13 @@ pub fn build(b: *std.Build) void {
     // For a top level step to actually do something, it must depend on other
     // steps (e.g. a Run step, as we will see in a moment).
     const example_exe = b.addExecutable(.{
-        .name = "swas-example",
+        .name = "sws-example",
         .root_module = b.createModule(.{
             .link_libc = true,
             .root_source_file = b.path("example/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "swas", .module = mod }},
+            .imports = &.{.{ .name = "sws", .module = mod }},
         }),
     });
     b.installArtifact(example_exe);

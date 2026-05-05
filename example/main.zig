@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const swas = @import("swas");
-const AsyncServer = swas.AsyncServer;
+const sws = @import("sws");
+const AsyncServer = sws.AsyncServer;
 
 const query_go = @import("db_query_go.zig");
 const llmr_submit = @import("cpu_llmr_submit.zig");

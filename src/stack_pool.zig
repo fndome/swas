@@ -176,7 +176,7 @@ const CacheLine4_6 = extern struct {
 };
 
 const CacheLine5 = extern struct {
-    /// 哨兵魔数 0x53574153 ("SWAS")，debug 时检测内存越界
+    /// 哨兵魔数 0x53574153，debug 时检测内存越界
     sentinel: u32 = 0x53574153,
     /// 二级计算区：协议解析 / Worker Pool 移交 / Fiber 虚拟寄存器
     ws: SlotWorkspace = .{ .raw = [_]u8{0} ** 56 },

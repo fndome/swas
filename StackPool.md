@@ -165,7 +165,7 @@ fn recycleBuffer(slot: *Slot) void {
 
 ---
 
-## 5. swas StackPool 模块
+## 5. sws StackPool 模块
 
 位于 `src/stack_pool.zig`：
 
@@ -227,7 +227,7 @@ pub fn AsyncServer(comptime T: type) type {
 
         const StackSlot = struct {
             header: SlotHeader,      // gen_id + buf_recycled
-            conn: Connection,        // swas 内核层：fd, state, write_offset...
+            conn: Connection,        // sws 内核层：fd, state, write_offset...
             user: T,                 // IM 业务层：user_id, room_id, device_type...
             prev_live: u32,          // 双向链表：上一个活跃连接
             next_live: u32,          // 双向链表：下一个活跃连接

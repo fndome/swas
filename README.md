@@ -1,4 +1,4 @@
-# swas — Single Worker Async Server
+# sws — Single Worker Server
 
 [中文文档](README_CN.md)
 
@@ -27,18 +27,18 @@ Handlers run as **fibers on the IO thread** by default.
 ## Quick Start
 
 ```bash
-git clone https://github.com/fndome/swas
-cd swas
+git clone https://github.com/fndome/sws
+cd sws
 zig build run
 ```
 
 ## Use as a Library
 
 ```zig
-const swas = @import("swas");
+const sws = @import("sws");
 
 pub fn main() !void {
-    var server = try swas.AsyncServer.init(alloc, io, "0.0.0.0:9090", null, 64);
+    var server = try sws.AsyncServer.init(alloc, io, "0.0.0.0:9090", null, 64);
     defer server.deinit();
 
     server.GET("/hello", myHandler);
@@ -302,10 +302,10 @@ supported for GPU compute (kernel driver gap).
 ### RingSharedClient
 
 io_uring-driven outbound TCP client. Glue layer for integrating NATS / Redis / HTTP client
-libraries into swas's IO thread — no separate runtime, no locks.
+libraries into sws's IO thread — no separate runtime, no locks.
 
 ```zig
-const RingSharedClient = @import("swas").RingSharedClient;
+const RingSharedClient = @import("sws").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const nats: *NatsClient = @ptrCast(@alignCast(ctx));
@@ -327,7 +327,7 @@ try cs.write("PUB subject 5\r\nhello\r\n");
 cs.close();  // graceful
 ```
 
-- All I/O on swas IO thread — `onData` / `onClose` run in the same context as hooks
+- All I/O on sws IO thread — `onData` / `onClose` run in the same context as hooks
 - `write()` queues data; pending writes auto-flushed as io_uring CQEs arrive
 - Protocol layer (NATS / Redis / HTTP) only needs `feed([]u8)` and `write([]const u8)`
 - Multiple clients per server; user_data uses a dedicated high bit to avoid collisions
@@ -340,8 +340,8 @@ via fiber yield/resume — no worker threads, no locks.
 
 ```zig
 // In main(), after AsyncServer.init() and before server.run():
-const Pipe = @import("swas").Pipe;
-const RingSharedClient = @import("swas").RingSharedClient;
+const Pipe = @import("sws").Pipe;
+const RingSharedClient = @import("sws").RingSharedClient;
 
 fn onData(ctx: ?*anyopaque, data: []u8) void {
     const p: *Pipe = @ptrCast(@alignCast(ctx));
@@ -394,7 +394,7 @@ Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre
 > ctx.json(200, result);              // resumes here — expects data still intact
 > ```
 >
-> SWAS uses a **shared stack** (one 64KB buffer, all fibers reuse it). When a fiber
+> SWS uses a **shared stack** (one 64KB buffer, all fibers reuse it). When a fiber
 > yields in `await()`, the next fiber's execution overwrites that same memory. The
 > resumed fiber's stack frame is corrupted.
 >
@@ -413,11 +413,11 @@ Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre
 > This directly translates to lower memory pressure and better operational stability.
 >
 > This is the fundamental tradeoff: **Future API semantics vs. 1M-connection memory model**.
-> SWAS chooses the latter. All async is done via `Next.go`/`Next.submit` with callbacks
+> SWS chooses the latter. All async is done via `Next.go`/`Next.submit` with callbacks
 > instead of `await`-style suspension.
 > - Fibers are cooperative; OS threads are preemptive. This breaks the fiber model.
 >
-> | Zig pattern | SWAS replacement |
+> | Zig pattern | SWS replacement |
 > |---|---|
 > | `io.async(cpuWork)` + `future.await(io)` | `Next.submit(Ctx, ctx, exec)` + `DeferredResponse` |
 > | `io.async(ioWork)` + `future.await(io)` | `Next.go(Ctx, ctx, exec)` (fiber on IO thread) |
