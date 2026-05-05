@@ -85,6 +85,7 @@ pub fn slotFree(pool: anytype, idx: u32) void {
 /// 返回超时槽位的索引列表（调用方负责 close）。
 pub fn ttlScan(
     pool: anytype,
+    allocator: Allocator,
     now_ms: i64,
     timeout_ms: i64,
     scan_cursor: *u32,
@@ -100,7 +101,7 @@ pub fn ttlScan(
     for (live[start..end]) |idx| {
         const slot = &pool.slots[idx];
         if (now_ms - slot.line2.last_active_ms >= timeout_ms) {
-            out.append(idx) catch {};
+            out.append(allocator, idx) catch {};
         }
     }
 

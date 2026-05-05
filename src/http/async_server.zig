@@ -142,6 +142,10 @@ pub const AsyncServer = struct {
     timeout_user_data: u64 = 0,
     timeout_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
 
+    /// sticker TTL 增量扫描游标
+    ttl_scan_cursor: u32 = 0,
+    ttl_scan_out: std.ArrayList(u32),
+
     cfg: Config,
 
     /// 通用跨线程 IO 回调队列 (在 RingShared 内)
@@ -342,6 +346,7 @@ pub const AsyncServer = struct {
             .ws_ctx_pool = std.heap.MemoryPool(WsTaskCtx).empty,
             .shared_fiber_stack = shared_stack,
             .dns_resolver = dns_resolver,
+            .ttl_scan_out = std.ArrayList(u32).initCapacity(allocator, 512) catch @panic("OOM"),
         };
         server.rs = RingShared.bind(&server.ring, &server.io_registry);
 
@@ -374,6 +379,7 @@ pub const AsyncServer = struct {
 
         self.connections.deinit();
         self.pool.deinit(self.allocator);
+        self.ttl_scan_out.deinit(self.allocator);
         if (self.user_map) |*um| um.deinit();
         self.deferred_hooks.deinit(self.allocator);
         self.tick_hooks.deinit(self.allocator);
@@ -1157,6 +1163,8 @@ pub const AsyncServer = struct {
                 self.drainTick();
                 // 出站 ring CQE 收割（HTTP client / NATS / MySQL 等）
                 if (self.fiber_shared) |fs| fs.tick();
+                // TTL 增量扫描（每轮 512 个活跃槽位）
+                self.ttlScanTick();
                 // 处理中可能产生新 SQE → 下一轮 submit 带出去
                 continue;
             }
@@ -1181,6 +1189,8 @@ pub const AsyncServer = struct {
             self.drainTick();
             // 出站 ring CQE 收割
             if (self.fiber_shared) |fs| fs.tick();
+            // TTL 增量扫描
+            self.ttlScanTick();
 
             // 提交 + 阻塞等至少 1 个完成事件
             _ = try self.ring.submit_and_wait(1);
@@ -1188,6 +1198,7 @@ pub const AsyncServer = struct {
             self.dispatchCqes(&cqes, n2);
             drainPendingResumes();
             if (self.fiber_shared) |fs| fs.tick();
+            self.ttlScanTick();
         }
     }
 
@@ -1198,7 +1209,6 @@ pub const AsyncServer = struct {
 
             if (self.timeout_user_data != 0 and user_data == self.timeout_user_data) {
                 self.timeout_user_data = 0;
-                self.checkIdleConnections();
                 self.ring.cqe_seen(&cqes[i]);
                 continue;
             }
@@ -1285,6 +1295,24 @@ fn executeNext(self: *Self, req: *const Item) void {
             return;
         };
         self.timeout_user_data = user_data;
+    }
+
+    fn ttlScanTick(self: *Self) void {
+        const now = milliTimestamp(self.io);
+        self.ttl_scan_out.clearRetainingCapacity();
+        sticker.ttlScan(
+            &self.pool,
+            self.allocator,
+            now,
+            @intCast(self.cfg.idle_timeout_ms),
+            &self.ttl_scan_cursor,
+            512,
+            &self.ttl_scan_out,
+        );
+        for (self.ttl_scan_out.items) |idx| {
+            const slot = &self.pool.slots[idx];
+            self.closeConn(slot.line2.conn_id, slot.line1.fd);
+        }
     }
 
     fn checkIdleConnections(self: *Self) void {
