@@ -37,11 +37,13 @@ pub const Pipe = struct {
         return Writer{ .pipe = self };
     }
 
-    /// RingSharedClient.on_data 回调入口：喂数据进读缓冲区，唤醒等待的 reader
+    /// RingSharedClient.on_data 回调入口：喂数据进读缓冲区，
+    /// 标记 fiber 待恢复，由 IO 主循环在 CQE 收割后统一 resume。
     pub fn feed(self: *Pipe, data: []const u8) !void {
         try self.read_buf.appendSlice(self.allocator, data);
         if (Fiber.isYielded()) {
-            Fiber.resumeYielded("");
+            Fiber.pending_resume = true;
+            Fiber.pending_resume_data = data;
         }
     }
 

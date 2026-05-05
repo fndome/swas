@@ -115,6 +115,8 @@ pub const AsyncServer = struct {
     connections: std.AutoHashMap(u64, Connection),
     /// StackPool array-indexed connection pool (migrating from AutoHashMap)
     pool: StackPool(StackSlot, constants.MAX_CONNECTIONS),
+    /// Flat hash map: user_id → pool slot index (IM routing, L3-resident)
+    user_map: ?std.AutoHashMap(u64, u32) = null,
     /// Monotonic generation ID for ghost-event defense
     conn_gen_id: u32 = 1,
     next_user_data: u64,
@@ -305,6 +307,9 @@ pub const AsyncServer = struct {
         var conn_pool = try StackPool(StackSlot, constants.MAX_CONNECTIONS).init(allocator);
         errdefer conn_pool.deinit(allocator);
 
+        var user_map = std.AutoHashMap(u64, u32).init(allocator);
+        errdefer user_map.deinit();
+
         var server = Self{
             .allocator = allocator,
             .io = io,
@@ -313,6 +318,7 @@ pub const AsyncServer = struct {
             .next_conn_id = 1,
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
             .pool = conn_pool,
+            .user_map = user_map,
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
             .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
             .io_registry = io_registry,
@@ -367,6 +373,7 @@ pub const AsyncServer = struct {
 
         self.connections.deinit();
         self.pool.deinit(self.allocator);
+        if (self.user_map) |*um| um.deinit();
         self.deferred_hooks.deinit(self.allocator);
         self.tick_hooks.deinit(self.allocator);
         self.io_registry.deinit();
@@ -1094,6 +1101,15 @@ pub const AsyncServer = struct {
         self.should_stop = true;
     }
 
+    fn drainPendingResumes() void {
+        if (Fiber.pending_resume) {
+            Fiber.pending_resume = false;
+            const data = Fiber.pending_resume_data orelse "";
+            Fiber.pending_resume_data = null;
+            Fiber.resumeYielded(data);
+        }
+    }
+
     pub fn run(self: *Self) !void {
         if (self.cfg.io_cpu) |cpu| {
             var mask: linux.cpu_set_t = [_]usize{0} ** (linux.CPU_SETSIZE / @sizeOf(usize));
@@ -1130,6 +1146,7 @@ pub const AsyncServer = struct {
             if (n > 0) {
                 // 高速路径: 有事件就处理，不阻塞
                 self.dispatchCqes(&cqes, n);
+                drainPendingResumes();
                 // Next.go() 任务: 同一线程 fiber 执行
                 self.drainNextTasks();
                 // tick 钩子: 每轮必触发（倒计时、超时检测等）
@@ -1165,6 +1182,7 @@ pub const AsyncServer = struct {
             _ = try self.ring.submit_and_wait(1);
             const n2 = try self.ring.copy_cqes(&cqes, 0);
             self.dispatchCqes(&cqes, n2);
+            drainPendingResumes();
             if (self.fiber_shared) |fs| fs.tick();
         }
     }

@@ -51,7 +51,10 @@ pub const TinyCache = struct {
         return &self.pipe.?;
     }
 
-    /// 淘汰当前缓存的连接
+    /// 淘汰当前缓存的连接。
+    /// 安全：stream.deinit() 内 rs.remove(id) 注销 IORegistry 回调，
+    /// 后续任何在途 CQE 到达时 dispatch 查 hashmap 无匹配，静默丢弃。
+    /// 不会发生 use-after-free。
     pub fn evict(self: *TinyCache) void {
         if (self.stream) |s| {
             s.deinit();

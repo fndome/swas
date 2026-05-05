@@ -84,7 +84,11 @@ pub const Fiber = struct {
         _ = IoFiber.contextSwitch(&.{ .old = &tmp, .new = caller_context.? });
     }
 
-    pub fn resumeYielded(data: []const u8) void {
+    /// 延迟恢复队列：CQE 处理期间不直接 resume，而是标记后由主循环统一恢复
+pub threadlocal var pending_resume: bool = false;
+pub threadlocal var pending_resume_data: ?[]const u8 = null;
+
+pub fn resumeYielded(data: []const u8) void {
         const target = yielded_fiber orelse return;
         yielded_result = data;
         active_call = saved_call;
