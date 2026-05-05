@@ -98,8 +98,10 @@ pub const TinyCache = struct {
         self.last_used_ms = now_ms;
     }
 
-    /// 周期调用（由 RingB.tick() 自动调用），TTL 过期时主动淘汰空闲连接。
-    /// 禁用状态或无缓存时退化为零开销空操作。
+    /// 周期调用（由 RingB.tick() 自动驱动），TTL 过期时主动淘汰空闲连接。
+    /// 禁用态（ttl_ms == 0）或无缓存时退化为零开销空操作。
+    /// 安全保证：IORegistry 先 remove 后 close fd，配合 gen_id 编码，
+    /// 旧 CQE 在 dispatch 时 hashmap miss 或 gen_id 不匹配 → 静默丢弃。无数据污染。
     pub fn tick(self: *TinyCache, now_ms: i64) void {
         if (!self.enabled()) return;
         if (self.stream != null and now_ms - self.last_used_ms >= self.ttl_ms) {
