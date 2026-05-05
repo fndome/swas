@@ -100,7 +100,7 @@ fn deferredRespond(allocator: Allocator, node: *DeferredNode) void {
     for (self.deferred_hooks.items) |hook| {
         hook(self, node);
     }
-    if (self.connections.getPtr(node.conn_id)) |conn| {
+    if (self.getConn(node.conn_id)) |conn| {
         self.respondZeroCopy(conn, node.status, node.ct, node.body, "");
     } else {
         allocator.free(node.body);
@@ -655,10 +655,18 @@ pub const AsyncServer = struct {
         }
     }
 
+    /// 统一连接查找：先走 sticker (pool slot)，再走 hashmap 兜底。
+    fn getConn(self: *Self, conn_id: u64) ?*Connection {
+        if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
+            return @ptrCast(@alignCast(r.conn));
+        }
+        return null;
+    }
+
     fn closeConn(self: *Self, conn_id: u64, fd: i32) void {
         self.ws_server.removeActive(conn_id);
 
-        if (self.connections.getPtr(conn_id)) |conn| {
+        if (self.getConn(conn_id)) |conn| {
             if (conn.ws_token) |t| { self.allocator.free(t); conn.ws_token = null; }
 
             // Drain any queued WebSocket frames
@@ -684,7 +692,7 @@ pub const AsyncServer = struct {
         }
 
         if (self.use_fixed_files) {
-            if (self.connections.getPtr(conn_id)) |conn| {
+            if (self.getConn(conn_id)) |conn| {
                 const idx = conn.fixed_index;
                 _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
                 self.freeFixedIndex(idx);
@@ -692,14 +700,14 @@ pub const AsyncServer = struct {
         }
 
         if (fd > 0) {
-            const close_conn = self.connections.getPtr(conn_id) orelse return;
+            const close_conn = self.getConn(conn_id) orelse return;
             const close_ud = if (close_conn.pool_idx != 0xFFFFFFFF)
                 packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG
             else
                 conn_id | CLOSE_USER_DATA_FLAG;
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
-                if (self.connections.getPtr(conn_id)) |c| {
+                if (self.getConn(conn_id)) |c| {
                     c.state = .closing;
                 }
                 self.closeConn(conn_id, 0);
@@ -724,33 +732,23 @@ pub const AsyncServer = struct {
         const conn_fd: i32 = @intCast(res);
         const conn_id = self.nextConnId();
 
-        // Acquire StackPool slot for ghost-event defense
-        const pool_idx = self.pool.acquire() orelse {
+        const alloc = sticker.slotAlloc(&self.pool, conn_fd, &self.conn_gen_id, milliTimestamp(self.io));
+        if (alloc.idx == 0xFFFFFFFF) {
             const rc = linux.close(conn_fd);
             if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
             self.accept_stalled = true;
             self.submitAccept() catch |err| logErr("failed to resubmit accept (pool full): {s}", .{@errorName(err)});
             return;
-        };
-        const gen_id = self.conn_gen_id;
-        self.conn_gen_id +%= 1;
-        {
-            const slot = &self.pool.slots[pool_idx];
-            slot.line1.gen_id = gen_id;
-            slot.line1.fd = conn_fd;
-            slot.line1.state = .reading;
-            slot.line2.last_active_ms = milliTimestamp(self.io);
-            slot.line2.birth_ms = slot.line2.last_active_ms;
-            slot.line2.conn_id = conn_id;
-            slot.line2.active_list_pos = self.pool.liveAdd(pool_idx);
         }
+        const pool_idx = alloc.idx;
+        self.pool.slots[pool_idx].line2.conn_id = conn_id;
 
         var conn = Connection{
             .id = conn_id,
             .fd = conn_fd,
             .last_active_ms = milliTimestamp(self.io),
             .pool_idx = pool_idx,
-            .gen_id = gen_id,
+            .gen_id = self.pool.slots[pool_idx].line1.gen_id,
             .active_list_pos = self.pool.slots[pool_idx].line2.active_list_pos,
         };
 
@@ -758,6 +756,7 @@ pub const AsyncServer = struct {
             const idx = self.allocFixedIndex() catch {
                 const rc = linux.close(conn_fd);
                 if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
+                sticker.slotFree(&self.pool, pool_idx);
                 self.accept_stalled = true;
                 self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
                 return;
@@ -768,6 +767,7 @@ pub const AsyncServer = struct {
                 self.freeFixedIndex(idx);
                 const rc = linux.close(conn_fd);
                 if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
+                sticker.slotFree(&self.pool, pool_idx);
                 self.accept_stalled = true;
                 self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
                 return;
@@ -775,6 +775,7 @@ pub const AsyncServer = struct {
         }
 
         self.connections.put(conn_id, conn) catch {
+            sticker.slotFree(&self.pool, pool_idx);
             if (self.use_fixed_files) {
                 const idx = conn.fixed_index;
                 _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
@@ -786,7 +787,7 @@ pub const AsyncServer = struct {
             self.submitAccept() catch |err| logErr("failed to resubmit accept after put error: {s}", .{@errorName(err)});
             return;
         };
-        const conn_ptr = self.connections.getPtr(conn_id) orelse {
+        const conn_ptr = self.getConn(conn_id) orelse {
             // Defensive: conn_fd was accepted but the map entry disappeared.
             // Close it immediately to prevent a zombie FD leak.
             const rc = linux.close(conn_fd);
@@ -811,7 +812,7 @@ pub const AsyncServer = struct {
     fn onReadComplete(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
         _ = user_data;
         if (res <= 0) {
-            const conn = self.connections.get(conn_id) orelse return;
+            const conn = self.getConn(conn_id) orelse return;
             if (cqe_flags & linux.IORING_CQE_F_BUFFER != 0) {
                 const err_bid = @as(u16, @truncate(cqe_flags >> 16));
                 self.buffer_pool.markReplenish(err_bid);
@@ -819,7 +820,7 @@ pub const AsyncServer = struct {
             self.closeConn(conn_id, conn.fd);
             return;
         }
-        const conn = self.connections.getPtr(conn_id) orelse return;
+        const conn = self.getConn(conn_id) orelse return;
 
         if (cqe_flags & linux.IORING_CQE_F_BUFFER == 0) {
             self.closeConn(conn_id, conn.fd);
@@ -1024,11 +1025,11 @@ pub const AsyncServer = struct {
     fn onWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
         _ = user_data;
         if (res <= 0) {
-            const conn = self.connections.get(conn_id) orelse return;
+            const conn = self.getConn(conn_id) orelse return;
             self.closeConn(conn_id, conn.fd);
             return;
         }
-        const conn = self.connections.getPtr(conn_id) orelse return;
+        const conn = self.getConn(conn_id) orelse return;
         conn.write_offset += @as(usize, @intCast(res));
         const total = conn.write_headers_len + if (conn.write_body) |b| b.len else 0;
         if (conn.write_offset >= total) {
@@ -1079,7 +1080,7 @@ pub const AsyncServer = struct {
     }
 
     pub fn getConnToken(self: *Self, conn_id: u64) ?[]const u8 {
-        if (self.connections.getPtr(conn_id)) |conn| {
+        if (self.getConn(conn_id)) |conn| {
             return conn.ws_token;
         }
         return null;
@@ -1217,7 +1218,7 @@ pub const AsyncServer = struct {
             } else {
                 const conn_id = user_data;
                 const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
-                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else self.connections.getPtr(conn_id) orelse {
+                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else self.getConn(conn_id) orelse {
                     // Ghost CQE: provided buffer may need recycle
                     if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
                         self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
@@ -1315,7 +1316,7 @@ fn executeNext(self: *Self, req: *const Item) void {
 
         for (to_remove.items) |conn_id| {
             logErr("closing idle connection conn_id={d}", .{conn_id});
-            if (self.connections.getPtr(conn_id)) |conn| {
+            if (self.getConn(conn_id)) |conn| {
                 self.closeConn(conn_id, conn.fd);
             }
         }
@@ -1565,11 +1566,11 @@ fn executeNext(self: *Self, req: *const Item) void {
     fn onWsFrame(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
         _ = user_data;
         if (res <= 0) {
-            const conn = self.connections.get(conn_id) orelse return;
+            const conn = self.getConn(conn_id) orelse return;
             self.closeConn(conn_id, conn.fd);
             return;
         }
-        const conn = self.connections.getPtr(conn_id) orelse return;
+        const conn = self.getConn(conn_id) orelse return;
 
         if (cqe_flags & linux.IORING_CQE_F_BUFFER == 0) {
             self.closeConn(conn_id, conn.fd);
@@ -1735,11 +1736,11 @@ fn executeNext(self: *Self, req: *const Item) void {
     fn onWsWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
         _ = user_data;
         if (res <= 0) {
-            const conn = self.connections.get(conn_id) orelse return;
+            const conn = self.getConn(conn_id) orelse return;
             self.closeConn(conn_id, conn.fd);
             return;
         }
-        const conn = self.connections.getPtr(conn_id) orelse return;
+        const conn = self.getConn(conn_id) orelse return;
         conn.write_offset += @as(usize, @intCast(res));
         if (conn.write_offset >= conn.write_headers_len) {
             conn.write_retries = 0;
@@ -1770,7 +1771,7 @@ fn executeNext(self: *Self, req: *const Item) void {
     }
 
     pub fn sendWsFrame(self: *Self, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
-        const conn = self.connections.getPtr(conn_id) orelse return;
+        const conn = self.getConn(conn_id) orelse return;
 
         // If a write is already in-flight, queue this frame for later delivery.
         if (conn.is_writing) {
