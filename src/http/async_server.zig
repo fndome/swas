@@ -55,6 +55,7 @@ const packUserData = @import("../stack_pool.zig").packUserData;
 const unpackGenId = @import("../stack_pool.zig").unpackGenId;
 const unpackIdx = @import("../stack_pool.zig").unpackIdx;
 const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
+const sticker = @import("../stack_pool_sticker.zig");
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -1208,18 +1209,10 @@ pub const AsyncServer = struct {
             } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
                 // IORING_OP_CLOSE completed — final cleanup through closeConn
                 const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
-                const close_conn_id: u64 = blk: {
-                    if (raw_ud != 0 and raw_ud & 0x0FFFFFFF00000000 != 0) {
-                        const idx = unpackIdx(raw_ud);
-                        if (idx < constants.MAX_CONNECTIONS) {
-                            const slot = &self.pool.slots[idx];
-                            if (unpackGenId(raw_ud) == slot.line1.gen_id) {
-                                break :blk slot.line2.conn_id;
-                            }
-                        }
-                    }
-                    break :blk raw_ud;
-                };
+                const close_conn_id: u64 = if (sticker.getSlotChecked(&self.pool, raw_ud)) |slot|
+                    slot.line2.conn_id
+                else
+                    raw_ud;
                 self.closeConn(close_conn_id, 0);
                 self.ring.cqe_seen(&cqes[i]);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
@@ -1227,23 +1220,21 @@ pub const AsyncServer = struct {
                 self.io_registry.dispatch(user_data, res);
             } else {
                 const conn_id = user_data;
-                // Try StackPool path first: unpack idx + check gen_id ghost event
-                const idx = unpackIdx(conn_id);
-                const gen = unpackGenId(conn_id);
-                const conn = if (gen != 0 and idx < constants.MAX_CONNECTIONS) blk: {
-                    const slot = &self.pool.slots[idx];
-                    if (slot.line1.gen_id == gen) {
-                        break :blk self.connections.getPtr(conn_id);
+                const conn = blk: {
+                    if (sticker.getSlotChecked(&self.pool, user_data)) |_| {
+                        break :blk self.connections.getPtr(conn_id) orelse {
+                            // Ghost CQE: gen_id matched but hashmap gone.
+                            // Recycle provided buffer if present.
+                            if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                                self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
+                            }
+                            self.ring.cqe_seen(&cqes[i]);
+                            continue;
+                        };
                     }
-                    // Ghost event: old gen_id, slot reused.
-                    // Recycle provided buffer if present — kernel still owns it.
-                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        const bid = @as(u16, @truncate(cqe.flags >> 16));
-                        self.buffer_pool.markReplenish(bid);
-                    }
-                    self.ring.cqe_seen(&cqes[i]);
-                    continue;
-                } else self.connections.getPtr(conn_id);
+                    // Not a packed token — try old conn_id hashmap lookup
+                    break :blk self.connections.getPtr(conn_id);
+                };
                 const conn_ptr = conn orelse {
                     self.ring.cqe_seen(&cqes[i]);
                     continue;
