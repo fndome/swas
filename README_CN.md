@@ -168,16 +168,18 @@ var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", app_ctx, fiber_stac
 const FiberShared = @import("sws").FiberShared;
 const RingB = @import("sws").HttpRing;
 const HttpClient = @import("sws").HttpClient;
-const TinyCache = @import("sws").TinyCache;
 
 var fiber_shared = try FiberShared.init(alloc);
 defer fiber_shared.deinit();
 
-var ring_b = try RingB.init(alloc, io, server.ring.fd);
+// Ring B 内建 1s TinyCache TTL：
+var ring_b = try RingB.init(alloc, io, server.ring.fd, 1000);
 defer ring_b.deinit();
 try ring_b.registerWith(&fiber_shared);
 
-var cache = TinyCache.init(alloc, 1000);  // 1s TTL
+// HttpClient 自动使用 RingB 内建缓存：
+var http_client = try HttpClient.init(alloc, &ring_b);
+defer http_client.deinit();
 
 server.fiber_shared = &fiber_shared;
 ```
@@ -406,31 +408,14 @@ Next.submit(GpuCtx, ctx, struct {
 GPU 驱动内置异步执行，1 个 worker + fiber 即可提交 N 个 stream 并轮询完成，
 无需额外线程池。
 
-### TinyCache
+### TinyCache（内建在 RingB 中）
 
-出站连接缓存基石。单条目 TTL 缓存：同 host:port 未过期时复用 TCP 连接和 Pipe。
-HTTP / NATS / MySQL 等协议 client 共用此基础件。
+出站连接缓存基石。**由 RingB 持有**——全部生命周期（init、tick、evict、deinit）自动管理。
+使用 `HttpClient` 即可免费获得同 host:port 的连接复用。
 
-```zig
-const TinyCache = @import("sws").TinyCache;
-
-var cache = TinyCache.init(allocator, 1000);  // 1s TTL
-
-// HttpClient 中：缓存命中 → 复用 pipe；未命中 → 连接 → store
-if (cache.getPipe(host, port, now_ms)) |pipe| {
-    // 复用已缓存连接
-} else {
-    var stream = try RingSharedClient.init(alloc, rs, onData, onClose, &cache);
-    try stream.connectRaw(ip, port);
-    var pipe = try Pipe.init(alloc, stream);
-    try cache.store(stream, pipe, host, port, now_ms);
-}
-```
-
-**设计原则（io_uring 最佳实践）：**
-- 连接阶段允许重试——connect 失败不影响缓存，下次 getPipe 自动重建
-- 读写阶段禁止重试——write/read 失败立即淘汰缓存条目
-- 原因：io_uring SQE 级 partial write 由内核 TCP 栈保证；应用层重试 read/write 会造成协议帧边界错乱（HTTP 管线化、WS 帧、DB 协议包）
+- 同 host:port 未过期时自动复用 TCP 连接和 Pipe
+- 过期条目由 `RingB.tick()` 每轮自动淘汰
+- 连接阶段允许重试，读写阶段禁止重试（内核 TCP 栈保证 SQE 级写入）
 
 ### Pipe
 
@@ -606,24 +591,21 @@ handler（IO 线程上的 fiber）:
 
 连接池只需维护已连接 TCP fd 集合（ringbuffer 或 free list）。handler 拿 fd → io_uring 发 `write(sql)` + `read()` → 解析结果 → 放回 fd。
 
-## HttpRing + HttpClient（Ring B，独立出站 Ring）
+## HttpRing + HttpClient（Ring B，内建 TinyCache）
 
-```
-HttpRing（独立 io_uring Ring B）
-  ├── DnsResolver（内置异步 DNS，也支持 c-ares 切换）
-  ├── IORegistry（客户端连接注册表）
-  ├── InvokeQueue（跨线程回调队列）
-  └── ATTACH_WQ → 共享 Ring A 的内核 io-wq 线程池
-
-HttpClient
-  ├── get(url) — 阻塞 API，内部异步
-  └── tinyCache — 同 host:port 的连接 1s 内复用（TTL 固定，不自增）
-```
+HttpRing（独立 io_uring Ring B）内建 `TinyCache` 连接缓存。`ATTACH_WQ` 共享 Ring A 的内核 io-wq 线程池。同 host:port 连接在 TTL 窗口内自动复用，`RingB.tick()` 每轮自动淘汰过期条目，用
+户无需手动管理缓存。
 
 **用法：**
 
 ```zig
-const client = try sws.HttpClient.init(allocator, io, server.ring.fd, 1000);
+// Ring B init（1s 缓存 TTL）：
+const ring_b = try sws.HttpRing.init(allocator, io, server.ring.fd, 1000);
+defer ring_b.deinit();
+try ring_b.registerWith(&fiber_shared);
+
+// HttpClient 自动使用 RingB 内建缓存：
+const client = try sws.HttpClient.init(allocator, &ring_b);
 defer client.deinit();
 const resp = try client.get("http://api.example.com/data");
 defer resp.deinit();

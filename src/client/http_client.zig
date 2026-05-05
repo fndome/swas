@@ -84,14 +84,15 @@ fn onClose(ctx: ?*anyopaque) void {
 pub const HttpClient = struct {
     allocator: Allocator,
     ring_b: *RingB,
+    /// 指向 ring_b.http_cache（内建缓存，由 RingB.tick() 自动淘汰过期条目）
     cache: *TinyCache,
 
-    pub fn init(allocator: Allocator, ring_b: *RingB, cache: *TinyCache) !*HttpClient {
+    pub fn init(allocator: Allocator, ring_b: *RingB) !*HttpClient {
         const self = try allocator.create(HttpClient);
         self.* = .{
             .allocator = allocator,
             .ring_b = ring_b,
-            .cache = cache,
+            .cache = &ring_b.http_cache,
         };
         return self;
     }
@@ -242,6 +243,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     _ = complete;
     const ctx: *RequestContext = @ptrCast(@alignCast(user_ctx));
     const client = ctx.client;
+    const cache = client.cache;
 
     const parsed = parseUrl(ctx.allocator, ctx.url) catch {
         ctx.response = makeErrorResponse(ctx.allocator, 400, "invalid URL");
@@ -259,11 +261,11 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     const now = nowMs();
     var stream: *RingSharedClient = undefined;
 
-    if (client.cache.getPipe(parsed.host, parsed.port, now)) |pipe| {
+    if (cache.getPipe(parsed.host, parsed.port, now)) |pipe| {
         active_pipe = pipe;
-        stream = client.cache.stream.?;
+        stream = cache.stream.?;
     } else {
-        stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(&client.cache)), null) catch {
+        stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch {
             ctx.response = makeErrorResponse(ctx.allocator, 502, "client init failed");
             ctx.notify();
             return;
@@ -282,18 +284,18 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             return;
         };
 
-        client.cache.store(stream, pipe, parsed.host, parsed.port, now) catch {
+        cache.store(stream, pipe, parsed.host, parsed.port, now) catch {
             pipe.deinit();
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
             ctx.notify();
             return;
         };
-        active_pipe = client.cache.pipe orelse unreachable;
+        active_pipe = cache.pipe orelse unreachable;
     }
     defer active_pipe = null;
 
-    const reader = client.cache.pipe.?.reader();
+    const reader = cache.pipe.?.reader();
 
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
@@ -304,7 +306,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     stream.write(req) catch {
         ctx.cleanup();
-        client.cache.evict();
+        cache.evict();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
         ctx.notify();
         return;
@@ -323,7 +325,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
         break :blk true;
     };
     if (!read_ok) {
-        client.cache.evict();
+        cache.evict();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "read failed");
         ctx.notify();
         return;
@@ -332,9 +334,9 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     if (parseResponse(ctx.allocator, resp_buf[0..total])) |resp| {
         ctx.response = resp;
         ctx.notify();
-        client.cache.touch(nowMs());
+        cache.touch(nowMs());
     } else |_| {
-        client.cache.evict();
+        cache.evict();
         ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
         ctx.notify();
     }

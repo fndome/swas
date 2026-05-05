@@ -27,8 +27,13 @@ pub const TinyCache = struct {
     port: u16 = 0,
     last_used_ms: i64 = 0,
 
+    /// ttl_ms = 0 表示禁用缓存，所有方法退化为空操作。
     pub fn init(allocator: Allocator, ttl_ms: i64) TinyCache {
         return TinyCache{ .allocator = allocator, .ttl_ms = ttl_ms };
+    }
+
+    pub fn enabled(self: *const TinyCache) bool {
+        return self.ttl_ms > 0;
     }
 
     pub fn deinit(self: *TinyCache) void {
@@ -37,7 +42,9 @@ pub const TinyCache = struct {
 
     /// 缓存命中时返回 pipe 指针，调用方通过 threadlocal 设置 active_pipe。
     /// 未命中时返回 null，调用方负责创建新连接后调用 store()。
+    /// 禁用状态（ttl_ms == 0）永远返回 null。
     pub fn getPipe(self: *TinyCache, host: []const u8, port: u16, now_ms: i64) ?*Pipe {
+        if (!self.enabled()) return null;
         if (self.stream == null) return null;
         if (self.port != port) return null;
         if (self.host == null) return null;
@@ -71,8 +78,12 @@ pub const TinyCache = struct {
         self.port = 0;
     }
 
-    /// 存储新连接到缓存
+    /// 存储新连接到缓存。禁用状态（ttl_ms == 0）直接淘汰已有条目后返回。
     pub fn store(self: *TinyCache, stream: *RingSharedClient, p: Pipe, host: []const u8, port: u16, now_ms: i64) !void {
+        if (!self.enabled()) {
+            self.evict();
+            return;
+        }
         self.evict();
         const host_dup = try self.allocator.dupe(u8, host);
         self.stream = stream;
@@ -87,9 +98,10 @@ pub const TinyCache = struct {
         self.last_used_ms = now_ms;
     }
 
-    /// 周期调用（如 server.addHookTick），TTL 过期时主动淘汰空闲连接。
-    /// 零成本：无缓存或未过期时仅一次时间戳比较。
+    /// 周期调用（由 RingB.tick() 自动调用），TTL 过期时主动淘汰空闲连接。
+    /// 禁用状态或无缓存时退化为零开销空操作。
     pub fn tick(self: *TinyCache, now_ms: i64) void {
+        if (!self.enabled()) return;
         if (self.stream != null and now_ms - self.last_used_ms >= self.ttl_ms) {
             self.evict();
         }

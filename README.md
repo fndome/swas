@@ -171,16 +171,18 @@ To add outbound rings (HTTP/NATS/MySQL), inject `FiberShared`:
 const FiberShared = @import("sws").FiberShared;
 const RingB = @import("sws").HttpRing;   // same as RingB
 const HttpClient = @import("sws").HttpClient;
-const TinyCache = @import("sws").TinyCache;
 
 var fiber_shared = try FiberShared.init(alloc);
 defer fiber_shared.deinit();
 
-var ring_b = try RingB.init(alloc, io, server.ring.fd);
+// Ring B with 1s built-in TinyCache TTL:
+var ring_b = try RingB.init(alloc, io, server.ring.fd, 1000);
 defer ring_b.deinit();
 try ring_b.registerWith(&fiber_shared);
 
-var cache = TinyCache.init(alloc, 1000);  // 1s TTL
+// HttpClient auto-uses RingB's built-in cache:
+var http_client = try HttpClient.init(alloc, &ring_b);
+defer http_client.deinit();
 
 // Set fiber_shared on server so IO thread harvests outbound CQEs
 server.fiber_shared = &fiber_shared;
@@ -459,32 +461,15 @@ cs.close();  // graceful
 - Protocol layer (NATS / Redis / HTTP) only needs `feed([]u8)` and `write([]const u8)`
 - Multiple clients per server; user_data uses a dedicated high bit to avoid collisions
 
-### TinyCache
+### TinyCache (built into RingB)
 
-Single-entry TTL connection cache for outbound protocols (HTTP / NATS / MySQL). Same host:port
-connections are reused within the TTL window, avoiding repeated TCP handshakes.
+Single-entry TTL connection cache for outbound protocols. **Owned by RingB** — all
+lifecycle (init, tick, evict, deinit) is managed automatically. Users get connection
+reuse for free with `HttpClient`.
 
-```zig
-const TinyCache = @import("sws").TinyCache;
-
-var cache = TinyCache.init(allocator, 1000);  // 1s TTL
-
-// In HttpClient: cache hit → reuse pipe; miss → connect → store
-if (cache.getPipe(host, port, now_ms)) |pipe| {
-    // Reuse cached connection
-} else {
-    var stream = try RingSharedClient.init(alloc, rs, onData, onClose, &cache);
-    try stream.connectRaw(ip, port);
-    var pipe = try Pipe.init(alloc, stream);
-    try cache.store(stream, pipe, host, port, now_ms);
-}
-```
-
-**Design principle:**
-- Connect phase allows retries — failed connect doesn't poison the cache
-- Read/write phase forbids retries — failed read/write immediately evicts cache entry
-- Reason: io_uring SQE-level partial writes are guaranteed by the kernel TCP stack;
-  application-layer read/write retries break protocol framing (HTTP pipelining, WS frames, DB protocol packets).
+- Same host:port connections auto-reused within TTL window
+- Expired entries auto-evicted by `RingB.tick()` each event loop iteration
+- Connect phase allows retries; read/write phase forbids retries (kernel TCP stack guarantees SQE-level writes)
 
 ### Pipe
 
@@ -544,25 +529,24 @@ self.large_pool.release(buf);
 ### HttpRing + HttpClient (Ring B)
 
 Independent io_uring Ring B for outbound HTTP client. Shares the kernel io-wq thread pool
-via `IORING_SETUP_ATTACH_WQ`, built-in async DNS via `DnsResolver`, and connection reuse via `TinyCache`.
+via `IORING_SETUP_ATTACH_WQ`. **TinyCache is built into RingB** — same host:port connections
+are automatically reused within the TTL window and evicted by `RingB.tick()`.
 
 ```zig
 const sws = @import("sws");
 
-// Ring B init (attached to server's Ring A io-wq):
-var ring_b = try sws.HttpRing.init(allocator, io, server.ring.fd);
+// Ring B init (attached to server's Ring A io-wq, 1s cache TTL):
+var ring_b = try sws.HttpRing.init(allocator, io, server.ring.fd, 1000);
 defer ring_b.deinit();
 try ring_b.registerWith(&fiber_shared);
 
-// HttpClient with 1s TinyCache TTL:
-var http_cache = sws.TinyCache.init(allocator, 1000);
-var http_client = try sws.HttpClient.init(allocator, &ring_b, &http_cache);
+// HttpClient — cache is automatically managed by RingB:
+var http_client = try sws.HttpClient.init(allocator, &ring_b);
 defer http_client.deinit();
 
 // Use from handler:
 const resp = try http_client.get("http://api.example.com/data");
 defer resp.deinit();
-// resp.status, resp.body
 
 // POST with body:
 const resp2 = try http_client.post("http://api.example.com/submit", "{\"key\":\"val\"}");

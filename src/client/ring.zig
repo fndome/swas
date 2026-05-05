@@ -9,20 +9,24 @@ const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_DATA_FLAG;
 const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
 const RingTrait = @import("../shared/fiber_shared.zig").RingTrait;
+const TinyCache = @import("tiny_cache.zig").TinyCache;
 
 const MAX_CQES_TICK = 64;
 
 /// ── Ring B ────────────────────────────────────────────────
 ///
 /// 出站 HTTP 客户端 IO 归口。
-/// 持有 ring + RingShared + IORegistry + DnsResolver + InvokeQueue。
+/// 持有 ring + RingShared + IORegistry + DnsResolver + InvokeQueue + TinyCache。
 /// 通过 registerWith() 注入 FiberShared 调度胶水，零额外线程。
 ///
+/// TinyCache 内建在 RingB 中，由 RingB.tick() 每轮自动淘汰过期连接，
+/// 用户无需手动管理缓存生命周期。
+///
 /// 用法：
-///   const ring_b = try RingB.init(alloc, io, server.ring.fd);
+///   const ring_b = try RingB.init(alloc, io, server.ring.fd, 1000);
 ///   defer ring_b.deinit();
 ///   try ring_b.registerWith(&fiber_shared);
-///   const client = try HttpClient.init(alloc, &ring_b, 1000);
+///   const client = try HttpClient.init(alloc, &ring_b);
 pub const RingB = struct {
     allocator: Allocator,
     ring: linux.IoUring,
@@ -30,8 +34,11 @@ pub const RingB = struct {
     rs: RingShared,
     dns: DnsResolver,
     invoke: InvokeQueue,
+    /// 内建出站连接缓存：同 host:port 在 TTL 内复用 TCP 连接。
+    /// RingB.tick() 自动淘汰过期条目，用户无需干预。
+    http_cache: TinyCache,
 
-    pub fn init(allocator: Allocator, io: std.Io, attach_ring_fd: i32) !RingB {
+    pub fn init(allocator: Allocator, io: std.Io, attach_ring_fd: i32, cache_ttl_ms: i64) !RingB {
         const ns_ip = readResolvConfNameserver() catch @as(u32, 0x08080808);
 
         var ring = brk: {
@@ -58,10 +65,12 @@ pub const RingB = struct {
             .rs = rs,
             .dns = dns,
             .invoke = .{},
+            .http_cache = TinyCache.init(allocator, cache_ttl_ms),
         };
     }
 
     pub fn deinit(self: *RingB) void {
+        self.http_cache.deinit();
         self.invoke.drain(self.allocator);
         self.dns.deinit();
         self.registry.deinit();
@@ -81,8 +90,11 @@ pub const RingB = struct {
         self.tick();
     }
 
-    /// 非阻塞收割 Ring B 的 CQE 并分发
+    /// 非阻塞收割 Ring B 的 CQE + 淘汰过期缓存连接。
     pub fn tick(self: *RingB) void {
+        if (self.http_cache.enabled()) {
+            self.http_cache.tick(nowMs());
+        }
         self.dns.tick();
         self.invoke.drain(self.allocator);
         _ = self.ring.submit() catch {};
@@ -101,6 +113,12 @@ pub const RingB = struct {
 
 /// 保留向下兼容别名
 pub const HttpRing = RingB;
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
+}
 
 fn readResolvConfNameserver() !u32 {
     const path = "/etc/resolv.conf\x00";
