@@ -20,7 +20,7 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
             const freelist = try allocator.alloc(u32, capacity);
 
             for (freelist, 0..) |*f, i| {
-                f.* = @intCast(capacity - 1 - i);
+                f.* = @intCast(i); // sequential for stream prefetcher
             }
 
             return Self{
@@ -51,7 +51,8 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
         }
 
         /// swap-remove：用最后一个元素覆盖 list_pos，O(1)。
-        /// 返回被移过来的 idx，调用方需更新其 slot.active_list_pos = list_pos。
+        /// 返回被移过来的 idx（调用方需更新其 slot.active_list_pos = list_pos）。
+        /// 返回 null 表示移除的是尾部元素，无元素被移动，无需更新。
         pub fn liveRemove(self: *Self, list_pos: u32) ?u32 {
             if (list_pos >= self.live.items.len) return null;
             const last = self.live.getLast();
@@ -81,7 +82,7 @@ pub inline fn unpackGenId(ud: u64) u32 {
 pub const CLOSE_USER_DATA_FLAG: u64 = 1 << 60; // close SQE marker
 
 pub inline fn unpackIdx(ud: u64) u32 {
-    return @intCast(ud & 0xFFFFFFFF);
+    return @truncate(ud);
 }
 
 /// ── 缓存行子结构 ───────────────────────────────────────

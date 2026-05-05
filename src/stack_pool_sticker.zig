@@ -53,6 +53,8 @@ pub fn slotAlloc(pool: anytype, fd: i32, conn_gen_id: *u32, now_ms: i64) struct 
     conn_gen_id.* +%= 1;
 
     const slot = &pool.slots[idx];
+    // Debug: verify sentinel intact (catches buffer overflow from previous slot user)
+    std.debug.assert(slot.line5.sentinel == 0x53574153);
     slot.line1.gen_id = gen_id;
     slot.line1.fd = fd;
     slot.line1.state = .reading;

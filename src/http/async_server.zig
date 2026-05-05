@@ -591,10 +591,8 @@ pub const AsyncServer = struct {
     }
 
     fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
-        const user_data = if (conn.pool_idx != 0xFFFFFFFF)
-            packUserData(conn.gen_id, conn.pool_idx)
-        else
-            conn_id;
+        _ = conn_id;
+        const user_data = packUserData(conn.gen_id, conn.pool_idx);
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
         const sqe = try self.ring.read(user_data, fd, .{
             .buffer_selection = .{ .group_id = READ_BUF_GROUP_ID, .len = BUFFER_SIZE },
@@ -603,14 +601,12 @@ pub const AsyncServer = struct {
     }
 
     fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
+        _ = conn_id;
         if (conn.write_offset == 0) {
             conn.write_start_ms = milliTimestamp(self.io);
             conn.write_retries = 0;
         }
-        const user_data = if (conn.pool_idx != 0xFFFFFFFF)
-            packUserData(conn.gen_id, conn.pool_idx)
-        else
-            conn_id;
+        const user_data = packUserData(conn.gen_id, conn.pool_idx);
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
 
         const resp_buf = conn.response_buf orelse return;
@@ -701,10 +697,7 @@ pub const AsyncServer = struct {
 
         if (fd > 0) {
             const close_conn = self.getConn(conn_id) orelse return;
-            const close_ud = if (close_conn.pool_idx != 0xFFFFFFFF)
-                packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG
-            else
-                conn_id | CLOSE_USER_DATA_FLAG;
+            const close_ud = packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG;
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
                 if (self.getConn(conn_id)) |c| {
@@ -1225,16 +1218,15 @@ pub const AsyncServer = struct {
                 defer self.ring.cqe_seen(&cqes[i]);
                 self.io_registry.dispatch(user_data, res);
             } else {
-                const conn_id = user_data;
                 const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
-                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else self.getConn(conn_id) orelse {
-                    // Ghost CQE: provided buffer may need recycle
+                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else {
                     if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
                         self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
                     }
                     self.ring.cqe_seen(&cqes[i]);
                     continue;
                 };
+                const conn_id = conn_ptr.id;
                 defer self.ring.cqe_seen(&cqes[i]);
 
                 if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
