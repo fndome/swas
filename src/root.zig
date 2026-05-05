@@ -18,7 +18,7 @@ pub const Opcode = @import("ws/types.zig").Opcode;
 pub const SubmitQueue = @import("next/queue.zig").SubmitQueue;
 pub const QueueItem = @import("next/queue.zig").Item;
 pub const Next = @import("next/next.zig").Next;
-/// Next.chainGoSubmit: Go（IO fiber）→ Submit（worker）→ 响应。同一 Ctx 贯穿两阶段。一行代码完成 DB + compute。
+/// Next.chainGoSubmit: execGo(fiber, IO 线程) 异步集齐数据 → complete 触发 → execSubmit(worker 池) → respond 响应
 pub const chainGoSubmit = @import("next/next.zig").Next.chainGoSubmit;
 
 /// 高级范式：用户自定义 I/O 请求，push 到 SubmitQueue，

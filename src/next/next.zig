@@ -26,6 +26,9 @@ const ParkedTask = struct {
     task: *PoolTask,
     poll_fn: *const fn (*anyopaque) bool,
     poll_ctx: *anyopaque,
+    /// 堆分配的 fiber 栈（64KB），跨 yield 保持存活。
+    /// resume 完成后由 resumeParked 释放。
+    stack: []u8,
 };
 
 const FIBER_STACK: u32 = 65536;
@@ -50,18 +53,8 @@ const WorkerPool = struct {
     workers: []std.Thread,
     head: ?*PoolTask,
     tail: ?*PoolTask,
-    spinlock: bool,
-    stop: bool align(@alignOf(u8)),
-
-    fn acquire(self: *WorkerPool) void {
-        while (@atomicRmw(bool, &self.spinlock, .Xchg, true, .acquire)) {
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn release(self: *WorkerPool) void {
-        @atomicStore(bool, &self.spinlock, false, .release);
-    }
+    mutex: std.Thread.Mutex,
+    stop: bool,
 
     fn init(allocator: Allocator, count: u8) !WorkerPool {
         const workers = try allocator.alloc(std.Thread, count);
@@ -70,12 +63,12 @@ const WorkerPool = struct {
             .workers = workers,
             .head = null,
             .tail = null,
-            .spinlock = false,
+            .mutex = .{},
             .stop = false,
         };
         for (workers, 0..) |*w, i| {
             w.* = std.Thread.spawn(.{}, workerLoop, .{ &pool, @as(u8, @intCast(i)) }) catch {
-                pool.stop = true;
+                @atomicStore(bool, &pool.stop, true, .release);
                 for (workers[0..i]) |pw| pw.join();
                 allocator.free(workers);
                 return error.ThreadSpawnFailed;
@@ -85,9 +78,9 @@ const WorkerPool = struct {
     }
 
     fn deinit(self: *WorkerPool) void {
-        self.acquire();
+        self.mutex.lock();
         @atomicStore(bool, &self.stop, true, .release);
-        self.release();
+        self.mutex.unlock();
         while (self.pop()) |task| {
             self.allocator.destroy(task);
         }
@@ -96,25 +89,25 @@ const WorkerPool = struct {
     }
 
     fn submit(self: *WorkerPool, task: *PoolTask) void {
-        self.acquire();
+        self.mutex.lock();
         if (self.tail) |t| {
             t.next = task;
         } else {
             self.head = task;
         }
         self.tail = task;
-        self.release();
+        self.mutex.unlock();
     }
 
     fn pop(self: *WorkerPool) ?*PoolTask {
-        self.acquire();
+        self.mutex.lock();
         const task = self.head orelse {
-            self.release();
+            self.mutex.unlock();
             return null;
         };
         self.head = task.next;
         if (self.head == null) self.tail = null;
-        self.release();
+        self.mutex.unlock();
         task.next = null;
         return task;
     }
@@ -145,20 +138,37 @@ const WorkerPool = struct {
 };
 
 fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask)) void {
-    var stack: [FIBER_STACK]u8 = undefined;
-    var fiber = Fiber.init(&stack);
+    const stack = pool.allocator.alloc(u8, FIBER_STACK) catch {
+        task.exec(task.ctx, task.alloc);
+        pool.allocator.destroy(task);
+        return;
+    };
+    var fiber = Fiber.init(stack);
     const call = makeFiberCall(task);
     fiber.exec(call);
 
     if (Fiber.isYielded()) {
-        const ctx = @import("fiber.zig").parked_ctx orelse return;
-        const poll = @import("fiber.zig").parked_poll orelse return;
-        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse return;
+        const ctx = @import("fiber.zig").parked_ctx orelse {
+            pool.allocator.free(stack);
+            pool.allocator.destroy(task);
+            return;
+        };
+        const poll = @import("fiber.zig").parked_poll orelse {
+            pool.allocator.free(stack);
+            pool.allocator.destroy(task);
+            return;
+        };
+        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse {
+            pool.allocator.free(stack);
+            pool.allocator.destroy(task);
+            return;
+        };
         parked.append(pool.allocator, .{
             .fiber_ctx = ctx.*,
             .task = task,
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
+            .stack = stack,
         }) catch {
             @import("fiber.zig").saved_call = call;
             Fiber.resumeContext(ctx);
@@ -167,6 +177,7 @@ fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;
     } else {
+        pool.allocator.free(stack);
         pool.allocator.destroy(task);
     }
 }
@@ -176,19 +187,33 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
     Fiber.resumeContext(&pt.fiber_ctx);
 
     if (Fiber.isYielded()) {
-        const ctx = @import("fiber.zig").parked_ctx orelse return;
-        const poll = @import("fiber.zig").parked_poll orelse return;
-        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse return;
+        const ctx = @import("fiber.zig").parked_ctx orelse {
+            pool.allocator.free(pt.stack);
+            pool.allocator.destroy(pt.task);
+            return;
+        };
+        const poll = @import("fiber.zig").parked_poll orelse {
+            pool.allocator.free(pt.stack);
+            pool.allocator.destroy(pt.task);
+            return;
+        };
+        const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse {
+            pool.allocator.free(pt.stack);
+            pool.allocator.destroy(pt.task);
+            return;
+        };
         parked.append(pool.allocator, .{
             .fiber_ctx = ctx.*,
             .task = pt.task,
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
+            .stack = pt.stack,  // 栈随任务跨 yield 存活
         }) catch {};
         @import("fiber.zig").parked_ctx = null;
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;
     } else {
+        pool.allocator.free(pt.stack);
         pool.allocator.destroy(pt.task);
     }
 }
@@ -384,20 +409,23 @@ pub const Next = struct {
 
     /// ── Next.chainGoSubmit ─────────────────────────────────
     ///
-    /// 编程模型：Go（IO 线程 fiber）→ Submit（worker 池）→ 响应。
-    /// 同一 Ctx 流经两个阶段，无需手动分配 DeferredResponse。
+    /// 编程模型：Go（IO 线程 fiber，异步 DB/NATS 等）→ Submit（worker 池）→ 响应。
+    /// 同一 Ctx 流经两个阶段。execGo 异步收集全部数据后才触发 execSubmit，
+    /// 无需手动分配 DeferredResponse。
     ///
     /// 用法（handler 中一行搞定）：
-    ///   try Next.chainGoSubmit(ctx, myCtx, execDb, execCompute, sendJson);
+    ///   try Next.chainGoSubmit(ctx, myCtx,
+    ///       execDb,       // fn(*MyCtx, complete) — IO 线程 fiber，collect 500 rows 后调 complete
+    ///       execCompute,  // fn(*MyCtx) — worker 池
+    ///       sendJson,     // fn(*MyCtx, *DeferredResponse) — 响应
+    ///   );
     ///
-    ///   execDb(Ctx):       IO 线程 fiber 执行（DB io_uring、异步 I/O）
-    ///   execCompute(Ctx):  worker 池执行（CPU 密集）
-    ///   sendJson(Ctx, DeferredResponse):  构建并发送响应
+    /// execGo 通过 complete 回调通知"已集齐所有数据"，此时自动切到 execSubmit。
     pub fn chainGoSubmit(
         comptime T: type,
         http_ctx: *Context,
         user_ctx: T,
-        comptime execGo: fn (*T) void,
+        comptime execGo: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
         comptime execSubmit: fn (*T) void,
         comptime respond: fn (*T, *DeferredResponse) void,
     ) !void {
@@ -409,55 +437,60 @@ pub const Next = struct {
         errdefer alloc.destroy(resp);
         resp.* = .{ .server = server, .conn_id = http_ctx.conn_id, .allocator = alloc };
 
-        const wrap = try alloc.create(ChainWrap(T));
-        errdefer alloc.destroy(wrap);
-        wrap.* = .{ .user = user_ctx, .resp = resp, .allocator = alloc, .next = default_next };
+        // ChainWrap.user 紧邻 chain 字段，execGo 收到 &w.user 后可
+        // 通过 @fieldParentPtr("user", user_ptr) 回到 ChainWrap
+        const w = try alloc.create(ChainWrap(T));
+        errdefer alloc.destroy(w);
+        w.* = .{ .user = user_ctx, .chain = .{ .resp = resp, .allocator = alloc } };
 
         http_ctx.deferred = true;
 
         go(
             ChainWrap(T),
-            wrap.*,
+            w.*,
             struct {
-                fn execGoWrapper(
-                    w: *ChainWrap(T),
+                fn run(
+                    wrap: *ChainWrap(T),
                     complete: *const fn (?*anyopaque, []const u8) void,
                 ) void {
-                    execGo(&w.user);
+                    execGo(&wrap.user, struct {
+                        fn done(caller_ctx: ?*anyopaque, data: []const u8) void {
+                            // 通过 execGo 传入的 user 指针恢复 ChainWrap
+                            const uptr: *T = @ptrCast(@alignCast(caller_ctx.?));
+                            const w2: *ChainWrap(T) = @fieldParentPtr("user", uptr);
+                            const alloc2 = w2.chain.allocator;
+                            const resp2 = w2.chain.resp;
 
-                    // 将 Ctx 的副本交到 worker 池
-                    const submit_ctx = w.allocator.create(ChainSubmitCtx(T)) catch {
-                        w.resp.json(500, "{\"error\":\"OOM\"}");
-                        w.allocator.destroy(w.resp);
-                        w.allocator.destroy(w);
-                        complete(w, "");
-                        return;
-                    };
-                    submit_ctx.* = .{
-                        .user = w.user,
-                        .resp = w.resp,
-                        .allocator = w.allocator,
-                    };
+                            // Step 2: worker 池
+                            const sc = alloc2.create(ChainSubmitCtx(T)) catch {
+                                resp2.json(500, "{\"error\":\"OOM\"}");
+                                alloc2.destroy(resp2);
+                                return;
+                            };
+                            sc.* = .{ .user = w2.user, .resp = resp2, .allocator = alloc2 };
 
-                    submit(
-                        ChainSubmitCtx(T),
-                        submit_ctx.*,
-                        struct {
-                            fn execSubmitWrapper(
-                                sc: *ChainSubmitCtx(T),
-                                _: *const fn (?*anyopaque, []const u8) void,
-                            ) void {
-                                defer sc.allocator.destroy(sc.resp);
-                                execSubmit(&sc.user);
-                                respond(&sc.user, sc.resp);
-                            }
-                        }.execSubmitWrapper,
-                    );
+                            submit(
+                                ChainSubmitCtx(T),
+                                sc.*,
+                                struct {
+                                    fn run2(
+                                        s: *ChainSubmitCtx(T),
+                                        _: *const fn (?*anyopaque, []const u8) void,
+                                    ) void {
+                                        defer s.allocator.destroy(s.resp);
+                                        execSubmit(&s.user);
+                                        respond(&s.user, s.resp);
+                                    }
+                                }.run2,
+                            );
 
-                    w.allocator.destroy(w);
-                    complete(w, "");
+                            _ = data;
+                        }
+                    }.done);
+
+                    _ = complete;
                 }
-            }.execGoWrapper,
+            }.run,
         );
     }
 
@@ -469,11 +502,14 @@ pub const Next = struct {
 fn ChainWrap(comptime T: type) type {
     return struct {
         user: T,
-        resp: *Next.DeferredResponse,
-        allocator: Allocator,
-        next: ?*Next,
+        chain: ChainGoCtx,
     };
 }
+
+const ChainGoCtx = struct {
+    resp: *Next.DeferredResponse,
+    allocator: Allocator,
+};
 
 fn ChainSubmitCtx(comptime T: type) type {
     return struct {
