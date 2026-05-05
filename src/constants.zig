@@ -16,6 +16,7 @@ pub const MAX_FIXED_FILES = 16384;
 pub const MAX_PATH_LENGTH = 2048;
 pub const IDLE_TIMEOUT_MS = 30000;
 pub const WRITE_TIMEOUT_MS = 5000;
+pub const MAX_CONNECTIONS = 1_048_576;
 
 pub const USER_TASK_BATCH = 64;
 

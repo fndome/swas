@@ -125,7 +125,7 @@ const CacheLine4_6 = extern struct {
     ws_write_queue_tail: u64 = 0,
     ws_token_ptr: u64 = 0,
     ws_token_len: u32 = 0,
-    _fill: [40]u8 = [_]u8{0} ** 40,
+    _fill: [48]u8 = [_]u8{0} ** 48,
 };
 
 comptime {

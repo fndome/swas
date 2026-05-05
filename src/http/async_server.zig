@@ -49,6 +49,11 @@ const ws_upgrade = @import("../ws/upgrade.zig");
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const RingShared = @import("../shared/ring_shared.zig").RingShared;
 const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
+const StackPool = @import("../stack_pool.zig").StackPool;
+const StackSlot = @import("../stack_pool.zig").StackSlot;
+const packUserData = @import("../stack_pool.zig").packUserData;
+const unpackGenId = @import("../stack_pool.zig").unpackGenId;
+const unpackIdx = @import("../stack_pool.zig").unpackIdx;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -107,6 +112,10 @@ pub const AsyncServer = struct {
     listen_fd: i32,
     next_conn_id: u64,
     connections: std.AutoHashMap(u64, Connection),
+    /// StackPool array-indexed connection pool (migrating from AutoHashMap)
+    pool: StackPool(StackSlot, constants.MAX_CONNECTIONS),
+    /// Monotonic generation ID for ghost-event defense
+    conn_gen_id: u32 = 1,
     next_user_data: u64,
     app_ctx: ?*anyopaque,
 
@@ -292,6 +301,9 @@ pub const AsyncServer = struct {
         var dns_resolver = try DnsResolver.init(allocator, &ring, &io_registry, io, ns_ip);
         errdefer dns_resolver.deinit();
 
+        var conn_pool = try StackPool(StackSlot, constants.MAX_CONNECTIONS).init(allocator);
+        errdefer conn_pool.deinit(allocator);
+
         var server = Self{
             .allocator = allocator,
             .io = io,
@@ -299,6 +311,7 @@ pub const AsyncServer = struct {
             .listen_fd = fd,
             .next_conn_id = 1,
             .connections = std.AutoHashMap(u64, Connection).init(allocator),
+            .pool = conn_pool,
             .deferred_hooks = std.ArrayList(*const fn (self: *Self, node: *DeferredNode) void).empty,
             .tick_hooks = std.ArrayList(*const fn (self: *Self) void).empty,
             .io_registry = io_registry,
@@ -352,6 +365,7 @@ pub const AsyncServer = struct {
         if (lrc != 0) logErr("close listen_fd={d} failed: {d}", .{ self.listen_fd, lrc });
 
         self.connections.deinit();
+        self.pool.deinit(self.allocator);
         self.deferred_hooks.deinit(self.allocator);
         self.tick_hooks.deinit(self.allocator);
         self.io_registry.deinit();
