@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const HttpRing = @import("ring.zig").HttpRing;
-const RingSharedClient = @import("../next/client.zig").RingSharedClient;
+const RingSharedClient = @import("../tcp_stream.zig").RingSharedClient;
 const Pipe = @import("../next/pipe.zig").Pipe;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
