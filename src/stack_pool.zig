@@ -31,6 +31,14 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
             };
         }
 
+        /// 预热：触碰每个 slot 的首字段，强制内核分配物理页，
+        /// 消除运行时冷启动 Page Fault 抖动。
+        pub fn warmup(self: *Self) void {
+            for (self.slots) |*slot| {
+                @atomicStore(u32, &slot.line1.gen_id, 0, .monotonic);
+            }
+        }
+
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.live.deinit(allocator);
             allocator.free(self.slots);

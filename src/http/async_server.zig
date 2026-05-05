@@ -311,6 +311,7 @@ pub const AsyncServer = struct {
 
         var conn_pool = try StackPool(StackSlot, constants.MAX_CONNECTIONS).init(allocator);
         errdefer conn_pool.deinit(allocator);
+        conn_pool.warmup();
 
         var user_map = std.AutoHashMap(u64, u32).init(allocator);
         errdefer user_map.deinit();
