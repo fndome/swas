@@ -184,6 +184,15 @@ pub fn completeCompute(slot: *StackSlot, result_code: i32) void {
     slot.line5.ws.compute.result_code = result_code;
 }
 
+/// ── 协议视图切换 ──────────────────────────────────────
+
+/// HTTP → WebSocket 升级：清空 HTTP 解析残留，初始化 WS 视图
+pub fn switchToWs(slot: *StackSlot) void {
+    @memset(&slot.line5.ws.raw, 0);
+    slot.line5.ws.websocket.is_final = false;
+    slot.line5.ws.websocket.payload_len = 0;
+}
+
 /// ── 哨兵校验 ──────────────────────────────────────────
 
 pub fn sentinelIntact(slot: *const StackSlot) bool {

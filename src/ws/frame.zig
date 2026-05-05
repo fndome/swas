@@ -37,9 +37,7 @@ pub fn parseFrame(data: []u8) !Frame {
     const payload = data[offset..][0..@as(usize, @intCast(payload_len))];
 
     if (mask) {
-        for (payload, 0..) |*b, i| {
-            b.* ^= mask_key[i & 3];
-        }
+        maskPayload(payload, mask_key);
     }
 
     return Frame{ .opcode = opcode, .fin = fin, .payload = payload };
@@ -83,4 +81,28 @@ pub fn writeFrame(buf: []u8, frame: Frame) !usize {
 
     @memcpy(buf[offset..][0..frame.payload.len], frame.payload);
     return total;
+}
+
+/// SIMD 加速 WebSocket 掩码计算。
+/// 将 4 字节 mask_key 复制为 16 字节向量，16 字节/轮 XOR。
+fn maskPayload(payload: []u8, mask_key: [4]u8) void {
+    const Vec = @Vector(16, u8);
+    const mask_vec: Vec = [_]u8{
+        mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+        mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+        mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+        mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+    };
+
+    var i: usize = 0;
+    const chunk_count = payload.len / 16;
+    for (0..chunk_count) |_| {
+        const chunk: *Vec = @ptrCast(@alignCast(&payload[i]));
+        chunk.* ^= mask_vec;
+        i += 16;
+    }
+    // Tail: remaining < 16 bytes
+    while (i < payload.len) : (i += 1) {
+        payload[i] ^= mask_key[i & 3];
+    }
 }
