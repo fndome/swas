@@ -79,7 +79,7 @@ StackPool<StackSlot, 1_048_576>
   └── warmup() — 触碰所有页消除冷启动 Page Fault
 ```
 
-#### StackSlot（320 字节，5 条缓存行）
+#### StackSlot（384 字节，5 条缓存行）
 
 每个连接槽位按独立缓存行拆分，热路径无竞争：
 
@@ -529,20 +529,20 @@ sws 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享
 | 组件 | 大小 | 说明 |
 |------|------|------|
 | StackSlot（每连接） | 320 字节 | 5 条独立缓存行子结构 |
-| StackPool（1M 槽位） | 320 MB | 预分配连续数组，warmup 预热 |
+| StackPool（1M 槽位） | ~400 MB | 384B per StackSlot，连续数组，warmup 预热 |
 | Freelist（1M u32） | 4 MB | O(1) 获取/释放 |
 | 读缓冲区（空闲时） | 0 字节 | io_uring 提供缓冲区，空闲时归还 |
 | io_uring 读缓冲 slab | 64 MB | 16384 × 4KB 块，内核回收 |
 | 分层写缓冲池 | 动态 | 8 个尺寸类别（512B–64KB），freelist 循环复用 |
 | 共享 fiber 栈 | 64 KB | 所有 fiber 共用一块预分配栈 |
 | LargeBufferPool | 64 MB | 64 × 1MB 超大报文缓冲 |
-| **100 万空闲连接** | **~460 MB** | 无线程栈开销 |
+| **100 万空闲连接** | **~540 MB** | 无线程栈开销 |
 
 和 [greatws](https://github.com/antlabs/greatws) 一样，空闲连接消耗零缓冲内存。
 
 ### 缓存行布局原理
 
-320 字节 StackSlot 按独立缓存行拆分：
+384 字节 StackSlot 按独立缓存行拆分：
 
 - **line1（64B）：** fd、gen_id、state、write_offset — CQE 分发只触及此缓存行
 - **line2（64B）：** conn_id、last_active_ms、active_list_pos — TTL 扫描只触及此缓存行

@@ -82,7 +82,7 @@ StackPool<StackSlot, 1_048_576>
   └── warmup() — touch all pages to eliminate cold-start faults
 ```
 
-#### StackSlot (320 bytes, 5 cache lines)
+#### StackSlot (384 bytes, 5 cache lines)
 
 Each connection slot is split across independent cache lines for contention-free hot-path access:
 
@@ -664,20 +664,20 @@ See `example/` and `src/example.zig`.
 | Component | Size | Notes |
 |-----------|------|-------|
 | StackSlot (per connection) | 320 bytes | 5 cache-line-aligned sub-structures |
-| StackPool (1M slots) | 320 MB | Pre-allocated contiguous array, warmup-touched |
+| StackPool (1M slots) | ~400 MB | 384B per StackSlot, contiguous, warmup-touched |
 | Freelist (1M u32) | 4 MB | O(1) acquire/release |
 | Read buffer (idle) | 0 bytes | io_uring provided buffers, returned on idle |
 | Slab for io_uring reads | 64 MB | 16384 × 4KB blocks, kernel-recycled |
 | Tiered write pool | dynamic | 8 size classes (512B–64KB), freelist-recycled |
 | Shared fiber stack | 64 KB | All fibers share one pre-allocated stack |
 | LargeBufferPool | 64 MB | 64 × 1MB blocks for oversized requests |
-| **1M idle connections** | **~460 MB** | No per-thread stack overhead |
+| **1M idle connections** | **~540 MB** | No per-thread stack overhead |
 
 Like [greatws](https://github.com/antlabs/greatws), idle connections consume zero buffer memory.
 
 ### Cache-line layout rationale
 
-The 320-byte StackSlot is split across independent cache lines:
+The 384-byte StackSlot is split across independent cache lines:
 
 - **line1 (64B):** fd, gen_id, state, write_offset — only this is touched during CQE dispatch
 - **line2 (64B):** conn_id, last_active_ms, active_list_pos — only touched during TTL scanning
