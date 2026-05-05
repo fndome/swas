@@ -381,4 +381,104 @@ pub const Next = struct {
             std.log.err("Next.push: ringbuffer full, task dropped", .{});
         }
     }
+
+    /// ── Next.chainGoSubmit ─────────────────────────────────
+    ///
+    /// 编程模型：Go（IO 线程 fiber）→ Submit（worker 池）→ 响应。
+    /// 同一 Ctx 流经两个阶段，无需手动分配 DeferredResponse。
+    ///
+    /// 用法（handler 中一行搞定）：
+    ///   try Next.chainGoSubmit(ctx, myCtx, execDb, execCompute, sendJson);
+    ///
+    ///   execDb(Ctx):       IO 线程 fiber 执行（DB io_uring、异步 I/O）
+    ///   execCompute(Ctx):  worker 池执行（CPU 密集）
+    ///   sendJson(Ctx, DeferredResponse):  构建并发送响应
+    pub fn chainGoSubmit(
+        comptime T: type,
+        http_ctx: *Context,
+        user_ctx: T,
+        comptime execGo: fn (*T) void,
+        comptime execSubmit: fn (*T) void,
+        comptime respond: fn (*T, *DeferredResponse) void,
+    ) !void {
+        const s = http_ctx.server orelse return;
+        const server: *AsyncServer = @ptrCast(@alignCast(s));
+        const alloc = http_ctx.allocator;
+
+        const resp = try alloc.create(DeferredResponse);
+        errdefer alloc.destroy(resp);
+        resp.* = .{ .server = server, .conn_id = http_ctx.conn_id, .allocator = alloc };
+
+        const wrap = try alloc.create(ChainWrap(T));
+        errdefer alloc.destroy(wrap);
+        wrap.* = .{ .user = user_ctx, .resp = resp, .allocator = alloc, .next = default_next };
+
+        http_ctx.deferred = true;
+
+        go(
+            ChainWrap(T),
+            wrap.*,
+            struct {
+                fn execGoWrapper(
+                    w: *ChainWrap(T),
+                    complete: *const fn (?*anyopaque, []const u8) void,
+                ) void {
+                    execGo(&w.user);
+
+                    // 将 Ctx 的副本交到 worker 池
+                    const submit_ctx = w.allocator.create(ChainSubmitCtx(T)) catch {
+                        w.resp.json(500, "{\"error\":\"OOM\"}");
+                        w.allocator.destroy(w.resp);
+                        w.allocator.destroy(w);
+                        complete(w, "");
+                        return;
+                    };
+                    submit_ctx.* = .{
+                        .user = w.user,
+                        .resp = w.resp,
+                        .allocator = w.allocator,
+                    };
+
+                    submit(
+                        ChainSubmitCtx(T),
+                        submit_ctx.*,
+                        struct {
+                            fn execSubmitWrapper(
+                                sc: *ChainSubmitCtx(T),
+                                _complete2: *const fn (?*anyopaque, []const u8) void,
+                            ) void {
+                                defer sc.allocator.destroy(sc.resp);
+                                execSubmit(&sc.user);
+                                respond(&sc.user, sc.resp);
+                            }
+                        }.execSubmitWrapper,
+                    );
+
+                    w.allocator.destroy(w);
+                    complete(w, "");
+                }
+            }.execGoWrapper,
+        );
+    }
+
+    const DeferredResponse = @import("../root.zig").DeferredResponse;
+    const Context = @import("../http/context.zig").Context;
+    const AsyncServer = @import("../http/async_server.zig").AsyncServer;
 };
+
+fn ChainWrap(comptime T: type) type {
+    return struct {
+        user: T,
+        resp: *Next.DeferredResponse,
+        allocator: Allocator,
+        next: ?*Next,
+    };
+}
+
+fn ChainSubmitCtx(comptime T: type) type {
+    return struct {
+        user: T,
+        resp: *Next.DeferredResponse,
+        allocator: Allocator,
+    };
+}
