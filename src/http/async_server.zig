@@ -612,6 +612,9 @@ pub const AsyncServer = struct {
 
         const resp_buf = conn.response_buf orelse return;
 
+        // iovecs from StackSlot (Line4) — kernel-safe during async write, never freed
+        const iovs = &self.pool.slots[conn.pool_idx].line4.write_iovs;
+
         // Bounds-safe header end: clamp to actual buffer length to prevent
         // index-out-of-bounds panic when write_offset drifts past the buffer.
         const header_len = @min(conn.write_headers_len, resp_buf.len);
@@ -623,7 +626,7 @@ pub const AsyncServer = struct {
             var count: usize = 0;
 
             if (conn.write_offset < header_len) {
-                conn.write_iovs[count] = .{
+                iovs[count] = .{
                     .base = resp_buf.ptr + conn.write_offset,
                     .len = header_len - conn.write_offset,
                 };
@@ -635,14 +638,14 @@ pub const AsyncServer = struct {
             else
                 0;
             if (body_start < body.len) {
-                conn.write_iovs[count] = .{
+                iovs[count] = .{
                     .base = body.ptr + body_start,
                     .len = body.len - body_start,
                 };
                 count += 1;
             }
 
-            const sqe = try self.ring.writev(user_data, fd, conn.write_iovs[0..count], 0);
+            const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         } else {
             if (conn.write_offset >= header_len) return;

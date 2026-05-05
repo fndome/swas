@@ -30,8 +30,6 @@ pub const Connection = struct {
     write_start_ms: i64 = 0,
     ws_token: ?[]const u8 = null,
     write_retries: u8 = 0,
-    /// iovec 数组存 Connection 里，保证 writev SQE 处理期间内存不失效
-    write_iovs: [2]std.posix.iovec_const = undefined,
     /// 读 buffer 是否已归还 io_uring provided buffer pool（防止二次回收）
     read_buf_recycled: bool = false,
     /// 写 buffer (write_body + response_buf) 是否已在 close 路径释放（防止 double-free）
