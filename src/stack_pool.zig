@@ -212,6 +212,16 @@ pub const StackSlot = extern struct {
         if (@offsetOf(StackSlot, "line5") != 320) {
             @compileError("line5 offset must be 320, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(StackSlot, "line5")}));
         }
+        // Gemini: explicit offset check for hot fields to guard compiler padding drift
+        if (@offsetOf(CacheLine1, "fd") != 8) {
+            @compileError("CacheLine1.fd must be at offset 8, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(CacheLine1, "fd")}));
+        }
+        if (@offsetOf(CacheLine2, "last_active_ms") != 8) {
+            @compileError("CacheLine2.last_active_ms must be at offset 8, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(CacheLine2, "last_active_ms")}));
+        }
+        if (@offsetOf(CacheLine5, "sentinel") != 0) {
+            @compileError("CacheLine5.sentinel must be at offset 0, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(CacheLine5, "sentinel")}));
+        }
     }
 };
 
