@@ -5,14 +5,17 @@
 A single-thread async HTTP + WebSocket server on Linux `io_uring`, in Zig 0.16.0.
 
 ```
-IO thread (io_uring + fiber):
+IO thread (io_uring Ring A + fiber):
   ├── accept/read/write CQE → fiber → handler → respond
   ├── drain user SubmitQueues
   ├── drain Next.go() ringbuffer tasks
-  └── drain DeferredResponse → respond
+  ├── drain DeferredResponse / InvokeQueue → respond
+  ├── drainTick (DNS tick + invoke.drain + tick_hooks)
+  ├── FiberShared.tick() — harvest outbound rings (Ring B/C/D...)
+  └── TTL incremental scan (StackPool live list)
 
 Worker pool (optional, offload CPU/GPU/blocking I/O):
-  └── Next.submit() → worker thread → compute → DeferredResponse → IO thread drains
+  └── Next.submit() → worker thread → compute → InvokeQueue → IO thread drains
 ```
 
 Handlers run as **fibers on the IO thread** by default.
@@ -55,23 +58,133 @@ The entire event loop runs on **one IO thread**. Handlers execute as **fibers** 
 ```
 IO thread (single):
   io_uring.submit_and_wait(1)
-    → CQE dispatch
+    → CQE dispatch (via StackPool sticker)
     → fiber → handler → ctx.text/json/html
+    → drainPendingResumes (fiber resume queue)
     → drainNextTasks (Next.go ringbuffer tasks)
-    → drainDeferred  (DeferredResponse)
+    → drainTick (DNS tick + invoke.drain + tick_hooks)
+    → FiberShared.tick() (outbound Ring B/C/D harvest)
+    → TTL scan (StackPool live list, incremental)
     → loop
 ```
 
 No background threads unless you call `server.initPool4NextSubmit(n)`.
 
+### StackPool — O(1) connection pool
+
+Connections are stored in a **pre-allocated array** (not a hash map). O(1) acquire/release via freelist.
+
+```
+StackPool<StackSlot, 1_048_576>
+  ├── slots: [1M]StackSlot — contiguous, cache-line-aligned
+  ├── freelist: [1M]u32 — O(1) pop/push
+  ├── live: []u32 — active slot indices (TTL scan source)
+  └── warmup() — touch all pages to eliminate cold-start faults
+```
+
+#### StackSlot (320 bytes, 5 cache lines)
+
+Each connection slot is split across independent cache lines for contention-free hot-path access:
+
+```
+line1 ( 64B): fd, gen_id, state, write_offset, req_count — CQE dispatch (hottest)
+line2 ( 64B): conn_id, last_active_ms, active_list_pos — TTL scanning
+line3 ( 64B): fiber_context, large_buf_ptr — async anchors, Worker Pool, oversized body
+line4 (128B): response_buf, write_iovs, ws_write_queue — write path (low frequency)
+line5 ( 64B): sentinel (0x53574153) + workspace union — HTTP/WS/Compute view
+```
+
+**Ghost event defense:** `user_data = (gen_id << 32) | idx`. After close, gen_id is zeroed. Any in-flight CQE arriving after close fails the gen_id match and is silently discarded.
+
+**Workspace switching:** The `line5.ws` union switches between `HttpWork`, `WsWork`, and `ComputeWork` views depending on connection state — no heap allocation for protocol parsing state.
+
+### Ring A + FiberShared — multi-ring architecture
+
+**Ring A** (built-in): the main server's `io_uring` ring — accept, connection read/write, DNS, invoke.
+
+**Outbound rings** (Ring B, Ring C...): independent io_uring rings for outbound protocols. Registered with `FiberShared`, which the IO thread harvests every event loop iteration — zero extra threads, zero locks.
+
+```
+Ring A (main server, IO thread):
+  ├── accept / read / write / close
+  ├── io_registry (client callbacks)
+  ├── dns_resolver (async UDP DNS)
+  ├── rs.invoke (cross-thread push → IO thread callback)
+  └── FiberShared.tick()
+        ├── Ring B (HTTP client) : ATTACH_WQ → shared io-wq
+        │     ├── DnsResolver
+        │     ├── IORegistry
+        │     ├── InvokeQueue
+        │     └── TinyCache
+        ├── Ring C (NATS client futures)
+        └── Ring D (MySQL client futures)
+```
+
+#### FiberShared
+
+Pure scheduling glue layer. Holds tick handles for all outbound rings. IO thread calls `tick()` every loop iteration to non-blocking harvest CQEs from all registered rings.
+
+```zig
+const FiberShared = @import("sws").FiberShared;
+const RingTrait = @import("sws").RingTrait;
+
+var fiber_shared = try FiberShared.init(allocator);
+defer fiber_shared.deinit();
+
+// Ring B (HTTP client) registers itself
+try ring_b.registerWith(&fiber_shared);
+
+// Any new ring just implements RingTrait:
+//   ptr: *anyopaque  — pointer to ring instance
+//   tickFn: fn(*anyopaque) void  — dns.tick + invoke.drain + submit + copy_cqes + dispatch
+```
+
+#### RingTrait
+
+Contract that every outbound ring must implement:
+
+1. `dns.tick()` — drive DNS query state machine
+2. `invoke.drain()` — process cross-thread task dispatch
+3. `ring.submit()` — submit pending SQEs
+4. `ring.copy_cqes()` — non-blocking harvest CQEs
+5. `registry.dispatch(ud, res)` — dispatch CQEs to registered callbacks
+
 ### Init
 
 ```zig
 var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", app_ctx, fiber_stack_size_kb);
-//                                                                         ↑ 0 = 64KB
+//                                                                    ↑ 0 = 64KB
 ```
 
 First handler/middleware registration calls `ensureNext()` → creates `Next` (ringbuffer) + `setDefault()`.
+
+Internally, `AsyncServer.init()` creates:
+- `pool`: StackPool — O(1) contiguous connection array
+- `large_pool`: LargeBufferPool(64) — 64 × 1MB blocks for oversized requests (>32KB)
+- `rs`: RingShared — single ring shared resource (ring + registry + invoke)
+- `io_registry`: IORegistry — outbound client connection registry
+- `dns_resolver`: DnsResolver — async UDP DNS with TTL cache
+
+To add outbound rings (HTTP/NATS/MySQL), inject `FiberShared`:
+
+```zig
+const FiberShared = @import("sws").FiberShared;
+const RingB = @import("sws").HttpRing;   // same as RingB
+const HttpClient = @import("sws").HttpClient;
+const TinyCache = @import("sws").TinyCache;
+
+var fiber_shared = try FiberShared.init(alloc);
+defer fiber_shared.deinit();
+
+var ring_b = try RingB.init(alloc, io, server.ring.fd);
+defer ring_b.deinit();
+try ring_b.registerWith(&fiber_shared);
+
+var cache = TinyCache.init(alloc, 1000);  // 1s TTL
+
+// Set fiber_shared on server so IO thread harvests outbound CQEs
+server.fiber_shared = &fiber_shared;
+```
 
 ### Handler — Synchronous (on IO thread)
 
@@ -299,6 +412,20 @@ GPU drivers are async internally — one worker + fiber can submit N streams
 and poll for completion. No extra thread pool needed. io_uring not yet
 supported for GPU compute (kernel driver gap).
 
+### RingShared
+
+`RingShared` is the materialization of a single io_uring ring + single thread — injected into server and any outbound client, all equal.
+
+```zig
+const rs = server.rs;  // { ring, registry, invoke, io_tid }
+// Any client is injected equally:
+var client = try RingSharedClient.init(alloc, rs, ...);
+var http   = try HttpClient.init(alloc, ring_b, cache);
+```
+
+- `rs.ringPtr()` / `rs.registryPtr()` — IO-thread assertion guard (non-IO thread access → @panic)
+- `rs.invoke.push()` — any-thread-safe CAS callback (worker → IO thread)
+
 ### RingSharedClient
 
 io_uring-driven outbound TCP client. Glue layer for integrating NATS / Redis / HTTP client
@@ -331,6 +458,33 @@ cs.close();  // graceful
 - `write()` queues data; pending writes auto-flushed as io_uring CQEs arrive
 - Protocol layer (NATS / Redis / HTTP) only needs `feed([]u8)` and `write([]const u8)`
 - Multiple clients per server; user_data uses a dedicated high bit to avoid collisions
+
+### TinyCache
+
+Single-entry TTL connection cache for outbound protocols (HTTP / NATS / MySQL). Same host:port
+connections are reused within the TTL window, avoiding repeated TCP handshakes.
+
+```zig
+const TinyCache = @import("sws").TinyCache;
+
+var cache = TinyCache.init(allocator, 1000);  // 1s TTL
+
+// In HttpClient: cache hit → reuse pipe; miss → connect → store
+if (cache.getPipe(host, port, now_ms)) |pipe| {
+    // Reuse cached connection
+} else {
+    var stream = try RingSharedClient.init(alloc, rs, onData, onClose, &cache);
+    try stream.connectRaw(ip, port);
+    var pipe = try Pipe.init(alloc, stream);
+    try cache.store(stream, pipe, host, port, now_ms);
+}
+```
+
+**Design principle:**
+- Connect phase allows retries — failed connect doesn't poison the cache
+- Read/write phase forbids retries — failed read/write immediately evicts cache entry
+- Reason: io_uring SQE-level partial writes are guaranteed by the kernel TCP stack;
+  application-layer read/write retries break protocol framing (HTTP pipelining, WS frames, DB protocol packets).
 
 ### Pipe
 
@@ -371,9 +525,71 @@ try cs.connect("localhost", 5432);
 - `reset()` clears buffers on disconnect/reconnect
 - Requires protocol library to accept `anytype` reader/writer (pgz needs 1-line patch on `WriteBuffer.send`)
 
+### LargeBufferPool
+
+For oversized requests (Content-Length > 32KB) that can't fit in the 64KB shared fiber stack.
+Pre-allocated 1MB blocks with O(1) freelist acquire/release.
+
+```zig
+const LargeBufferPool = @import("sws").LargeBufferPool;
+
+// 64 blocks × 1MB = 64MB — built into AsyncServer by default
+// Usage in oversized body path:
+const buf = self.large_pool.acquire() orelse return error.OutOfLargeBuffers;
+// io_uring READ CQE writes directly to buf.ptr
+// ... process body ...
+self.large_pool.release(buf);
+```
+
+### HttpRing + HttpClient (Ring B)
+
+Independent io_uring Ring B for outbound HTTP client. Shares the kernel io-wq thread pool
+via `IORING_SETUP_ATTACH_WQ`, built-in async DNS via `DnsResolver`, and connection reuse via `TinyCache`.
+
+```zig
+const sws = @import("sws");
+
+// Ring B init (attached to server's Ring A io-wq):
+var ring_b = try sws.HttpRing.init(allocator, io, server.ring.fd);
+defer ring_b.deinit();
+try ring_b.registerWith(&fiber_shared);
+
+// HttpClient with 1s TinyCache TTL:
+var http_cache = sws.TinyCache.init(allocator, 1000);
+var http_client = try sws.HttpClient.init(allocator, &ring_b, &http_cache);
+defer http_client.deinit();
+
+// Use from handler:
+const resp = try http_client.get("http://api.example.com/data");
+defer resp.deinit();
+// resp.status, resp.body
+
+// POST with body:
+const resp2 = try http_client.post("http://api.example.com/submit", "{\"key\":\"val\"}");
+```
+
+#### c-ares async DNS (optional)
+
+Built-in `DnsResolver` covers basic needs (A record + TTL cache). For truncated UDP (TC bit → TCP retry) or SRV records, switch to c-ares:
+
+```bash
+sudo apt install libc-ares-dev
+```
+
+Add to `build.zig`:
+```zig
+exe.linkSystemLibrary("cares");
+```
+
+Switch DNS backend:
+```zig
+const HttpCaresDns = sws.HttpCaresDns;
+// ring.dns = HttpCaresDns.init(alloc, ring.rs);
+```
+
 ### Fiber
 
-Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre-allocated stack buffer** — sequential execution, no per-request stack allocation, zero contention.
+Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre-allocated stack buffer** (stored in `AsyncServer.shared_fiber_stack`) — sequential execution, no per-request stack allocation, zero contention.
 
 > ⚠️ **Do NOT use `std.Io.async()` / `future.await()` in handlers.**
 >
@@ -447,14 +663,29 @@ See `example/` and `src/example.zig`.
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| Connection struct | ~110 bytes | Per-connection state |
-| Write buffer | 0 bytes idle | Lazily allocated from tiered pool (512B-64KB) |
-| Read buffer | 0 bytes idle | io_uring provided buffers, returned on idle |
-| Slab for io_uring reads | 64MB | 16384 × 4KB blocks, recycled by kernel |
-| Tiered write pool | dynamic | 8 size classes, recycled |
-| **1M idle connections** | **~250MB** | No per-thread stack overhead |
+| StackSlot (per connection) | 320 bytes | 5 cache-line-aligned sub-structures |
+| StackPool (1M slots) | 320 MB | Pre-allocated contiguous array, warmup-touched |
+| Freelist (1M u32) | 4 MB | O(1) acquire/release |
+| Read buffer (idle) | 0 bytes | io_uring provided buffers, returned on idle |
+| Slab for io_uring reads | 64 MB | 16384 × 4KB blocks, kernel-recycled |
+| Tiered write pool | dynamic | 8 size classes (512B–64KB), freelist-recycled |
+| Shared fiber stack | 64 KB | All fibers share one pre-allocated stack |
+| LargeBufferPool | 64 MB | 64 × 1MB blocks for oversized requests |
+| **1M idle connections** | **~460 MB** | No per-thread stack overhead |
 
 Like [greatws](https://github.com/antlabs/greatws), idle connections consume zero buffer memory.
+
+### Cache-line layout rationale
+
+The 320-byte StackSlot is split across independent cache lines:
+
+- **line1 (64B):** fd, gen_id, state, write_offset — only this is touched during CQE dispatch
+- **line2 (64B):** conn_id, last_active_ms, active_list_pos — only touched during TTL scanning
+- **line3 (64B):** fiber_context, large_buf_ptr — async anchors (Worker Pool / oversized bodies)
+- **line4 (128B):** response_buf, write_iovs, WS queue — write path, not in the hot path
+- **line5 (64B):** sentinel + workspace union — protocol parser scratch, zero extra allocation
+
+The IO loop's hottest path (CQE dispatch → slot lookup) only touches line1. TTL scanning only touches line2. No cache-line ping-pong between unrelated operations.
 
 ### WebSocket payload copying
 
@@ -477,8 +708,23 @@ WS handlers may offload frame data asynchronously, so frame payloads must remain
 | `fiber_stack_size_kb` | 64 | fiber stack size (KB). 0 = 64 |
 | `io_cpu` | null | pin IO thread to CPU core |
 | `idle_timeout_ms` | 30000 | close idle connections |
+| `write_timeout_ms` | 5000 | close stuck-write connections |
 | `buffer_size` | 4096 | io_uring buffer block size |
 | `buffer_pool_size` | 16384 | number of buffer blocks |
+
+## invokeOnIoThread
+
+Cross-thread safe callback to IO thread. Underneath is `rs.invoke` (CAS lock-free linked list), drained automatically in `drainTick`.
+
+```zig
+server.invokeOnIoThread(MyCtx, ctx, struct {
+    fn run(allocator, c: *MyCtx) void {
+        // Runs on IO thread — safe to access ring/registry
+        c.client.write("PUB ...");
+        allocator.free(c.data);
+    }
+}.run);
+```
 
 ## Advanced: io_uring-native DB Pool
 

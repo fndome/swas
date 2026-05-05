@@ -3,14 +3,16 @@
 基于 Linux `io_uring` 的单线程 HTTP + WebSocket 服务器，Zig 0.16.0。
 
 ```
-IO 线程（io_uring + fiber）:
+IO 线程（io_uring Ring A + fiber）:
   ├── accept/read/write CQE → fiber → handler → 发响应
   ├── drainNextTasks（Next.go ringbuffer 任务）
-  ├── drainTick（DNS 超时检测 + rs.invoke.drain + tick_hooks）
-  └── DNS 客户端 / RingSharedClient / Pipe（全部同线程 io_uring）
+  ├── drainDeferred / InvokeQueue → 发响应
+  ├── drainTick（DNS tick + invoke.drain + tick_hooks）
+  ├── FiberShared.tick() — 收割出站 ring（Ring B/C/D...）
+  └── TTL 增量扫描（StackPool 活跃表）
 
 Worker 线程池（可选，仅 CPU 密集任务）:
-  └── Next.submit() → worker 线程 → 计算 → rs.invoke.push → IO 线程回调
+  └── Next.submit() → worker 线程 → 计算 → InvokeQueue → IO 线程回调
 ```
 
 Handler 默认作为 **fiber 运行在 IO 线程上**。
@@ -53,23 +55,132 @@ pub fn main() !void {
 ```
 IO 线程（单线程）:
   io_uring.submit_and_wait(1)
-    → CQE 分发
+    → CQE 分发（通过 StackPool sticker）
     → fiber → handler → ctx.text/json/html
+    → drainPendingResumes（fiber 恢复队列）
     → drainNextTasks（Next.go ringbuffer 任务）
-    → drainTick（rs.invoke.drain + DNS tick + hooks）
+    → drainTick（DNS tick + invoke.drain + tick_hooks）
+    → FiberShared.tick()（收割出站 Ring B/C/D）
+    → TTL 扫描（StackPool 活跃表，增量滑窗）
     → 循环
 ```
 
 除非显式调用 `server.initPool4NextSubmit(n)`，不会启动任何后台线程。
 
+### StackPool — O(1) 连接池
+
+连接存储于**预分配数组**（非哈希表）。freelist 支持 O(1) 获取/释放。
+
+```
+StackPool<StackSlot, 1_048_576>
+  ├── slots: [1M]StackSlot — 连续内存，缓存行对齐
+  ├── freelist: [1M]u32 — O(1) 压入/弹出
+  ├── live: []u32 — 活跃槽位索引表（TTL 扫描源）
+  └── warmup() — 触碰所有页消除冷启动 Page Fault
+```
+
+#### StackSlot（320 字节，5 条缓存行）
+
+每个连接槽位按独立缓存行拆分，热路径无竞争：
+
+```
+line1（64B）：fd、gen_id、state、write_offset、req_count — CQE 分发（最热）
+line2（64B）：conn_id、last_active_ms、active_list_pos — TTL 扫描
+line3（64B）：fiber_context、large_buf_ptr — 异步锚点、Worker Pool、超大报文
+line4（128B）：response_buf、write_iovs、ws_write_queue — 写路径（低频）
+line5（64B）：sentinel（0x53574153）+ workspace 联合体 — HTTP/WS/Compute 视图
+```
+
+**幽灵事件防御：** `user_data = (gen_id << 32) | idx`。关闭连接时清零 gen_id。任何在途 CQE 到达时 gen_id 不匹配 → 静默丢弃。
+
+**视图切换：** `line5.ws` 联合体根据连接状态在 `HttpWork`、`WsWork`、`ComputeWork` 之间切换——协议解析状态零堆分配。
+
+### Ring A + FiberShared — 多 ring 架构
+
+**Ring A**（内置）：主服务器 `io_uring` ring — accept、连接读写、DNS、invoke。
+
+**出站 ring**（Ring B、Ring C...）：独立 io_uring ring 用于出站协议。注册到 `FiberShared`，IO 线程每轮事件循环遍历收割——零额外线程，零锁。
+
+```
+Ring A（主服务器，IO 线程）:
+  ├── accept / read / write / close
+  ├── io_registry（客户端回调注册表）
+  ├── dns_resolver（异步 UDP DNS）
+  ├── rs.invoke（跨线程推送 → IO 线程回调）
+  └── FiberShared.tick()
+        ├── Ring B（HTTP 客户端）：ATTACH_WQ → 共享内核 io-wq
+        │     ├── DnsResolver
+        │     ├── IORegistry
+        │     ├── InvokeQueue
+        │     └── TinyCache
+        ├── Ring C（NATS 客户端 futures）
+        └── Ring D（MySQL 客户端 futures）
+```
+
+#### FiberShared
+
+纯调度胶水层。持有所有出站 ring 的 tick 句柄。IO 线程每轮调 `tick()` 非阻塞收割所有已注册 ring 的 CQE。
+
+```zig
+const FiberShared = @import("sws").FiberShared;
+const RingTrait = @import("sws").RingTrait;
+
+var fiber_shared = try FiberShared.init(allocator);
+defer fiber_shared.deinit();
+
+// Ring B（HTTP 客户端）自行注册
+try ring_b.registerWith(&fiber_shared);
+
+// 任何新 ring 只需实现 RingTrait：
+//   ptr: *anyopaque  — 指向具体 ring 实例的指针
+//   tickFn: fn(*anyopaque) void  — dns.tick + invoke.drain + submit + copy_cqes + dispatch
+```
+
+#### RingTrait
+
+每个出站 ring 必须实现的契约：
+
+1. `dns.tick()` — 驱动 DNS 查询状态机
+2. `invoke.drain()` — 处理跨线程任务投递
+3. `ring.submit()` — 提交待处理 SQE
+4. `ring.copy_cqes()` — 非阻塞收割 CQE
+5. `registry.dispatch(ud, res)` — 分发 CQE 到已注册回调
+
 ### 初始化
 
 ```zig
 var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", app_ctx, fiber_stack_size_kb);
-//                                                                         ↑ 0 = 64KB
+//                                                                    ↑ 0 = 64KB
 ```
 
 首次注册 handler/middleware 时 `ensureNext()` 自动创建 `Next`（ringbuffer）+ `setDefault()`。
+
+内部 `AsyncServer.init()` 创建：
+- `pool`: StackPool — O(1) 连续数组连接池
+- `large_pool`: LargeBufferPool(64) — 64 × 1MB 超大报文缓冲
+- `rs`: RingShared — 单 ring 共享资源（ring + registry + invoke）
+- `io_registry`: IORegistry — 出站客户端连接注册表
+- `dns_resolver`: DnsResolver — 异步 UDP DNS + TTL 缓存
+
+添加出站 ring（HTTP/NATS/MySQL）需要注入 `FiberShared`：
+
+```zig
+const FiberShared = @import("sws").FiberShared;
+const RingB = @import("sws").HttpRing;
+const HttpClient = @import("sws").HttpClient;
+const TinyCache = @import("sws").TinyCache;
+
+var fiber_shared = try FiberShared.init(alloc);
+defer fiber_shared.deinit();
+
+var ring_b = try RingB.init(alloc, io, server.ring.fd);
+defer ring_b.deinit();
+try ring_b.registerWith(&fiber_shared);
+
+var cache = TinyCache.init(alloc, 1000);  // 1s TTL
+
+server.fiber_shared = &fiber_shared;
+```
 
 ### Handler — 同步（跑在 IO 线程）
 
@@ -295,76 +406,31 @@ Next.submit(GpuCtx, ctx, struct {
 GPU 驱动内置异步执行，1 个 worker + fiber 即可提交 N 个 stream 并轮询完成，
 无需额外线程池。
 
-### RingSharedClient
+### TinyCache
 
-基于 io_uring 的出站 TCP 客户端。同享 `RingShared`（ring + registry + invoke），用于将 NATS / Redis / HTTP client 等第三方库集成到 sws 的 IO 线程——无需独立运行时，全程零锁。
+出站连接缓存基石。单条目 TTL 缓存：同 host:port 未过期时复用 TCP 连接和 Pipe。
+HTTP / NATS / MySQL 等协议 client 共用此基础件。
 
 ```zig
-const RingSharedClient = @import("sws").RingSharedClient;
+const TinyCache = @import("sws").TinyCache;
 
-fn onData(ctx: ?*anyopaque, data: []u8) void {
-    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
-    nats.feed(data);
+var cache = TinyCache.init(allocator, 1000);  // 1s TTL
+
+// HttpClient 中：缓存命中 → 复用 pipe；未命中 → 连接 → store
+if (cache.getPipe(host, port, now_ms)) |pipe| {
+    // 复用已缓存连接
+} else {
+    var stream = try RingSharedClient.init(alloc, rs, onData, onClose, &cache);
+    try stream.connectRaw(ip, port);
+    var pipe = try Pipe.init(alloc, stream);
+    try cache.store(stream, pipe, host, port, now_ms);
 }
-
-fn onClose(ctx: ?*anyopaque) void {
-    const nats: *NatsClient = @ptrCast(@alignCast(ctx));
-    nats.discard();
-}
-
-var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, nats_ctx);
-defer cs.deinit();
-try cs.connect("127.0.0.1", 4222);
-
-try cs.write("PUB subject 5\r\nhello\r\n");
-cs.close();
 ```
 
-- `server.rs` 是 `RingShared` 实例——内含 ring、registry、invoke 队列，注入到各个 client
-- 所有 I/O 跑在 sws IO 线程 — `onData` / `onClose` 与 handler 在同一上下文执行
-
-### RingShared
-
-`RingShared` 是 io_uring 单 ring + 单线程的物化——注入到 server 和任意 client，表示一切平等。
-
-```zig
-const rs = server.rs;  // { ring, registry, invoke }
-// 任何 client 平等注入:
-var client = try RingSharedClient.init(alloc, rs, ...);
-var http   = try HttpClient.init(alloc, rs, dns);
-```
-
-- `rs.ringPtr()` / `rs.registryPtr()` — IO 线程断言保护（非 IO 线程调用直接 @panic）
-- `rs.invoke.push()` — 任意线程安全 CAS 回调（worker → IO 线程）
-
-### DNS 解析
-
-内置 io_uring 异步 DNS 解析 + TTL 缓存。
-
-```zig
-// RingSharedClient.connect("redis.svc.local", 6379)
-//   → DNS 缓存命中 → 直接连接
-//   → 未命中 → fiber yield → io_uring UDP DNS → resume → 连接
-```
-
-- 自动读取 `/etc/resolv.conf` 获取 K8s CoreDNS nameserver
-- TTL 缓存（5s ~ 300s），最多 256 条目
-
-### invokeOnIoThread
-
-任意线程安全回调到 IO 线程执行。
-
-```zig
-server.invokeOnIoThread(MyCtx, ctx, struct {
-    fn run(allocator, c: *MyCtx) void {
-        // IO 线程执行 — 安全访问 ring/registry
-        c.client.write("PUB ...");
-        allocator.free(c.data);
-    }
-}.run);
-```
-
-底层是 `rs.invoke` (CAS 无锁链表)，`drainTick` 自动清空。
+**设计原则（io_uring 最佳实践）：**
+- 连接阶段允许重试——connect 失败不影响缓存，下次 getPipe 自动重建
+- 读写阶段禁止重试——write/read 失败立即淘汰缓存条目
+- 原因：io_uring SQE 级 partial write 由内核 TCP 栈保证；应用层重试 read/write 会造成协议帧边界错乱（HTTP 管线化、WS 帧、DB 协议包）
 
 ### Pipe
 
@@ -372,39 +438,25 @@ server.invokeOnIoThread(MyCtx, ctx, struct {
 使同步风格的协议库（pgz、myzql）通过 fiber yield/resume 直接跑在 IO 线程——
 无需 worker 线程，全程零锁。
 
+### LargeBufferPool
+
+超大报文缓冲池。64KB 共享栈无法容纳的请求（Content-Length > 32KB）由此接管。
+每块 1MB，预分配 64 块。O(1) acquire/release，freelist 驱动。
+
 ```zig
-const Pipe = @import("sws").Pipe;
-const RingSharedClient = @import("sws").RingSharedClient;
+const LargeBufferPool = @import("sws").LargeBufferPool;
 
-fn onData(ctx: ?*anyopaque, data: []u8) void {
-    const p: *Pipe = @ptrCast(@alignCast(ctx));
-    p.feed(data) catch {};
-}
-
-fn onClose(ctx: ?*anyopaque) void {
-    const p: *Pipe = @ptrCast(@alignCast(ctx));
-    p.reset();
-}
-
-var cs = try RingSharedClient.init(allocator, server.rs, onData, onClose, &pipe);
-var pipe = try Pipe.init(allocator, cs);
-defer pipe.deinit();
-
-try cs.connect("localhost", 5432);
-
-// 任何接受 anytype reader/writer 的协议库直接可用：
-// var conn = try pgz.Connection.init(allocator, pipe.reader(), pipe.writer());
-// var result = try conn.query("SELECT 1", struct { u8 });
+// 64 块 × 1MB = 64MB，AsyncServer 内置
+// 在超长报文路径中使用：
+const buf = self.large_pool.acquire() orelse return error.OutOfLargeBuffers;
+// io_uring READ CQE 直接写 buf.ptr
+// ... 处理 body ...
+self.large_pool.release(buf);
 ```
-
-- `feed(data)` 将 RingSharedClient 字节推入读缓冲区，唤醒等待中的 fiber
-- `reader.read()` 在无数据时通过 fiber yield 挂起——对调用方表现为同步阻塞
-- `writer.write()` 写入缓冲区；`flushWrite()` 通过 RingSharedClient 发出
-- `reset()` 在断开/重连时清空缓冲区
 
 ### Fiber
 
-sws 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享一块预分配栈**——顺序执行，无 per-request 分配，零竞争。
+sws 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享一块预分配栈**（存储在 `AsyncServer.shared_fiber_stack`）——顺序执行，无 per-request 分配，零竞争。
 
 > ⚠️ **严禁在 handler 中使用 `std.Io.async()` / `future.await()`。**
 >
@@ -476,14 +528,29 @@ sws 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享
 
 | 组件 | 大小 | 说明 |
 |------|------|------|
-| 连接结构体 | ~110 字节 | 每连接状态 |
-| 写缓冲区 | 空闲时 0 字节 | 从分层池按需分配（512B-64KB） |
-| 读缓冲区 | 空闲时 0 字节 | io_uring 提供缓冲区，空闲时归还 |
-| io_uring 读缓冲 slab | 64MB | 16384 × 4KB 块，内核回收 |
-| 分层写缓冲池 | 动态 | 8 个尺寸类别，循环复用 |
-| **100 万空闲连接** | **~250MB** | 无线程栈开销 |
+| StackSlot（每连接） | 320 字节 | 5 条独立缓存行子结构 |
+| StackPool（1M 槽位） | 320 MB | 预分配连续数组，warmup 预热 |
+| Freelist（1M u32） | 4 MB | O(1) 获取/释放 |
+| 读缓冲区（空闲时） | 0 字节 | io_uring 提供缓冲区，空闲时归还 |
+| io_uring 读缓冲 slab | 64 MB | 16384 × 4KB 块，内核回收 |
+| 分层写缓冲池 | 动态 | 8 个尺寸类别（512B–64KB），freelist 循环复用 |
+| 共享 fiber 栈 | 64 KB | 所有 fiber 共用一块预分配栈 |
+| LargeBufferPool | 64 MB | 64 × 1MB 超大报文缓冲 |
+| **100 万空闲连接** | **~460 MB** | 无线程栈开销 |
 
 和 [greatws](https://github.com/antlabs/greatws) 一样，空闲连接消耗零缓冲内存。
+
+### 缓存行布局原理
+
+320 字节 StackSlot 按独立缓存行拆分：
+
+- **line1（64B）：** fd、gen_id、state、write_offset — CQE 分发只触及此缓存行
+- **line2（64B）：** conn_id、last_active_ms、active_list_pos — TTL 扫描只触及此缓存行
+- **line3（64B）：** fiber_context、large_buf_ptr — 异步锚点（Worker Pool / 超大报文）
+- **line4（128B）：** response_buf、write_iovs、WS 队列 — 写路径，不在热路径上
+- **line5（64B）：** sentinel + workspace 联合体 — 协议解析暂存，零额外分配
+
+IO 循环最热路径（CQE 分发 → slot 查询）仅触及 line1。TTL 扫描仅触及 line2。不同操作之间无缓存行竞争。
 
 ### WebSocket 帧负载拷贝
 
@@ -509,6 +576,22 @@ WS handler 可将帧数据异步卸出，因此帧负载在 handler 返回后仍
 | `write_timeout_ms` | 5000 | 写超时关闭连接 |
 | `buffer_size` | 4096 | io_uring 缓冲区块大小 |
 | `buffer_pool_size` | 16384 | 缓冲区块数量 |
+
+## invokeOnIoThread
+
+任意线程安全回调到 IO 线程执行。
+
+```zig
+server.invokeOnIoThread(MyCtx, ctx, struct {
+    fn run(allocator, c: *MyCtx) void {
+        // IO 线程执行 — 安全访问 ring/registry
+        c.client.write("PUB ...");
+        allocator.free(c.data);
+    }
+}.run);
+```
+
+底层是 `rs.invoke` (CAS 无锁链表)，`drainTick` 自动清空。
 
 ## 进阶：io_uring 原生 DB 连接池
 
