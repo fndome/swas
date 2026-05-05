@@ -677,6 +677,8 @@ pub const AsyncServer = struct {
                             swapped_conn.active_list_pos = conn.active_list_pos;
                         }
                     }
+                    // Invalidate gen_id so ghost CQEs are rejected
+                    self.pool.slots[conn.pool_idx].line1.gen_id = 0;
                     self.pool.release(conn.pool_idx);
                 }
                 _ = self.connections.remove(conn_id);
@@ -744,6 +746,7 @@ pub const AsyncServer = struct {
             slot.line1.fd = conn_fd;
             slot.line1.state = .reading;
             slot.line2.last_active_ms = milliTimestamp(self.io);
+            slot.line2.birth_ms = slot.line2.last_active_ms;
             slot.line2.conn_id = conn_id;
             slot.line2.active_list_pos = self.pool.liveAdd(pool_idx);
         }

@@ -97,7 +97,11 @@ const CacheLine1 = extern struct {
     read_bid: u16 = 0,
     write_retries: u8 = 0,
     keep_alive: bool = false,
-    _fill: [37]u8 = [_]u8{0} ** 37,
+    /// 当前窗口内请求计数（CQE 热路径防刷）
+    req_count: u32 = 0,
+    /// 当前限速窗口起始时间戳 (ms)
+    req_window_ms: i64 = 0,
+    _fill: [24]u8 = [_]u8{0} ** 24,
 };
 
 comptime {
@@ -115,7 +119,8 @@ const CacheLine2 = extern struct {
     is_writing: bool = false,
     conn_id: u64 = 0,
     active_list_pos: u32 = 0xFFFFFFFF,
-    _fill: [12]u8 = [_]u8{0} ** 12,
+    /// 连接创建时间戳 (ms)，用于绝对 TTL 硬超时
+    birth_ms: i64 = 0,
 };
 
 comptime {
@@ -131,7 +136,8 @@ const CacheLine3 = extern struct {
     large_buf_ptr: u64 = 0,
     large_buf_len: u32 = 0,
     large_buf_offset: u32 = 0,
-    _fill: [24]u8 = [_]u8{0} ** 24,
+    /// 二级计算区：Worker Pool 移交时的预解析元数据 (JSON offset/length 等)
+    worker_scratch: [24]u8 = [_]u8{0} ** 24,
 };
 
 comptime {
@@ -153,8 +159,22 @@ const CacheLine4_6 = extern struct {
     ws_write_queue_tail: u64 = 0,
     ws_token_ptr: u64 = 0,
     ws_token_len: u32 = 0,
-    _fill: [48]u8 = [_]u8{0} ** 48,
+    /// 二级计算区：写路径临时暂存 (NATS sequence / 校验和 / 协议中间态)
+    write_scratch: [48]u8 = [_]u8{0} ** 48,
 };
+
+const CacheLine5 = extern struct {
+    /// 哨兵魔数 0x53574153 ("SWAS")，debug 时检测内存越界
+    sentinel: u32 = 0x53574153,
+    /// 二级计算区：短读拼包区 + 通用临时暂存 (最大连续块)
+    workspace: [60]u8 = [_]u8{0} ** 60,
+};
+
+comptime {
+    if (@sizeOf(CacheLine5) != 64) {
+        @compileError("CacheLine5 must be 64 bytes, got " ++ std.fmt.comptimePrint("{}", .{@sizeOf(CacheLine5)}));
+    }
+}
 
 comptime {
     if (@sizeOf(CacheLine4_6) != 128) {
@@ -174,12 +194,12 @@ pub const StackSlot = extern struct {
     line2: CacheLine2,
     line3: CacheLine3,
     line4: CacheLine4_6,
+    line5: CacheLine5,
 
     comptime {
         if (@sizeOf(StackSlot) > 400) {
             @compileError("StackSlot exceeds 400 bytes: " ++ std.fmt.comptimePrint("{}", .{@sizeOf(StackSlot)}));
         }
-        // Verify line2 starts at offset 64
         if (@offsetOf(StackSlot, "line2") != 64) {
             @compileError("line2 offset must be 64, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(StackSlot, "line2")}));
         }
@@ -188,6 +208,9 @@ pub const StackSlot = extern struct {
         }
         if (@offsetOf(StackSlot, "line4") != 192) {
             @compileError("line4 offset must be 192, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(StackSlot, "line4")}));
+        }
+        if (@offsetOf(StackSlot, "line5") != 320) {
+            @compileError("line5 offset must be 320, got " ++ std.fmt.comptimePrint("{}", .{@offsetOf(StackSlot, "line5")}));
         }
     }
 };
