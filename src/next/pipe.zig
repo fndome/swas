@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Fiber = @import("fiber.zig").Fiber;
-const RingSharedClient = @import("client.zig").RingSharedClient;
+const RingSharedClient = @import("../tcp_stream.zig").RingSharedClient;
 
 /// Pipe: 将 RingSharedClient 的推模型（on_data 回调）适配为拉模型（reader.read/writer.write）。
 ///
