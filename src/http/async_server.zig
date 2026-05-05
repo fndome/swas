@@ -365,18 +365,21 @@ pub const AsyncServer = struct {
 
         self.rs.invoke.drain(self.allocator);
 
-        var it = self.connections.iterator();
-
-        while (it.next()) |entry| {
-            if (entry.value_ptr.write_body) |b| self.allocator.free(b);
-            if (entry.value_ptr.ws_token) |t| self.allocator.free(t);
-            if (entry.value_ptr.response_buf) |buf| self.buffer_pool.freeTieredWriteBuf(buf, entry.value_ptr.response_buf_tier);
-            const rc = linux.close(entry.value_ptr.fd);
-            if (rc != 0) logErr("close fd={d} failed: {d}", .{ entry.value_ptr.fd, rc });
+        // Clean up all connections: free resources + release pool slots
+        {
+            var it = self.connections.iterator();
+            while (it.next()) |entry| {
+                const conn = entry.value_ptr;
+                if (conn.write_body) |b| self.allocator.free(b);
+                if (conn.ws_token) |t| self.allocator.free(t);
+                if (conn.response_buf) |buf| self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                _ = linux.close(conn.fd);
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    sticker.slotFree(&self.pool, conn.pool_idx);
+                }
+            }
         }
-        const lrc = linux.close(self.listen_fd);
-        if (lrc != 0) logErr("close listen_fd={d} failed: {d}", .{ self.listen_fd, lrc });
-
+        _ = linux.close(self.listen_fd);
         self.connections.deinit();
         self.pool.deinit(self.allocator);
         self.ttl_scan_out.deinit(self.allocator);
@@ -673,22 +676,7 @@ pub const AsyncServer = struct {
             }
 
             if (conn.state == .closing or fd == 0) {
-                // Second pass: release pool slot and live list entry
-                if (conn.pool_idx != 0xFFFFFFFF) {
-                    if (self.pool.liveRemove(conn.active_list_pos)) |swapped_idx| {
-                        // Update the swapped-in slot's list position
-                        const slot = &self.pool.slots[swapped_idx];
-                        slot.line2.active_list_pos = conn.active_list_pos;
-                        // Also update the Connection's active_list_pos if in hashmap
-                        if (self.connections.getPtr(slot.line2.conn_id)) |swapped_conn| {
-                            swapped_conn.active_list_pos = conn.active_list_pos;
-                        }
-                    }
-                    // Invalidate gen_id so ghost CQEs are rejected
-                    self.pool.slots[conn.pool_idx].line1.gen_id = 0;
-                    self.pool.release(conn.pool_idx);
-                }
-                _ = self.connections.remove(conn_id);
+                sticker.connFree(&self.pool, &self.connections, conn_id);
                 return;
             }
 
@@ -711,14 +699,13 @@ pub const AsyncServer = struct {
                 conn_id | CLOSE_USER_DATA_FLAG;
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
-                // fd already closed, clean up map entry
                 if (self.connections.getPtr(conn_id)) |c| {
                     c.state = .closing;
                 }
                 self.closeConn(conn_id, 0);
                 return;
             };
-            sqe.opcode = @enumFromInt(19); // IORING_OP_CLOSE
+            sqe.opcode = @enumFromInt(19);
             sqe.fd = fd;
         }
     }
@@ -1217,7 +1204,6 @@ pub const AsyncServer = struct {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
             } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
-                // IORING_OP_CLOSE completed — final cleanup through closeConn
                 const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
                 const close_conn_id: u64 = if (sticker.getSlotChecked(&self.pool, raw_ud)) |slot|
                     slot.line2.conn_id
@@ -1230,22 +1216,12 @@ pub const AsyncServer = struct {
                 self.io_registry.dispatch(user_data, res);
             } else {
                 const conn_id = user_data;
-                const conn = blk: {
-                    if (sticker.getSlotChecked(&self.pool, user_data)) |_| {
-                        break :blk self.connections.getPtr(conn_id) orelse {
-                            // Ghost CQE: gen_id matched but hashmap gone.
-                            // Recycle provided buffer if present.
-                            if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                                self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
-                            }
-                            self.ring.cqe_seen(&cqes[i]);
-                            continue;
-                        };
+                const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
+                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else self.connections.getPtr(conn_id) orelse {
+                    // Ghost CQE: provided buffer may need recycle
+                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
                     }
-                    // Not a packed token — try old conn_id hashmap lookup
-                    break :blk self.connections.getPtr(conn_id);
-                };
-                const conn_ptr = conn orelse {
                     self.ring.cqe_seen(&cqes[i]);
                     continue;
                 };

@@ -163,3 +163,93 @@ pub fn writeScratch(slot: *StackSlot) []u8 {
 pub fn sentinelIntact(slot: *const StackSlot) bool {
     return slot.line5.sentinel == 0x53574153;
 }
+
+/// ── 全系统连接管理（封装 pool + hashmap 双查）──────────
+/// 过渡期同时维护 pool.slots[idx] 和 AutoHashMap(conn_id → Connection)。
+/// 未来 pool.slots 自含 Connection 后这些函数消失。
+
+/// CQE 分发入口：从 user_data 拿到 slot + Connection。
+/// 幽灵事件防御 → null；hashmap 无条目 → null。
+pub fn lookupByToken(
+    pool: anytype,
+    connections: anytype,
+    user_data: u64,
+) ?struct { slot: *StackSlot, conn: *anyopaque } {
+    const slot = getSlotChecked(pool, user_data) orelse return null;
+    const conn_ptr = connections.getPtr(slot.line2.conn_id) orelse return null;
+    return .{ .slot = slot, .conn = conn_ptr };
+}
+
+/// 从旧 conn_id 反查（过渡期兼容旧调用路径）
+pub fn lookupByConnId(
+    pool: anytype,
+    connections: anytype,
+    conn_id: u64,
+) ?struct { slot: *StackSlot, idx: u32, conn: *anyopaque } {
+    const conn = connections.getPtr(conn_id) orelse return null;
+    const idx = conn.pool_idx;
+    if (idx == 0xFFFFFFFF) return null;
+    const slot = &pool.slots[idx];
+    return .{ .slot = slot, .idx = idx, .conn = conn };
+}
+
+/// 分配连接：pool.acquire + liveAdd + connections.put
+pub fn connAlloc(
+    pool: anytype,
+    connections: anytype,
+    fd: i32,
+    conn_id: u64,
+    conn_gen_id: *u32,
+    now_ms: i64,
+    conn: anytype,
+) !u64 {
+    const result = slotAlloc(pool, fd, conn_gen_id, now_ms);
+    if (result.idx == 0xFFFFFFFF) return error.PoolFull;
+
+    const slot = &pool.slots[result.idx];
+    slot.line2.conn_id = conn_id;
+
+    // caller sets conn.* fields, then passes here for put
+    try connections.put(conn_id, conn);
+
+    return result.token;
+}
+
+/// 释放连接：liveRemove + gen_id 清零 + pool.release + connections.remove
+pub fn connFree(
+    pool: anytype,
+    connections: anytype,
+    conn_id: u64,
+) void {
+    if (connections.getPtr(conn_id)) |conn| {
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            slotFree(pool, conn.pool_idx);
+        }
+    }
+    _ = connections.remove(conn_id);
+}
+
+/// 清理所有连接（deinit 时调用），对每个 conn 执行 slotFree
+pub fn connFreeAll(
+    pool: anytype,
+    connections: anytype,
+) void {
+    var it = connections.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.pool_idx != 0xFFFFFFFF) {
+            slotFree(pool, entry.value_ptr.pool_idx);
+        }
+    }
+}
+
+/// 用 sticker 替换 dispatchCqes 中的手写 gen_id 检查
+/// 返回 (slot, conn_ptr)，无需调用方再查 hashmap。
+pub fn dispatchToken(
+    pool: anytype,
+    connections: anytype,
+    user_data: u64,
+) ?struct { conn: *anyopaque, slot: *StackSlot } {
+    const slot = getSlotChecked(pool, user_data) orelse return null;
+    const conn = connections.getPtr(slot.line2.conn_id) orelse return null;
+    return .{ .conn = conn, .slot = slot };
+}
