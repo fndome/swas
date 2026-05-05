@@ -54,6 +54,7 @@ const StackSlot = @import("../stack_pool.zig").StackSlot;
 const packUserData = @import("../stack_pool.zig").packUserData;
 const unpackGenId = @import("../stack_pool.zig").unpackGenId;
 const unpackIdx = @import("../stack_pool.zig").unpackIdx;
+const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -573,7 +574,10 @@ pub const AsyncServer = struct {
     }
 
     fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
-        const user_data = conn_id;
+        const user_data = if (conn.pool_idx != 0xFFFFFFFF)
+            packUserData(conn.gen_id, conn.pool_idx)
+        else
+            conn_id;
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
         const sqe = try self.ring.read(user_data, fd, .{
             .buffer_selection = .{ .group_id = READ_BUF_GROUP_ID, .len = BUFFER_SIZE },
@@ -586,7 +590,10 @@ pub const AsyncServer = struct {
             conn.write_start_ms = milliTimestamp(self.io);
             conn.write_retries = 0;
         }
-        const user_data = conn_id;
+        const user_data = if (conn.pool_idx != 0xFFFFFFFF)
+            packUserData(conn.gen_id, conn.pool_idx)
+        else
+            conn_id;
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
 
         const resp_buf = conn.response_buf orelse return;
@@ -670,7 +677,11 @@ pub const AsyncServer = struct {
         }
 
         if (fd > 0) {
-            const close_ud = conn_id | (1 << 61);
+            const close_conn = self.connections.getPtr(conn_id) orelse return;
+            const close_ud = if (close_conn.pool_idx != 0xFFFFFFFF)
+                packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG
+            else
+                conn_id | CLOSE_USER_DATA_FLAG;
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
                 // fd already closed, clean up map entry
@@ -698,10 +709,32 @@ pub const AsyncServer = struct {
         }
         const conn_fd: i32 = @intCast(res);
         const conn_id = self.nextConnId();
+
+        // Acquire StackPool slot for ghost-event defense
+        const pool_idx = self.pool.acquire() orelse {
+            const rc = linux.close(conn_fd);
+            if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
+            self.accept_stalled = true;
+            self.submitAccept() catch |err| logErr("failed to resubmit accept (pool full): {s}", .{@errorName(err)});
+            return;
+        };
+        const gen_id = self.conn_gen_id;
+        self.conn_gen_id +%= 1;
+        {
+            const slot = &self.pool.slots[pool_idx];
+            slot.line1.gen_id = gen_id;
+            slot.line1.fd = conn_fd;
+            slot.line1.state = .reading;
+            slot.line2.last_active_ms = milliTimestamp(self.io);
+            slot.line2.conn_id = conn_id;
+        }
+
         var conn = Connection{
             .id = conn_id,
             .fd = conn_fd,
             .last_active_ms = milliTimestamp(self.io),
+            .pool_idx = pool_idx,
+            .gen_id = gen_id,
         };
 
         if (self.use_fixed_files) {
@@ -1138,9 +1171,21 @@ pub const AsyncServer = struct {
             if (user_data == ACCEPT_USER_DATA) {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
-            } else if ((user_data & (1 << 61)) != 0) {
+            } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
                 // IORING_OP_CLOSE completed — final cleanup through closeConn
-                const close_conn_id = user_data & ~(@as(u64, 1) << 61);
+                const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
+                const close_conn_id: u64 = blk: {
+                    if (raw_ud != 0 and raw_ud & 0x0FFFFFFF00000000 != 0) {
+                        const idx = unpackIdx(raw_ud);
+                        if (idx < constants.MAX_CONNECTIONS) {
+                            const slot = &self.pool.slots[idx];
+                            if (unpackGenId(raw_ud) == slot.line1.gen_id) {
+                                break :blk slot.line2.conn_id;
+                            }
+                        }
+                    }
+                    break :blk raw_ud;
+                };
                 self.closeConn(close_conn_id, 0);
                 self.ring.cqe_seen(&cqes[i]);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
@@ -1148,30 +1193,42 @@ pub const AsyncServer = struct {
                 self.io_registry.dispatch(user_data, res);
             } else {
                 const conn_id = user_data;
-                const conn = self.connections.getPtr(conn_id) orelse {
+                // Try StackPool path first: unpack idx + check gen_id ghost event
+                const idx = unpackIdx(conn_id);
+                const gen = unpackGenId(conn_id);
+                const conn = if (gen != 0 and idx < constants.MAX_CONNECTIONS) blk: {
+                    const slot = &self.pool.slots[idx];
+                    if (slot.line1.gen_id == gen) {
+                        break :blk self.connections.getPtr(conn_id);
+                    }
+                    // Ghost event: old gen_id, slot reused
+                    self.ring.cqe_seen(&cqes[i]);
+                    continue;
+                } else self.connections.getPtr(conn_id);
+                const conn_ptr = conn orelse {
                     self.ring.cqe_seen(&cqes[i]);
                     continue;
                 };
                 defer self.ring.cqe_seen(&cqes[i]);
 
-                if (conn.state == .reading or conn.state == .processing) {
+                if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
                     self.onReadComplete(conn_id, res, user_data, cqe.flags);
-                } else if (conn.state == .writing) {
+                } else if (conn_ptr.state == .writing) {
                     self.onWriteComplete(conn_id, res, user_data);
-                } else if (conn.state == .ws_reading) {
+                } else if (conn_ptr.state == .ws_reading) {
                     self.onWsFrame(conn_id, res, user_data, cqe.flags);
-                } else if (conn.state == .ws_writing) {
+                } else if (conn_ptr.state == .ws_writing) {
                     self.onWsWriteComplete(conn_id, res, user_data);
-                } else if (conn.state == .closing) {
+                } else if (conn_ptr.state == .closing) {
                     // Recycle provided buffer for orphaned read CQE after fd close
-                    if (!conn.read_buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        conn.read_buf_recycled = true;
+                    if (!conn_ptr.read_buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        conn_ptr.read_buf_recycled = true;
                         const bid = @as(u16, @truncate(cqe.flags >> 16));
                         self.buffer_pool.markReplenish(bid);
                     }
-                    self.closeConn(conn_id, conn.fd);
+                    self.closeConn(conn_id, conn_ptr.fd);
                 } else {
-                    self.closeConn(conn_id, conn.fd);
+                    self.closeConn(conn_id, conn_ptr.fd);
                 }
             }
         }

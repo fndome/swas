@@ -41,6 +41,10 @@ pub const Connection = struct {
     /// WebSocket 写等待队列头部指针（单 IO 线程无锁链表）
     ws_write_queue_head: ?*WsWriteQueueNode = null,
     ws_write_queue_tail: ?*WsWriteQueueNode = null,
+    /// StackPool slot index (0xFFFFFFFF = not pooled)
+    pool_idx: u32 = 0xFFFFFFFF,
+    /// Generation ID for ghost-event defense (synced with pool slot)
+    gen_id: u32 = 0,
 };
 
 /// WebSocket 写队列节点（单 IO 线程，无需原子操作）

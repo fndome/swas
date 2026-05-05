@@ -47,12 +47,16 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
 }
 
 pub inline fn packUserData(gen_id: u32, idx: u32) u64 {
-    return (@as(u64, gen_id) << 32) | idx;
+    const g = gen_id & 0x0FFFFFFF; // 28 bits (268M), bits 60-63 reserved
+    return (@as(u64, g) << 32) | (idx & 0xFFFFFFFF);
 }
 
 pub inline fn unpackGenId(ud: u64) u32 {
-    return @intCast(ud >> 32);
+    return @intCast((ud >> 32) & 0x0FFFFFFF);
 }
+
+/// Flag bits reserved above gen_id range
+pub const CLOSE_USER_DATA_FLAG: u64 = 1 << 60; // close SQE marker
 
 pub inline fn unpackIdx(ud: u64) u32 {
     return @intCast(ud & 0xFFFFFFFF);
@@ -87,7 +91,8 @@ const CacheLine2 = extern struct {
     next_live: u32 = 0,
     write_start_ms: i64 = 0,
     is_writing: bool = false,
-    _fill: [31]u8 = [_]u8{0} ** 31,
+    conn_id: u64 = 0,
+    _fill: [16]u8 = [_]u8{0} ** 16,
 };
 
 comptime {
