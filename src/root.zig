@@ -45,6 +45,9 @@ pub const DNS_FD_MAGIC = @import("client/dns.zig").DNS_FD_MAGIC;
 pub const TinyCache = @import("client/tiny_cache.zig").TinyCache;
 pub const FiberShared = @import("shared/fiber_shared.zig").FiberShared;
 pub const RingTrait = @import("shared/fiber_shared.zig").RingTrait;
+pub const StackSlot = @import("stack_pool.zig").StackSlot;
+pub const LargeBufferPool = @import("shared/large_buffer_pool.zig").LargeBufferPool;
+pub const OVERSIZED_THRESHOLD = @import("stack_pool.zig").OVERSIZED_THRESHOLD;
 
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {

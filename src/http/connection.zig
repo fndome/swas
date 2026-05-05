@@ -1,12 +1,14 @@
 const std = @import("std");
 
-const ConnState = enum(u8) {
+pub const ConnState = enum(u8) {
     reading,
     processing,
     writing,
     closing,
     ws_reading,
     ws_writing,
+    /// Worker Pool 正在解析大报文，IO 线程挂起等待
+    waiting_computation,
 };
 
 pub const Connection = struct {
