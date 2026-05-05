@@ -1232,7 +1232,12 @@ pub const AsyncServer = struct {
                     if (slot.line1.gen_id == gen) {
                         break :blk self.connections.getPtr(conn_id);
                     }
-                    // Ghost event: old gen_id, slot reused
+                    // Ghost event: old gen_id, slot reused.
+                    // Recycle provided buffer if present — kernel still owns it.
+                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        const bid = @as(u16, @truncate(cqe.flags >> 16));
+                        self.buffer_pool.markReplenish(bid);
+                    }
                     self.ring.cqe_seen(&cqes[i]);
                     continue;
                 } else self.connections.getPtr(conn_id);
