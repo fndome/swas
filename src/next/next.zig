@@ -445,7 +445,7 @@ pub const Next = struct {
                         struct {
                             fn execSubmitWrapper(
                                 sc: *ChainSubmitCtx(T),
-                                _complete2: *const fn (?*anyopaque, []const u8) void,
+                                _: *const fn (?*anyopaque, []const u8) void,
                             ) void {
                                 defer sc.allocator.destroy(sc.resp);
                                 execSubmit(&sc.user);
