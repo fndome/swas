@@ -92,7 +92,7 @@ pub const ResumeEntry = struct {
     data: []const u8,
 };
 
-const RESUME_QUEUE_CAP = 16;
+const RESUME_QUEUE_CAP = 256;
 pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
 pub threadlocal var resume_head: u8 = 0;
 pub threadlocal var resume_tail: u8 = 0;

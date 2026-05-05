@@ -691,6 +691,8 @@ pub const AsyncServer = struct {
         const slot = &self.pool.slots[conn.pool_idx];
         slot.line3.large_buf_offset += @intCast(res);
         if (slot.line3.large_buf_offset >= slot.line3.large_buf_len) {
+            // Body complete. Set processing state — this implicitly
+            // suspends further reads on this FD until the handler finishes.
             conn.state = .processing;
             const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
             // Body complete — run normal handler path
@@ -975,7 +977,17 @@ pub const AsyncServer = struct {
             }
         }
 
-        const path = getPathFromRequest(read_buf[0..nread]) orelse {
+        const path = if (conn.pool_idx != 0xFFFFFFFF) blk: {
+            const hw2 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+            if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= nread)
+                break :blk read_buf[hw2.path_offset..][0..hw2.path_len];
+            break :blk getPathFromRequest(read_buf[0..nread]) orelse {
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                self.respond(conn, 400, "Bad Request");
+                return;
+            };
+        } else getPathFromRequest(read_buf[0..nread]) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 400, "Bad Request");
