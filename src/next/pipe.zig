@@ -42,8 +42,7 @@ pub const Pipe = struct {
     pub fn feed(self: *Pipe, data: []const u8) !void {
         try self.read_buf.appendSlice(self.allocator, data);
         if (Fiber.isYielded()) {
-            Fiber.pending_resume = true;
-            Fiber.pending_resume_data = data;
+            Fiber.pushResume(0, data);
         }
     }
 

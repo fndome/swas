@@ -1107,11 +1107,13 @@ pub const AsyncServer = struct {
     }
 
     fn drainPendingResumes() void {
-        if (Fiber.pending_resume) {
-            Fiber.pending_resume = false;
-            const data = Fiber.pending_resume_data orelse "";
-            Fiber.pending_resume_data = null;
-            Fiber.resumeYielded(data);
+        while (Fiber.popResume()) |entry| {
+            // Prefetch workspace into L1 before fiber touches it
+            // Fiber resume path typically reads workspace early
+            if (entry.slot_idx != 0) {
+                // Future: prefetch slot workspace by slot_idx
+            }
+            Fiber.resumeYielded(entry.data);
         }
     }
 

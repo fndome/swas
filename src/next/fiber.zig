@@ -84,9 +84,35 @@ pub const Fiber = struct {
         _ = IoFiber.contextSwitch(&.{ .old = &tmp, .new = caller_context.? });
     }
 
-    /// 延迟恢复队列：CQE 处理期间不直接 resume，而是标记后由主循环统一恢复
-pub threadlocal var pending_resume: bool = false;
-pub threadlocal var pending_resume_data: ?[]const u8 = null;
+    /// 延迟恢复队列：CQE 处理期间不直接 resume，而是入队后由主循环统一恢复。
+/// 队列存储 slot_idx 用于 resume 前对 workspace 做 prefetch。
+pub const ResumeEntry = struct {
+    slot_idx: u32,
+    data: []const u8,
+};
+
+const RESUME_QUEUE_CAP = 16;
+pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .data = "" }} ** RESUME_QUEUE_CAP;
+pub threadlocal var resume_head: u8 = 0;
+pub threadlocal var resume_tail: u8 = 0;
+
+pub fn pushResume(slot_idx: u32, data: []const u8) void {
+    const next = resume_tail +% 1;
+    if (next == resume_head) return; // queue full, drop (shouldn't happen in 1C)
+    resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .data = data };
+    resume_tail = next;
+}
+
+pub fn popResume() ?ResumeEntry {
+    if (resume_head == resume_tail) return null;
+    const entry = resume_queue[resume_head];
+    resume_head +%= 1;
+    return entry;
+}
+
+pub fn hasPendingResume() bool {
+    return resume_head != resume_tail;
+}
 
 pub fn resumeYielded(data: []const u8) void {
         const target = yielded_fiber orelse return;
