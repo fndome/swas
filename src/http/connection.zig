@@ -30,6 +30,20 @@ pub const Connection = struct {
     write_retries: u8 = 0,
     /// iovec 数组存 Connection 里，保证 writev SQE 处理期间内存不失效
     write_iovs: [2]std.posix.iovec_const = undefined,
-    /// 防止 io_uring 异步竞态导致 buffer 二次回收
-    buf_recycled: bool = false,
+    /// 读 buffer 是否已归还 io_uring provided buffer pool（防止二次回收）
+    read_buf_recycled: bool = false,
+    /// 写 buffer (write_body + response_buf) 是否已在 close 路径释放（防止 double-free）
+    write_bufs_freed: bool = false,
+    /// WebSocket 写锁：防止多个 Fiber 同时串扰帧数据
+    is_writing: bool = false,
+    /// WebSocket 写等待队列头部指针（单 IO 线程无锁链表）
+    ws_write_queue_head: ?*WsWriteQueueNode = null,
+    ws_write_queue_tail: ?*WsWriteQueueNode = null,
+};
+
+/// WebSocket 写队列节点（单 IO 线程，无需原子操作）
+pub const WsWriteQueueNode = struct {
+    opcode: @import("../ws/types.zig").Opcode,
+    payload: []u8,
+    next: ?*WsWriteQueueNode,
 };

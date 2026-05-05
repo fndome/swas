@@ -1,6 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// 为了榨干 1C 核心的 L1/L2 Cache，建议你的 HttpStack 采用以下布局：
+/// 字节偏移            字段内容                        理由
+/// 0 - 31      fd, gen_id, state, write_offset         IO 热区：CQE 回调最先访问，需在同一 Cache Line
+/// 32 - 63     retry_count, buffer_id, is_closed       状态位：控制重试和清理逻辑
+/// 64 - 127    user_id, last_active_ms                 业务区：仅在逻辑解析时访问
+///
 /// 单线程固定大小对象池。O(1) acquire/release，无锁，缓存友好。
 ///
 /// acquire: freelist[--top] → 返回索引

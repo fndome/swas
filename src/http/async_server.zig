@@ -26,6 +26,7 @@ const Next = @import("../next/next.zig").Next;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
 const Connection = @import("connection.zig").Connection;
+const WsWriteQueueNode = @import("connection.zig").WsWriteQueueNode;
 const Context = @import("context.zig").Context;
 const Middleware = @import("types.zig").Middleware;
 const Handler = @import("types.zig").Handler;
@@ -110,6 +111,10 @@ pub const AsyncServer = struct {
 
     should_stop: bool = false,
     buffer_pool: BufferPool,
+
+    /// Set when submitAccept fails; cleared on successful submission.
+    /// Used by the event loop to detect and recover broken accept chains.
+    accept_stalled: bool = false,
 
     use_fixed_files: bool = false,
     fixed_file_freelist: std.ArrayList(u16),
@@ -545,6 +550,7 @@ pub const AsyncServer = struct {
         var addr: linux.sockaddr = undefined;
         var addrlen: u32 = @sizeOf(linux.sockaddr);
         _ = try self.ring.accept(ACCEPT_USER_DATA, @intCast(self.listen_fd), &addr, &addrlen, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+        self.accept_stalled = false;
     }
 
     fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
@@ -566,22 +572,26 @@ pub const AsyncServer = struct {
 
         const resp_buf = conn.response_buf orelse return;
 
+        // Bounds-safe header end: clamp to actual buffer length to prevent
+        // index-out-of-bounds panic when write_offset drifts past the buffer.
+        const header_len = @min(conn.write_headers_len, resp_buf.len);
+
         if (conn.write_body) |body| {
-            const total = conn.write_headers_len + body.len;
+            const total = header_len + body.len;
             if (conn.write_offset >= total) return;
 
             var count: usize = 0;
 
-            if (conn.write_offset < conn.write_headers_len) {
+            if (conn.write_offset < header_len) {
                 conn.write_iovs[count] = .{
                     .base = resp_buf.ptr + conn.write_offset,
-                    .len = conn.write_headers_len - conn.write_offset,
+                    .len = header_len - conn.write_offset,
                 };
                 count += 1;
             }
 
-            const body_start = if (conn.write_offset > conn.write_headers_len)
-                conn.write_offset - conn.write_headers_len
+            const body_start = if (conn.write_offset > header_len)
+                conn.write_offset - header_len
             else
                 0;
             if (body_start < body.len) {
@@ -595,8 +605,8 @@ pub const AsyncServer = struct {
             const sqe = try self.ring.writev(user_data, fd, conn.write_iovs[0..count], 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         } else {
-            if (conn.write_offset >= conn.write_headers_len) return;
-            const to_send = resp_buf[conn.write_offset..conn.write_headers_len];
+            if (conn.write_offset >= header_len) return;
+            const to_send = resp_buf[conn.write_offset..header_len];
             const sqe = try self.ring.write(user_data, fd, to_send, 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         }
@@ -608,16 +618,23 @@ pub const AsyncServer = struct {
         if (self.connections.getPtr(conn_id)) |conn| {
             if (conn.ws_token) |t| { self.allocator.free(t); conn.ws_token = null; }
 
-            if (conn.state == .closing) {
-                // Second pass: close CQE arrived, safe to free write buffers
-                if (!conn.buf_recycled) {
-                    conn.buf_recycled = true;
-                    if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
-                    if (conn.response_buf) |buf| {
-                        self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                        conn.response_buf = null;
-                    }
+            // Drain any queued WebSocket frames
+            self.drainWsWriteQueue(conn);
+
+            // Always free write buffers — do NOT gate on read_buf_recycled.
+            // read_buf_recycled only protects the read (provided) buffer path.
+            if (!conn.write_bufs_freed) {
+                conn.write_bufs_freed = true;
+                if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
+                if (conn.response_buf) |buf| {
+                    self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                    conn.response_buf = null;
                 }
+            }
+
+            if (conn.state == .closing or fd == 0) {
+                // Second pass (close CQE arrived) or fd==0 (already closed elsewhere):
+                // safe to remove from map.
                 _ = self.connections.remove(conn_id);
                 return;
             }
@@ -637,6 +654,11 @@ pub const AsyncServer = struct {
             const close_ud = conn_id | (1 << 61);
             const sqe = self.ring.nop(close_ud) catch {
                 _ = linux.close(fd);
+                // fd already closed, clean up map entry
+                if (self.connections.getPtr(conn_id)) |c| {
+                    c.state = .closing;
+                }
+                self.closeConn(conn_id, 0);
                 return;
             };
             sqe.opcode = @enumFromInt(19); // IORING_OP_CLOSE
@@ -648,7 +670,11 @@ pub const AsyncServer = struct {
         _ = user_data;
         if (res < 0) {
             logErr("accept failed: {}", .{res});
-            self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
+            self.accept_stalled = true;
+            self.submitAccept() catch |err| {
+                logErr("failed to resubmit accept: {s}", .{@errorName(err)});
+                return;
+            };
             return;
         }
         const conn_fd: i32 = @intCast(res);
@@ -663,7 +689,8 @@ pub const AsyncServer = struct {
             const idx = self.allocFixedIndex() catch {
                 const rc = linux.close(conn_fd);
                 if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-                self.submitAccept() catch {};
+                self.accept_stalled = true;
+                self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
                 return;
             };
             if (self.ring.register_files_update(idx, &[_]linux.fd_t{conn_fd})) {
@@ -672,7 +699,8 @@ pub const AsyncServer = struct {
                 self.freeFixedIndex(idx);
                 const rc = linux.close(conn_fd);
                 if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-                self.submitAccept() catch {};
+                self.accept_stalled = true;
+                self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
                 return;
             }
         }
@@ -685,20 +713,30 @@ pub const AsyncServer = struct {
             }
             const rc = linux.close(conn_fd);
             if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
+            self.accept_stalled = true;
             self.submitAccept() catch |err| logErr("failed to resubmit accept after put error: {s}", .{@errorName(err)});
             return;
         };
         const conn_ptr = self.connections.getPtr(conn_id) orelse {
+            // Defensive: conn_fd was accepted but the map entry disappeared.
+            // Close it immediately to prevent a zombie FD leak.
+            const rc = linux.close(conn_fd);
+            if (rc != 0) logErr("close orphan conn_fd={d} failed: {d}", .{ conn_fd, rc });
+            self.accept_stalled = true;
             self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
             return;
         };
         self.submitRead(conn_id, conn_ptr) catch |err| {
             logErr("submitRead failed for fd {}: {s}", .{ conn_fd, @errorName(err) });
             self.closeConn(conn_id, conn_fd);
+            self.accept_stalled = true;
             self.submitAccept() catch |err2| logErr("failed to resubmit accept after read error: {s}", .{@errorName(err2)});
             return;
         };
-        self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
+        self.submitAccept() catch |err| {
+            self.accept_stalled = true;
+            logErr("failed to resubmit accept: {s}", .{@errorName(err)});
+        };
     }
 
     fn onReadComplete(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
@@ -1008,6 +1046,15 @@ pub const AsyncServer = struct {
         while (!self.should_stop) {
             try self.buffer_pool.flushReplenish(&self.ring);
 
+            // Recover broken accept chain: if submitAccept previously failed,
+            // retry now that the ring may have drained.
+            if (self.accept_stalled) {
+                self.submitAccept() catch |err| {
+                    logErr("accept chain recovery failed: {s}", .{@errorName(err)});
+                    // accept_stalled stays true; retry next iteration
+                };
+            }
+
             // 提交待处理的 SQE（可能来自上轮处理的 submitRead/submitWrite）
             _ = self.ring.submit() catch |err| {
                 logErr("submit failed: {s}", .{@errorName(err)});
@@ -1068,9 +1115,9 @@ pub const AsyncServer = struct {
                 self.ring.cqe_seen(&cqes[i]);
                 self.onAcceptComplete(res, user_data);
             } else if ((user_data & (1 << 61)) != 0) {
-                // IORING_OP_CLOSE completed — final cleanup
+                // IORING_OP_CLOSE completed — final cleanup through closeConn
                 const close_conn_id = user_data & ~(@as(u64, 1) << 61);
-                _ = self.connections.remove(close_conn_id);
+                self.closeConn(close_conn_id, 0);
                 self.ring.cqe_seen(&cqes[i]);
             } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
                 defer self.ring.cqe_seen(&cqes[i]);
@@ -1093,8 +1140,8 @@ pub const AsyncServer = struct {
                     self.onWsWriteComplete(conn_id, res, user_data);
                 } else if (conn.state == .closing) {
                     // Recycle provided buffer for orphaned read CQE after fd close
-                    if (!conn.buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        conn.buf_recycled = true;
+                    if (!conn.read_buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                        conn.read_buf_recycled = true;
                         const bid = @as(u16, @truncate(cqe.flags >> 16));
                         self.buffer_pool.markReplenish(bid);
                     }
@@ -1553,6 +1600,7 @@ fn executeNext(self: *Self, req: *const Item) void {
                 };
 
                 var ws_fiber = Fiber.init(self.shared_fiber_stack);
+                self.shared_fiber_active = true;
                 ws_fiber.exec(.{
                     .userCtx = t,
                     .complete = wsTaskComplete,
@@ -1586,10 +1634,8 @@ fn executeNext(self: *Self, req: *const Item) void {
             }
             conn.write_offset = 0;
             conn.write_headers_len = 0;
-            conn.state = .ws_reading;
-            self.submitRead(conn_id, conn) catch {
-                self.closeConn(conn_id, conn.fd);
-            };
+            // Flush any queued WebSocket frames before resuming reads
+            self.flushWsWriteQueue(conn_id, conn);
         } else {
             conn.write_retries += 1;
             if (conn.write_retries > maxWriteRetries(conn.write_headers_len)) {
@@ -1610,31 +1656,102 @@ fn executeNext(self: *Self, req: *const Item) void {
 
     pub fn sendWsFrame(self: *Self, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
         const conn = self.connections.getPtr(conn_id) orelse return;
-        if (conn.state != .ws_reading) return error.WriteBusy;
+
+        // If a write is already in-flight, queue this frame for later delivery.
+        if (conn.is_writing) {
+            const dup = self.allocator.dupe(u8, payload) catch {
+                return error.OutOfMemory;
+            };
+            const node = self.allocator.create(WsWriteQueueNode) catch {
+                self.allocator.free(dup);
+                return error.OutOfMemory;
+            };
+            node.* = .{ .opcode = opcode, .payload = dup, .next = null };
+            if (conn.ws_write_queue_tail) |tail| {
+                tail.next = node;
+            } else {
+                conn.ws_write_queue_head = node;
+            }
+            conn.ws_write_queue_tail = node;
+            return;
+        }
+
+        // No write in progress — send immediately.
+        conn.is_writing = true;
+        self.submitWsWrite(conn_id, conn, opcode, payload) catch |err| {
+            conn.is_writing = false;
+            return err;
+        };
+    }
+
+    fn submitWsWrite(self: *Self, conn_id: u64, conn: *Connection, opcode: Opcode, payload: []const u8) !void {
         const total = ws_frame.frameSize(payload.len);
         if (!self.ensureWriteBuf(conn, total)) {
-            self.closeConn(conn_id, conn.fd);
-            return;
+            return error.OutOfMemory;
         }
         const wbuf = conn.response_buf.?;
         if (total > wbuf.len) {
-            self.closeConn(conn_id, conn.fd);
-            return;
+            return error.BufferTooSmall;
         }
         _ = ws_frame.writeFrame(wbuf, .{
             .opcode = opcode,
             .fin = true,
             .payload = payload,
         }) catch {
-            self.closeConn(conn_id, conn.fd);
-            return;
+            return error.FrameWriteFailed;
         };
         conn.write_headers_len = total;
         conn.write_offset = 0;
         conn.state = .ws_writing;
-        self.submitWrite(conn_id, conn) catch {
-            self.closeConn(conn_id, conn.fd);
-        };
+        try self.submitWrite(conn_id, conn);
+    }
+
+    fn flushWsWriteQueue(self: *Self, conn_id: u64, conn: *Connection) void {
+        if (conn.ws_write_queue_head) |node| {
+            // Dequeue the head node
+            conn.ws_write_queue_head = node.next;
+            if (conn.ws_write_queue_head == null) {
+                conn.ws_write_queue_tail = null;
+            }
+            const opcode = node.opcode;
+            const payload = node.payload;
+            self.allocator.destroy(node);
+
+            self.submitWsWrite(conn_id, conn, opcode, payload) catch |err| {
+                logErr("flushWsWriteQueue: submitWsWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
+                self.allocator.free(payload);
+                conn.is_writing = false;
+                self.closeConn(conn_id, conn.fd);
+                return;
+            };
+            // Don't free payload yet — it's referenced by the write SQE.
+            // WsWriteQueueNode.payload is dup'd in sendWsFrame, freed after write completes.
+            // NOTE: payload ownership stays with the queue node's memory until write completes.
+            // We keep the payload alive by having it referenced in response_buf (frame write copies it).
+            // After write completes, the queue node's payload dup is freed in closeConn or here.
+            self.allocator.free(payload);
+        } else {
+            conn.is_writing = false;
+            conn.state = .ws_reading;
+            self.submitRead(conn_id, conn) catch |err| {
+                logErr("flushWsWriteQueue: submitRead failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
+                self.closeConn(conn_id, conn.fd);
+            };
+        }
+    }
+
+    fn drainWsWriteQueue(self: *Self, conn: *Connection) void {
+        // Free all queued WebSocket frames on connection close
+        var node = conn.ws_write_queue_head;
+        while (node) |n| {
+            const next = n.next;
+            self.allocator.free(n.payload);
+            self.allocator.destroy(n);
+            node = next;
+        }
+        conn.ws_write_queue_head = null;
+        conn.ws_write_queue_tail = null;
+        conn.is_writing = false;
     }
 };
 
@@ -1663,8 +1780,8 @@ fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     t.server.shared_fiber_active = false;
     t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.buf_recycled) {
-            conn.buf_recycled = true;
+        if (!conn.read_buf_recycled) {
+            conn.read_buf_recycled = true;
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
@@ -1858,8 +1975,8 @@ fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     std.debug.assert(t.tag == 0x48540001);
     t.server.shared_fiber_active = false;
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.buf_recycled) {
-            conn.buf_recycled = true;
+        if (!conn.read_buf_recycled) {
+            conn.read_buf_recycled = true;
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
