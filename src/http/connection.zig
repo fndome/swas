@@ -11,6 +11,8 @@ pub const ConnState = enum(u8) {
     ws_writing,
     /// Worker Pool 正在解析大报文，IO 线程挂起等待
     waiting_computation,
+    /// ChunkStream 流式搬运：IO 线程 copy → Worker 解析
+    streaming,
 };
 
 pub const Connection = struct {

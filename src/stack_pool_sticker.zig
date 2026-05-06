@@ -184,6 +184,24 @@ pub fn completeCompute(slot: *StackSlot, result_code: i32) void {
     slot.line5.ws.compute.result_code = result_code;
 }
 
+/// ── ChunkStream 指针存取 ──────────────────────────────
+/// stream_ptr 存于 slot.line3，指向堆分配的 StreamHandle。
+/// IO 线程读完数据 → feed → 攒够 → dispatch → Worker 线程解析。
+
+pub fn getStream(slot: *StackSlot) ?*anyopaque {
+    const ptr = @as(usize, @intCast(slot.line3.stream_ptr));
+    if (ptr == 0) return null;
+    return @ptrFromInt(ptr);
+}
+
+pub fn setStream(slot: *StackSlot, stream: *anyopaque) void {
+    slot.line3.stream_ptr = @intCast(@intFromPtr(stream));
+}
+
+pub fn clearStream(slot: *StackSlot) void {
+    slot.line3.stream_ptr = 0;
+}
+
 /// ── 协议视图切换 ──────────────────────────────────────
 
 /// HTTP → WebSocket 升级：清空 HTTP 解析残留，初始化 WS 视图

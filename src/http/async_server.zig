@@ -56,6 +56,7 @@ const unpackGenId = @import("../stack_pool.zig").unpackGenId;
 const unpackIdx = @import("../stack_pool.zig").unpackIdx;
 const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
 const sticker = @import("../stack_pool_sticker.zig");
+const StreamHandle = @import("../next/chunk_stream.zig").StreamHandle;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const LargeBufferPool = @import("../shared/large_buffer_pool.zig").LargeBufferPool;
 
@@ -676,9 +677,42 @@ pub const AsyncServer = struct {
 
     fn onBodyChunk(self: *Self, conn_id: u64, res: i32) void {
         const conn = self.getConn(conn_id) orelse return;
+        const slot = if (conn.pool_idx != 0xFFFFFFFF) &self.pool.slots[conn.pool_idx] else {
+            if (res <= 0) self.closeConn(conn_id, conn.fd);
+            return;
+        };
+
+        // ── ChunkStream 搬运路径 ─────────────────────────
+        if (sticker.getStream(slot)) |stream_ptr| {
+            const stream: *StreamHandle = @ptrCast(@alignCast(stream_ptr));
+            if (res <= 0) {
+                _ = stream.finish();
+                sticker.clearStream(slot);
+                if (slot.line3.large_buf_ptr != 0) {
+                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+                    self.large_pool.release(buf);
+                    slot.line3.large_buf_ptr = 0;
+                }
+                self.closeConn(conn_id, conn.fd);
+                return;
+            }
+            const n: u32 = @intCast(res);
+            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+            const data = buf[slot.line3.large_buf_offset..][0..@as(usize, @intCast(n))];
+            _ = stream.feed(data);
+            slot.line3.large_buf_offset += n;
+            self.submitBodyRead(conn, buf, slot) catch {
+                self.large_pool.release(buf);
+                slot.line3.large_buf_ptr = 0;
+                sticker.clearStream(slot);
+                self.closeConn(conn_id, conn.fd);
+            };
+            return;
+        }
+
+        // ── 原有 body 累积逻辑 ─────────────────────────
         if (res <= 0) {
             if (conn.pool_idx != 0xFFFFFFFF) {
-                const slot = &self.pool.slots[conn.pool_idx];
                 if (slot.line3.large_buf_ptr != 0) {
                     const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
                     self.large_pool.release(buf);
@@ -688,7 +722,6 @@ pub const AsyncServer = struct {
             self.closeConn(conn_id, conn.fd);
             return;
         }
-        const slot = &self.pool.slots[conn.pool_idx];
         slot.line3.large_buf_offset += @intCast(res);
         if (slot.line3.large_buf_offset >= slot.line3.large_buf_len) {
             // Body 收齐 → 运行 handler

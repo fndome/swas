@@ -20,6 +20,7 @@ pub const QueueItem = @import("next/queue.zig").Item;
 pub const Next = @import("next/next.zig").Next;
 /// Next.chainGoSubmit: execGo(fiber, IO 线程) 异步集齐数据 → complete 触发 → execSubmit(worker 池) → respond 响应
 pub const chainGoSubmit = @import("next/next.zig").Next.chainGoSubmit;
+pub const StreamHandle = @import("next/chunk_stream.zig").StreamHandle;
 
 /// 高级范式：用户自定义 I/O 请求，push 到 SubmitQueue，
 /// IO 线程执行 execute，完成后调 on_complete。

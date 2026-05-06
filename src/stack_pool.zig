@@ -145,8 +145,10 @@ const CacheLine3 = extern struct {
     large_buf_ptr: u64 = 0,
     large_buf_len: u32 = 0,
     large_buf_offset: u32 = 0,
+    /// ChunkStream 堆指针：IO 线程 feed → Worker dispatch
+    stream_ptr: u64 align(8) = 0,
     /// 二级计算区：Worker Pool 移交时的预解析元数据 (JSON offset/length 等)
-    worker_scratch: [24]u8 = [_]u8{0} ** 24,
+    worker_scratch: [16]u8 = [_]u8{0} ** 16,
 };
 
 comptime {
