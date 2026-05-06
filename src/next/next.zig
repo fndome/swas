@@ -53,8 +53,16 @@ const WorkerPool = struct {
     workers: []std.Thread,
     head: ?*PoolTask,
     tail: ?*PoolTask,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     stop: bool,
+
+    fn lockMutex(m: *std.Io.Mutex) void {
+        while (!m.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn unlockMutex(m: *std.Io.Mutex) void {
+        m.state.store(.unlocked, .release);
+    }
 
     fn init(allocator: Allocator, count: u8) !WorkerPool {
         const workers = try allocator.alloc(std.Thread, count);
@@ -63,7 +71,7 @@ const WorkerPool = struct {
             .workers = workers,
             .head = null,
             .tail = null,
-            .mutex = .{},
+            .mutex = .init,
             .stop = false,
         };
         for (workers, 0..) |*w, i| {
@@ -78,9 +86,9 @@ const WorkerPool = struct {
     }
 
     fn deinit(self: *WorkerPool) void {
-        self.mutex.lock();
+        WorkerPool.lockMutex(&self.mutex);
         @atomicStore(bool, &self.stop, true, .release);
-        self.mutex.unlock();
+        WorkerPool.unlockMutex(&self.mutex);
         while (self.pop()) |task| {
             self.allocator.destroy(task);
         }
@@ -89,25 +97,25 @@ const WorkerPool = struct {
     }
 
     fn submit(self: *WorkerPool, task: *PoolTask) void {
-        self.mutex.lock();
+        WorkerPool.lockMutex(&self.mutex);
         if (self.tail) |t| {
             t.next = task;
         } else {
             self.head = task;
         }
         self.tail = task;
-        self.mutex.unlock();
+        WorkerPool.unlockMutex(&self.mutex);
     }
 
     fn pop(self: *WorkerPool) ?*PoolTask {
-        self.mutex.lock();
+        WorkerPool.lockMutex(&self.mutex);
         const task = self.head orelse {
-            self.mutex.unlock();
+            WorkerPool.unlockMutex(&self.mutex);
             return null;
         };
         self.head = task.next;
         if (self.head == null) self.tail = null;
-        self.mutex.unlock();
+        WorkerPool.unlockMutex(&self.mutex);
         task.next = null;
         return task;
     }
@@ -429,8 +437,8 @@ pub const Next = struct {
         comptime execSubmit: fn (*T) void,
         comptime respond: fn (*T, *DeferredResponse) void,
     ) !void {
-        const s = http_ctx.server orelse return;
-        const server: *AsyncServer = @ptrCast(@alignCast(s));
+        const svr = http_ctx.server orelse return;
+        const server: *AsyncServer = @ptrCast(@alignCast(svr));
         const alloc = http_ctx.allocator;
 
         const resp = try alloc.create(DeferredResponse);
