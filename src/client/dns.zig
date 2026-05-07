@@ -102,6 +102,8 @@ pub const CaresDns = struct {
             self.registered_fds[registered_count] = @intCast(fd);
             registered_count += 1;
         }
+        // Ensure SQEs are visible to kernel before caller yields or returns
+        _ = self.rs.ring.submit() catch {};
     }
 
     fn removeFds(self: *CaresDns) void {

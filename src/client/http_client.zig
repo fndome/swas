@@ -91,7 +91,7 @@ pub const HttpClient = struct {
     next_gen: u64,
     stop: bool,
 
-    const REQUEST_TIMEOUT_US: usize = 5_000_000; // 5s
+    const REQUEST_TIMEOUT_MS: i64 = 5000; // 5s
 
     pub fn init(allocator: Allocator, ring_b: *RingB) !*HttpClient {
         const self = try allocator.create(HttpClient);
@@ -208,14 +208,12 @@ pub const HttpClient = struct {
 
         try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
         {
-            var waited: usize = 0;
-            const max_wait = REQUEST_TIMEOUT_US;
+            const deadline_ms = nowMs() + REQUEST_TIMEOUT_MS;
             while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
             while (!ctx.done) {
                 ctx.mutex.state.store(.unlocked, .release);
                 std.Thread.yield() catch {};
-                waited += 1; // ~1µs per iteration
-                if (waited > max_wait or @atomicLoad(bool, &self.stop, .acquire)) {
+                if (nowMs() >= deadline_ms or @atomicLoad(bool, &self.stop, .acquire)) {
                     // cancel → release 槽位: gen 自增, 旧 fiber notify 失效
                     @atomicStore(bool, &ctx.cancelled, true, .release);
                     @atomicStore(bool, &ctx.done, true, .release);

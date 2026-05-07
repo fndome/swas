@@ -2367,11 +2367,9 @@ fn executeNext(self: *Self, req: *const Item) void {
                 self.closeConn(conn_id, conn.fd);
                 return;
             };
-            // Don't free payload yet — it's referenced by the write SQE.
-            // WsWriteQueueNode.payload is dup'd in sendWsFrame, freed after write completes.
-            // NOTE: payload ownership stays with the queue node's memory until write completes.
-            // We keep the payload alive by having it referenced in response_buf (frame write copies it).
-            // After write completes, the queue node's payload dup is freed in closeConn or here.
+            // submitWsWrite copies payload into response_buf (ws_frame.writeFrame).
+            // The original queue node's dup is safe to free here — the write SQE
+            // references the response_buf copy, not this payload pointer.
             self.allocator.free(payload);
         } else {
             conn.is_writing = false;

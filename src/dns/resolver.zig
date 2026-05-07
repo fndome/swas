@@ -166,6 +166,7 @@ pub const DnsResolver = struct {
         sqe.len = self.recv_buf.len;
         sqe.off = 0;
         self.recv_outstanding = true;
+        _ = self.rs.ring.submit() catch {};
     }
 
     pub fn handleCqe(self: *DnsResolver, res: i32) void {

@@ -122,14 +122,13 @@ comptime {
 const CacheLine2 = extern struct {
     user_id: u64 = 0,
     last_active_ms: i64 = 0,
-    prev_live: u32 = 0,
-    next_live: u32 = 0,
     write_start_ms: i64 = 0,
     is_writing: bool = false,
     conn_id: u64 = 0,
     active_list_pos: u32 = 0xFFFFFFFF,
     /// 连接创建时间戳 (ms)，用于绝对 TTL 硬超时
     birth_ms: i64 = 0,
+    _pad: [4]u8 = [_]u8{0} ** 4,
 };
 
 comptime {
@@ -243,11 +242,11 @@ comptime {
     }
 }
 
-/// ── 连接槽位 (320 bytes, <400 budget) ──────────────────
+/// ── 连接槽位 (384 bytes, <400 budget) ──────────────────
 ///
-/// 四组子结构各占独立缓存行，IO 循环最热路径只碰 line1。
+/// 五组子结构各占独立缓存行，IO 循环最热路径只碰 line1。
 ///   line1 ( 64B): fd, gen_id, state, write_offset — CQE dispatch
-///   line2 ( 64B): user_id, last_active_ms, prev/next_live — TTL scan
+///   line2 ( 64B): user_id, last_active_ms, conn_id, birth_ms — TTL scan
 ///   line3 ( 64B): 异步锚点 + 大报文 — Worker Pool / LargeBufferPool
 ///   line4 (128B): response_buf, write_iovs, WS queue — 写路径低频
 pub const StackSlot = extern struct {
