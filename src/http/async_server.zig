@@ -2690,7 +2690,10 @@ fn httpTaskCleanup(t: *HttpTaskCtx) void {
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
-        if (conn.state == .streaming) {
+        const has_stream = conn.pool_idx != 0xFFFFFFFF and
+            sticker.getStream(&t.server.pool.slots[conn.pool_idx]) != null;
+        if (conn.state == .streaming or has_stream) {
+            if (has_stream) conn.state = .streaming;
             t.server.submitRead(t.conn_id, conn) catch {
                 t.server.closeConn(t.conn_id, conn.fd);
             };
@@ -2709,8 +2712,10 @@ fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
-        // Scheme D: handler set streaming → start Sticker read loop
-        if (conn.state == .streaming) {
+        const has_stream = conn.pool_idx != 0xFFFFFFFF and
+            sticker.getStream(&t.server.pool.slots[conn.pool_idx]) != null;
+        if (conn.state == .streaming or has_stream) {
+            if (has_stream) conn.state = .streaming;
             t.server.submitRead(t.conn_id, conn) catch {
                 t.server.closeConn(t.conn_id, conn.fd);
             };
