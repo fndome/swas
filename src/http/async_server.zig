@@ -1207,6 +1207,15 @@ pub const AsyncServer = struct {
             conn.read_len = 0;
             self.submitRead(conn_id, conn) catch |err| {
                 logErr("submitRead failed during header reassembly: {s}", .{@errorName(err)});
+                // Recycle the pending_bid before closing — closeConn doesn't know about it
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+                    if (hw.pending_bid != 0) {
+                        self.buffer_pool.markReplenish(hw.pending_bid);
+                        hw.pending_bid = 0;
+                        hw.pending_len = 0;
+                    }
+                }
                 self.closeConn(conn_id, conn.fd);
             };
             return;
@@ -1816,6 +1825,13 @@ fn executeNext(self: *Self, req: *const Item) void {
     fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
         if (conn.response_buf) |existing| {
             if (existing.len >= min_size) return true;
+            // Guard: if writev is in-flight, do NOT free the buffer the kernel is reading
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                if (@atomicLoad(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, .acquire) != 0) {
+                    logErr("ensureWriteBuf: refusing to replace in-flight write buffer for fd={d}", .{conn.fd});
+                    return false;
+                }
+            }
             self.buffer_pool.freeTieredWriteBuf(existing, conn.response_buf_tier);
             conn.response_buf = null;
         }
@@ -2215,13 +2231,24 @@ fn executeNext(self: *Self, req: *const Item) void {
                     .payload_buf = payload_full,
                 };
 
-                var ws_fiber = Fiber.init(self.shared_fiber_stack);
-                self.shared_fiber_active = true;
-                ws_fiber.exec(.{
-                    .userCtx = t,
-                    .complete = wsTaskComplete,
-                    .execFn = wsTaskExec,
-                });
+                if (self.shared_fiber_active) {
+                    // Shared stack occupied — dispatch WS handler via per-task stack
+                    if (self.next) |*n| {
+                        n.push(WsTaskCtx, t.*, wsTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                    } else {
+                        self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
+                        self.ws_ctx_pool.destroy(t);
+                        handler(conn_id, &frame, self.ws_server.ctx);
+                    }
+                } else {
+                    var ws_fiber = Fiber.init(self.shared_fiber_stack);
+                    self.shared_fiber_active = true;
+                    ws_fiber.exec(.{
+                        .userCtx = t,
+                        .complete = wsTaskComplete,
+                        .execFn = wsTaskExec,
+                    });
+                }
 
                 if (conn.state != .ws_writing) {
                     conn.state = .ws_reading;
@@ -2390,11 +2417,13 @@ fn wsTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const
     complete(t, "");
 }
 
-fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
-    const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
+fn wsTaskExecWrapperWithOwnership(t: *WsTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
+    wsTaskExec(t, complete);
+    wsTaskCleanup(t);
+}
+
+fn wsTaskCleanup(t: *WsTaskCtx) void {
     std.debug.assert(t.tag == 0x57530001);
-    t.server.shared_fiber_active = false;
-    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
         if (!conn.read_buf_recycled) {
             conn.read_buf_recycled = true;
@@ -2402,6 +2431,22 @@ fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
         }
         conn.read_len = 0;
     }
+    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
+    t.server.ws_ctx_pool.destroy(t);
+}
+
+fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
+    const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
+    std.debug.assert(t.tag == 0x57530001);
+    t.server.shared_fiber_active = false;
+    if (t.server.connections.getPtr(t.conn_id)) |conn| {
+        if (!conn.read_buf_recycled) {
+            conn.read_buf_recycled = true;
+            t.server.buffer_pool.markReplenish(t.read_bid);
+        }
+        conn.read_len = 0;
+    }
+    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
     t.server.ws_ctx_pool.destroy(t);
 }
 
@@ -2581,10 +2626,31 @@ fn maxWriteRetries(total: usize) u8 {
 }
 
 /// Wrapper for Next.push dispatching: takes ownership of HttpTaskCtx,
-/// runs httpTaskExec and calls httpTaskComplete when done.
+/// runs httpTaskExec and cleans up resources when done.
+/// NOTE: does NOT clear shared_fiber_active — the original fiber
+/// that yielded still holds the shared stack.
 fn httpTaskExecWrapperWithOwnership(t: *HttpTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
     httpTaskExec(t, complete);
-    httpTaskComplete(t, "");
+    httpTaskCleanup(t);
+}
+
+/// Resource cleanup for per-task-stack HTTP handlers. Does NOT touch
+/// shared_fiber_active — only the shared-stack completion path may clear it.
+fn httpTaskCleanup(t: *HttpTaskCtx) void {
+    std.debug.assert(t.tag == 0x48540001);
+    if (t.server.connections.getPtr(t.conn_id)) |conn| {
+        if (!conn.read_buf_recycled) {
+            conn.read_buf_recycled = true;
+            t.server.buffer_pool.markReplenish(t.read_bid);
+        }
+        conn.read_len = 0;
+        if (conn.state == .streaming) {
+            t.server.submitRead(t.conn_id, conn) catch {
+                t.server.closeConn(t.conn_id, conn.fd);
+            };
+        }
+    }
+    t.server.http_ctx_pool.destroy(t);
 }
 
 fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
@@ -2597,7 +2663,7 @@ fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
-        // Scheme D: handler 设置了 streaming → 启动 Sticker 读循环
+        // Scheme D: handler set streaming → start Sticker read loop
         if (conn.state == .streaming) {
             t.server.submitRead(t.conn_id, conn) catch {
                 t.server.closeConn(t.conn_id, conn.fd);

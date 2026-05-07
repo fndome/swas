@@ -15,6 +15,8 @@ const Pipe = @import("../next/pipe.zig").Pipe;
 const MAX_CONNS_PER_HOST: usize = 12;
 
 const PoolEntry = struct {
+    host: []u8,
+    port: u16,
     stream: *RingSharedClient,
     pipe: Pipe,
     last_used_ms: i64,
@@ -40,19 +42,20 @@ pub const TinyCache = struct {
 
     pub fn deinit(self: *TinyCache) void {
         for (self.entries.items) |*e| {
+            self.allocator.free(e.host);
             e.stream.deinit();
             e.pipe.deinit();
         }
         self.entries.deinit(self.allocator);
     }
 
-    /// 借出一条空闲连接。返回 (stream, pipe) 或 null。
+    /// 借出一条空闲连接到 host:port。返回 (stream, pipe) 或 null。
     pub fn acquire(self: *TinyCache, host: []const u8, port: u16, now_ms: i64) ?struct { stream: *RingSharedClient, pipe: *Pipe } {
-        _ = host;
-        _ = port;
         if (!self.enabled()) return null;
         for (self.entries.items) |*e| {
             if (e.borrowed) continue;
+            if (e.port != port) continue;
+            if (!std.mem.eql(u8, e.host, host)) continue;
             if (now_ms - e.last_used_ms >= self.ttl_ms) continue;
             e.pipe.reset();
             e.last_used_ms = now_ms;
@@ -73,10 +76,8 @@ pub const TinyCache = struct {
         }
     }
 
-    /// 存入新连接到池。池满时返回 error.PoolFull, 调用方应回 503。
+    /// 存入新连接到池。池满时返回 error.PoolFull。
     pub fn store(self: *TinyCache, stream: *RingSharedClient, p: Pipe, host: []const u8, port: u16, now_ms: i64) !void {
-        _ = host;
-        _ = port;
         if (!self.enabled()) {
             stream.deinit();
             return;
@@ -86,7 +87,13 @@ pub const TinyCache = struct {
             stream.deinit();
             return error.PoolFull;
         }
+        const host_dup = self.allocator.dupe(u8, host) catch {
+            stream.deinit();
+            return error.OutOfMemory;
+        };
         try self.entries.append(.{
+            .host = host_dup,
+            .port = port,
             .stream = stream,
             .pipe = p,
             .last_used_ms = now_ms,
@@ -98,6 +105,7 @@ pub const TinyCache = struct {
     pub fn evictPipe(self: *TinyCache, p: *const Pipe) void {
         for (self.entries.items, 0..) |*e, i| {
             if (&e.pipe == p) {
+                self.allocator.free(e.host);
                 e.stream.deinit();
                 e.pipe.deinit();
                 _ = self.entries.swapRemove(i);
@@ -117,6 +125,7 @@ pub const TinyCache = struct {
         while (i < self.entries.items.len) {
             const e = &self.entries.items[i];
             if (!e.borrowed and now_ms - e.last_used_ms >= self.ttl_ms) {
+                self.allocator.free(e.host);
                 e.stream.deinit();
                 e.pipe.deinit();
                 _ = self.entries.swapRemove(i);

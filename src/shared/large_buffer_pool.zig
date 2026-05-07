@@ -65,22 +65,28 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
         pub fn release(self: *Self, buf: []u8) void {
             for (self.blocks, 0..) |block, i| {
                 if (block.ptr == buf.ptr) {
+                    // First CAS attempt: BUSY → IDLE
                     const prev = @cmpxchgStrong(u8, &self.states[i], STATE_BUSY, STATE_IDLE, .acquire, .monotonic);
                     if (prev == null) {
-                        // CAS succeeded: BUSY → IDLE
                         self.freelist[self.freelist_top] = i;
                         self.freelist_top += 1;
                         return;
-                    } else if (prev.? == STATE_IDLE) {
-                        // Double-free detected: io_uring retry or close/error collision.
-                        // The buffer was already released — do NOT re-add to freelist.
+                    }
+                    if (prev.? == STATE_IDLE) {
+                        // Double-free detected — buffer already released
                         std.log.err("LargeBufferPool: double-free detected for block idx={d} ptr=0x{x}", .{ i, @intFromPtr(buf.ptr) });
                         return;
                     }
-                    // prev is still BUSY (CAS spuriously failed). Retry once.
-                    _ = @cmpxchgStrong(u8, &self.states[i], STATE_BUSY, STATE_IDLE, .acquire, .monotonic);
-                    self.freelist[self.freelist_top] = i;
-                    self.freelist_top += 1;
+                    // CAS spuriously failed (prev is still BUSY but cmpxchg returned non-null).
+                    // Retry with checked result.
+                    const prev2 = @cmpxchgStrong(u8, &self.states[i], STATE_BUSY, STATE_IDLE, .acquire, .monotonic);
+                    if (prev2 == null) {
+                        self.freelist[self.freelist_top] = i;
+                        self.freelist_top += 1;
+                        return;
+                    }
+                    // Second CAS also failed — buffer remains BUSY, do NOT re-add.
+                    std.log.err("LargeBufferPool: release CAS failed twice for block idx={d}, buffer leaked", .{i});
                     return;
                 }
             }

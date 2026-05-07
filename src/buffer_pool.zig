@@ -73,17 +73,22 @@ pub const BufferPool = struct {
     }
 
     /// Flush replenish queue to io_uring (re-register buffers with kernel).
+    /// On partial failure, keeps remaining bids in queue for next attempt.
     pub fn flushReplenish(self: *BufferPool, ring: *linux.IoUring) !void {
-        for (self.replenish_queue.items) |bid| {
+        var i: usize = 0;
+        while (i < self.replenish_queue.items.len) {
+            const bid = self.replenish_queue.items[i];
             const ptr = self.slab.ptr + @as(usize, bid) * BUFFER_SIZE;
-            _ = try ring.provide_buffers(
-                0,
-                ptr,
-                BUFFER_SIZE,
-                1,
-                READ_BUF_GROUP_ID,
-                bid,
-            );
+            _ = ring.provide_buffers(0, ptr, BUFFER_SIZE, 1, READ_BUF_GROUP_ID, bid) catch |err| {
+                // Ring full — trim processed items, keep remaining for next flush
+                std.log.warn("flushReplenish: provide_buffers failed at bid={d}: {s}, {d} remaining", .{ bid, @errorName(err), self.replenish_queue.items.len - i });
+                // Shift remaining items to front
+                const remaining = self.replenish_queue.items[i..];
+                std.mem.copyForwards(u16, self.replenish_queue.items[0..remaining.len], remaining);
+                self.replenish_queue.items.len = remaining.len;
+                return err;
+            };
+            i += 1;
         }
         self.replenish_queue.clearRetainingCapacity();
     }

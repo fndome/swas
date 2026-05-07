@@ -62,8 +62,10 @@ pub const StreamHandle = struct {
 
     fn dispatch(self: *Self) void {
         if (self.offset == 0) return;
-        @memcpy(self.worker_buf[0..self.offset], self.large_buf[0..self.offset]);
-        const chunk_len = self.offset;
+        // Cap: offset may exceed worker_buf.len if feed() hits threshold boundary
+        const copy_len = @min(self.offset, self.worker_buf.len);
+        @memcpy(self.worker_buf[0..copy_len], self.large_buf[0..copy_len]);
+        const chunk_len = copy_len;
         self.offset = 0;
 
         const ctx = ChunkDispatchCtx{
