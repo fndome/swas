@@ -25,11 +25,8 @@ const ParsedUrl = struct {
 
 fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     var rest = url;
-    if (std.mem.startsWith(u8, rest, "https://")) {
-        return error.TlsNotSupported;
-    } else if (std.mem.startsWith(u8, rest, "http://")) {
-        rest = rest["http://".len..];
-    }
+    if (std.mem.startsWith(u8, rest, "https://")) return error.TlsNotSupported;
+    if (std.mem.startsWith(u8, rest, "http://")) rest = rest["http://".len..];
     const path_start = std.mem.indexOfScalar(u8, rest, '/');
     const host_port = if (path_start) |p| rest[0..p] else rest;
     const path = if (path_start) |p| rest[p..] else "/";
@@ -81,24 +78,63 @@ fn onClose(ctx: ?*anyopaque) void {
     if (Fiber.isYielded()) Fiber.resumeYielded("");
 }
 
+const REQUEST_POOL_SIZE = 30;
+
 pub const HttpClient = struct {
     allocator: Allocator,
     ring_b: *RingB,
-    /// 指向 ring_b.http_cache（内建缓存，由 RingB.tick() 自动淘汰过期条目）
     cache: *TinyCache,
+    req_pool_free: [REQUEST_POOL_SIZE]usize,
+    req_pool_top: usize,
+    req_pool_items: [REQUEST_POOL_SIZE]RequestContext,
 
     pub fn init(allocator: Allocator, ring_b: *RingB) !*HttpClient {
         const self = try allocator.create(HttpClient);
+        var freelist: [REQUEST_POOL_SIZE]usize = undefined;
+        for (0..REQUEST_POOL_SIZE) |i| {
+            freelist[REQUEST_POOL_SIZE - 1 - i] = i;
+        }
         self.* = .{
             .allocator = allocator,
             .ring_b = ring_b,
             .cache = &ring_b.http_cache,
+            .req_pool_free = freelist,
+            .req_pool_top = REQUEST_POOL_SIZE,
+            .req_pool_items = undefined,
         };
         return self;
     }
 
     pub fn deinit(self: *HttpClient) void {
         self.allocator.destroy(self);
+    }
+
+    fn acquireReq(self: *HttpClient) ?*RequestContext {
+        if (self.req_pool_top == 0) return null;
+        self.req_pool_top -= 1;
+        const idx = self.req_pool_free[self.req_pool_top];
+        const ctx = &self.req_pool_items[idx];
+        ctx.* = .{
+            .method = "",
+            .url = "",
+            .headers = null,
+            .body = null,
+            .response = undefined,
+            .done = false,
+            .mutex = .init,
+            .cond = .init,
+            .allocator = self.allocator,
+            .client = self,
+            .pool_id = idx,
+            .from_pool = true,
+        };
+        return ctx;
+    }
+
+    fn releaseReq(self: *HttpClient, ctx: *RequestContext) void {
+        ctx.cleanup();
+        self.req_pool_free[self.req_pool_top] = ctx.pool_id;
+        self.req_pool_top += 1;
     }
 
     pub fn get(self: *HttpClient, url: []const u8) !Response {
@@ -130,27 +166,27 @@ pub const HttpClient = struct {
         } else null;
         errdefer if (body_dup) |b| self.allocator.free(b);
 
-        const ctx = try self.allocator.create(RequestContext);
-        errdefer self.allocator.destroy(ctx);
-
-        ctx.* = .{
-            .method = method,
-            .url = url,
-            .headers = headers_dup,
-            .body = body_dup,
-            .response = undefined,
-            .done = false,
-            .mutex = .{},
-            .cond = .{},
-            .allocator = self.allocator,
-            .client = self,
+        const ctx = self.acquireReq() orelse {
+            if (headers_dup) |h| self.allocator.free(h);
+            if (body_dup) |b| self.allocator.free(b);
+            return error.PoolFull;
         };
+        ctx.method = method;
+        ctx.url = url;
+        ctx.headers = headers_dup;
+        ctx.body = body_dup;
+        ctx.done = false;
+
         try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
-        ctx.mutex.lock();
-        while (!ctx.done) ctx.cond.wait(&ctx.mutex);
-        ctx.mutex.unlock();
+        while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
+        while (!ctx.done) {
+            ctx.mutex.state.store(.unlocked, .release);
+            std.Thread.yield() catch {};
+            while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
+        }
+        ctx.mutex.state.store(.unlocked, .release);
         const resp = ctx.response;
-        self.allocator.destroy(ctx);
+        self.releaseReq(ctx);
         return resp;
     }
 };
@@ -162,16 +198,17 @@ const RequestContext = struct {
     body: ?[]const u8,
     response: Response,
     done: bool,
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
     allocator: Allocator,
     client: *HttpClient,
+    pool_id: usize,
+    from_pool: bool,
 
     fn notify(self: *RequestContext) void {
-        self.mutex.lock();
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         self.done = true;
-        self.cond.signal();
-        self.mutex.unlock();
+        self.mutex.state.store(.unlocked, .release);
     }
 
     fn cleanup(self: *RequestContext) void {
@@ -180,11 +217,11 @@ const RequestContext = struct {
     }
 };
 
-fn handleRequest(allocator: Allocator, ctx_ptr: *RequestContext) void {
+fn handleRequest(allocator: Allocator, ctx_ptr: **RequestContext) void {
     _ = allocator;
-    const ctx = ctx_ptr;
-    const client = ctx.client;
-    const stack = client.allocator.alloc(u8, 65536) catch {
+    const ctx = ctx_ptr.*;
+    const ring = ctx.client.ring_b;
+    const stack = ring.allocator.alloc(u8, 65536) catch {
         ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
         ctx.notify();
         return;
@@ -199,44 +236,35 @@ fn handleRequest(allocator: Allocator, ctx_ptr: *RequestContext) void {
             fn run(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
                 httpRequestFiber(user_ctx, complete);
                 const c: *RequestContext = @ptrCast(@alignCast(user_ctx));
-                c.client.allocator.free(stack);
+                c.client.ring_b.allocator.free(stack);
             }
         }.run,
     });
 }
 
-fn buildRequest(
-    buf: []u8,
-    method: []const u8,
-    path: []const u8,
-    host: []const u8,
-    headers: ?[]const u8,
-    body: ?[]const u8,
-) ![]const u8 {
+fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
     if (body) |b| {
-        const content_len = b.len;
         if (headers) |h| {
             return std.fmt.bufPrint(buf,
                 "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-                .{ method, path, host, h, content_len, b },
+                .{ method, path, host, h, b.len, b },
             );
         }
         return std.fmt.bufPrint(buf,
             "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-            .{ method, path, host, content_len, b },
-        );
-    } else {
-        if (headers) |h| {
-            return std.fmt.bufPrint(buf,
-                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Connection: keep-alive\r\n\r\n",
-                .{ method, path, host, h },
-            );
-        }
-        return std.fmt.bufPrint(buf,
-            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
-            .{ method, path, host },
+            .{ method, path, host, b.len, b },
         );
     }
+    if (headers) |h| {
+        return std.fmt.bufPrint(buf,
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Connection: keep-alive\r\n\r\n",
+            .{ method, path, host, h },
+        );
+    }
+    return std.fmt.bufPrint(buf,
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
+        .{ method, path, host },
+    );
 }
 
 fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
@@ -276,14 +304,12 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             ctx.notify();
             return;
         };
-
         var pipe = Pipe.init(ctx.allocator, stream) catch {
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "pipe init failed");
             ctx.notify();
             return;
         };
-
         cache.store(stream, pipe, parsed.host, parsed.port, now) catch |err| {
             pipe.deinit();
             stream.deinit();

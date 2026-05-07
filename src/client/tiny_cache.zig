@@ -12,7 +12,7 @@ const Pipe = @import("../next/pipe.zig").Pipe;
 ///
 /// 上限: MAX_CONNS_PER_HOST = 8
 
-const MAX_CONNS_PER_HOST: usize = 10;
+const MAX_CONNS_PER_HOST: usize = 12;
 
 const PoolEntry = struct {
     stream: *RingSharedClient,
