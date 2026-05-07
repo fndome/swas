@@ -261,9 +261,9 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     const now = nowMs();
     var stream: *RingSharedClient = undefined;
 
-    if (cache.getPipe(parsed.host, parsed.port, now)) |pipe| {
-        active_pipe = pipe;
-        stream = cache.stream.?;
+    if (cache.acquire(parsed.host, parsed.port, now)) |borrowed| {
+        active_pipe = borrowed.pipe;
+        stream = borrowed.stream;
     } else {
         stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch {
             ctx.response = makeErrorResponse(ctx.allocator, 502, "client init failed");
@@ -284,10 +284,13 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             return;
         };
 
-        cache.store(stream, pipe, parsed.host, parsed.port, now) catch {
+        cache.store(stream, pipe, parsed.host, parsed.port, now) catch |err| {
             pipe.deinit();
             stream.deinit();
-            ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
+            switch (err) {
+                error.PoolFull => ctx.response = makeErrorResponse(ctx.allocator, 503, "connection pool full"),
+                else => ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM"),
+            }
             ctx.notify();
             return;
         };
@@ -306,7 +309,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     stream.write(req) catch {
         ctx.cleanup();
-        cache.evict();
+        cache.evictPipe(active_pipe.?);
         ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
         ctx.notify();
         return;
@@ -325,7 +328,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
         break :blk true;
     };
     if (!read_ok) {
-        cache.evict();
+        cache.evictPipe(active_pipe.?);
         ctx.response = makeErrorResponse(ctx.allocator, 502, "read failed");
         ctx.notify();
         return;
@@ -334,9 +337,9 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     if (parseResponse(ctx.allocator, resp_buf[0..total])) |resp| {
         ctx.response = resp;
         ctx.notify();
-        cache.touch(nowMs());
+        cache.release(active_pipe.?, nowMs());
     } else |_| {
-        cache.evict();
+        cache.evictPipe(active_pipe.?);
         ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
         ctx.notify();
     }

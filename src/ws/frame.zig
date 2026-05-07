@@ -96,10 +96,19 @@ fn maskPayload(payload: []u8, mask_key: [4]u8) void {
 
     var i: usize = 0;
     const chunk_count = payload.len / 16;
-    for (0..chunk_count) |_| {
-        const chunk: *Vec = @ptrCast(@alignCast(&payload[i]));
-        chunk.* ^= mask_vec;
-        i += 16;
+    if (chunk_count > 0 and @intFromPtr(&payload[0]) & 15 == 0) {
+        // Aligned fast path: SIMD XOR 16 bytes at a time
+        for (0..chunk_count) |_| {
+            const chunk: *Vec = @ptrCast(@alignCast(&payload[i]));
+            chunk.* ^= mask_vec;
+            i += 16;
+        }
+    } else {
+        // Unaligned slow path: byte-by-byte for safety
+        const end = chunk_count * 16;
+        while (i < end) : (i += 1) {
+            payload[i] ^= mask_key[i & 3];
+        }
     }
     // Tail: remaining < 16 bytes
     while (i < payload.len) : (i += 1) {

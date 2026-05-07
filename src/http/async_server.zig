@@ -205,7 +205,7 @@ pub const AsyncServer = struct {
         max_path_length: u32 = constants.MAX_PATH_LENGTH,
         idle_timeout_ms: u64 = constants.IDLE_TIMEOUT_MS,
         write_timeout_ms: u64 = constants.WRITE_TIMEOUT_MS,
-        fiber_stack_size_kb: u16 = 64,
+        fiber_stack_size_kb: u16 = 256,
         io_cpu: ?u6 = null,
     };
 
@@ -302,7 +302,7 @@ pub const AsyncServer = struct {
         var bp = try BufferPool.init(allocator, BUFFER_POOL_SIZE);
         errdefer bp.deinit();
 
-        const kb = if (fiber_stack_size_kb == 0) @as(u16, 64) else fiber_stack_size_kb;
+        const kb = if (fiber_stack_size_kb == 0) @as(u16, 256) else fiber_stack_size_kb;
         const stack_size = @as(u32, @intCast(kb)) * 1024;
         const shared_stack = try allocator.alloc(u8, stack_size);
         errdefer allocator.free(shared_stack);
@@ -738,6 +738,51 @@ pub const AsyncServer = struct {
         }
     }
 
+    /// ── ChunkStream 通用读回调 (方案 D: Sticker 搬运, 零 Fiber) ──
+    /// 适用: HTTP body 流式上传、WebSocket 帧流、任意 io_uring 读写源。
+    /// 数据到达 → feed stream → 攒够 → Worker 解析。
+    fn onStreamRead(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
+        _ = user_data;
+        const conn = self.getConn(conn_id) orelse return;
+        const slot = if (conn.pool_idx != 0xFFFFFFFF) &self.pool.slots[conn.pool_idx] else {
+            self.closeConn(conn_id, conn.fd);
+            return;
+        };
+        const stream_ptr = sticker.getStream(slot) orelse {
+            self.closeConn(conn_id, conn.fd);
+            return;
+        };
+        const stream: *StreamHandle = @ptrCast(@alignCast(stream_ptr));
+
+        if (res <= 0) {
+            _ = stream.finish();
+            sticker.clearStream(slot);
+            self.closeConn(conn_id, conn.fd);
+            return;
+        }
+
+        // 从 io_uring provided buffer 提取数据
+        if (cqe_flags & linux.IORING_CQE_F_BUFFER != 0) {
+            const bid = @as(u16, @truncate(cqe_flags >> 16));
+            const read_buf = self.buffer_pool.getReadBuf(bid);
+            const n = @as(usize, @intCast(res));
+            _ = stream.feed(read_buf[0..n]);
+            self.buffer_pool.markReplenish(bid);
+        } else {
+            // 显式 buffer 路径 (等同于 body 搬运)
+            const n = @as(u32, @intCast(res));
+            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+            const data = buf[slot.line3.large_buf_offset..][0..@as(usize, @intCast(n))];
+            _ = stream.feed(data);
+            slot.line3.large_buf_offset += n;
+        }
+
+        // 提交下一读
+        self.submitRead(conn_id, conn) catch {
+            self.closeConn(conn_id, conn.fd);
+        };
+    }
+
     fn processBodyRequest(self: *Self, conn_id: u64, conn: *Connection, body_buf: []u8) void {
         const bid = conn.read_bid;
         const header_buf = self.buffer_pool.getReadBuf(bid);
@@ -880,7 +925,8 @@ pub const AsyncServer = struct {
                 .read_bid = conn.read_bid,
                 .method_len = method_cap,
                 .path_len = path_cap,
-                .request_data = @constCast(body_buf), // body_buf now serves as request_data
+                .request_data = @constCast(effective_buf),
+                .body_data = @constCast(body_buf),
             };
             @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
             @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
@@ -914,7 +960,7 @@ pub const AsyncServer = struct {
     }
 
     /// 统一连接查找：先走 sticker (pool slot)，再走 hashmap 兜底。
-    fn getConn(self: *Self, conn_id: u64) ?*Connection {
+    pub fn getConn(self: *Self, conn_id: u64) ?*Connection {
         if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
             return @ptrCast(@alignCast(r.conn));
         }
@@ -1623,6 +1669,8 @@ pub const AsyncServer = struct {
                     self.onReadComplete(conn_id, res, user_data, cqe.flags);
                 } else if (conn_ptr.state == .receiving_body) {
                     self.onBodyChunk(conn_id, res);
+                } else if (conn_ptr.state == .streaming) {
+                    self.onStreamRead(conn_id, res, user_data, cqe.flags);
                 } else if (conn_ptr.state == .writing) {
                     self.onWriteComplete(conn_id, res, user_data);
                 } else if (conn_ptr.state == .ws_reading) {
@@ -2318,6 +2366,7 @@ const HttpTaskCtx = struct {
     path_buf: [256]u8 = [_]u8{0} ** 256,
     path_len: u8 = 0,
     request_data: []u8,
+    body_data: ?[]u8 = null,
 };
 
 fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
@@ -2336,7 +2385,7 @@ fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []con
         .allocator = server.allocator,
         .status = 200,
         .content_type = .plain,
-        .body = null,
+        .body = t.body_data,
         .headers = null,
         .conn_id = t.conn_id,
         .server = @ptrCast(server),
@@ -2498,6 +2547,12 @@ fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
             t.server.buffer_pool.markReplenish(t.read_bid);
         }
         conn.read_len = 0;
+        // Scheme D: handler 设置了 streaming → 启动 Sticker 读循环
+        if (conn.state == .streaming) {
+            t.server.submitRead(t.conn_id, conn) catch {
+                t.server.closeConn(t.conn_id, conn.fd);
+            };
+        }
     }
     t.server.http_ctx_pool.destroy(t);
 }

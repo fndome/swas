@@ -31,7 +31,7 @@ const ParkedTask = struct {
     stack: []u8,
 };
 
-const FIBER_STACK: u32 = 65536;
+const FIBER_STACK: u32 = 262144; // 256KB
 
 fn makeFiberCall(task: *PoolTask) @import("fiber.zig").FiberCall {
     return .{

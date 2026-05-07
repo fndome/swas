@@ -1,0 +1,185 @@
+const std = @import("std");
+const linux = std.os.linux;
+const Allocator = std.mem.Allocator;
+
+const StreamHandle = @import("../next/chunk_stream.zig").StreamHandle;
+
+const TCP_READ_BUF = 262144; // 256KB
+
+/// ── TcpOutboundRing: 通用 TCP 出站 io_uring 通道 ──────────
+///
+/// 不与 RingA(主服务)/RingB(HTTP)/RingC(NATS) 共享 ring。
+/// 每条 TCP 连接有独立 token → CQE 路由。
+/// tick() 非阻塞: submit pending SQEs → 收已有 CQEs → 处理 → 重投读取。
+///
+/// 同一 ring 可承载 MySQL、Redis、PostgreSQL 等多种协议。
+/// 上层只需要 connect → (可选 auth/query helpers) → attachStream。
+///
+/// 用法:
+///   var ring = try TcpOutboundRing.init(alloc, 256);
+///   defer ring.deinit();
+///   const conn = try ring.connect("127.0.0.1", 3306);
+///   ring.attachStream(conn, stream);
+///   // 主循环: while (running) { ring.tick(); }
+pub const TcpOutboundRing = struct {
+    const Self = @This();
+
+    ring: linux.IoUring,
+    allocator: Allocator,
+    conns: std.AutoHashMap(u64, *TcpConn),
+
+    /// 非阻塞 tick: 投递 SQEs → 收已有 CQEs → 处理。
+    /// 在主 event loop 中每轮调用一次。
+    pub fn tick(self: *Self) void {
+        _ = self.ring.submit() catch {};
+
+        const n = self.ring.copy_cqes(self.cqes, 0) catch 0;
+        for (self.cqes[0..n], 0..) |*cqe, i| {
+            defer self.ring.cqe_seen(&self.cqes[i]);
+            self.processCqe(cqe);
+        }
+    }
+
+    fn processCqe(self: *Self, cqe: *const linux.io_uring_cqe) void {
+        const token = cqe.user_data;
+        const conn = self.conns.getPtr(token) orelse return;
+        const res = cqe.res;
+
+        switch (conn.state) {
+            .connecting => {
+                if (res < 0) {
+                    self.removeConn(conn);
+                    return;
+                }
+                conn.state = .idle;
+                if (conn.stream != null or conn.on_read != null) {
+                    conn.submitRead(&self.ring) catch self.removeConn(conn);
+                }
+            },
+            .reading => {
+                if (res <= 0) {
+                    if (conn.stream) |s| _ = s.finish();
+                    self.removeConn(conn);
+                    return;
+                }
+                const n = @as(usize, @intCast(res));
+                if (conn.stream) |s| {
+                    _ = s.feed(conn.read_buf[0..n]);
+                } else if (conn.on_read) |cb| {
+                    cb(conn.on_read_ctx, conn.read_buf[0..n]);
+                }
+                conn.submitRead(&self.ring) catch self.removeConn(conn);
+            },
+            .writing => {
+                if (res <= 0) {
+                    self.removeConn(conn);
+                    return;
+                }
+                conn.written += @as(usize, @intCast(res));
+                if (conn.written >= conn.wbuf_len) {
+                    conn.wbuf_len = 0;
+                    conn.written = 0;
+                    conn.state = .idle;
+                    if (conn.stream != null or conn.on_read != null) {
+                        conn.submitRead(&self.ring) catch self.removeConn(conn);
+                    }
+                } else {
+                    conn.submitWrite(&self.ring) catch self.removeConn(conn);
+                }
+            },
+            .idle, .closing => {},
+        }
+    }
+
+    pub fn connect(self: *Self, host: []const u8, port: u16) !*TcpConn {
+        const fd = try linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        errdefer _ = linux.close(fd);
+
+        const addr = try std.net.Address.parseIp(host, port) catch
+            try std.net.Address.resolveIp(host, port, .ip4);
+
+        const token = self.next_token;
+        self.next_token += 1;
+
+        const conn = try self.allocator.create(TcpConn);
+        errdefer self.allocator.destroy(conn);
+        conn.* = .{
+            .fd = fd,
+            .token = token,
+            .state = .connecting,
+            .stream = null,
+            .on_read = null,
+            .on_read_ctx = null,
+            .read_buf = try self.allocator.alloc(u8, TCP_READ_BUF),
+            .wbuf = .{},
+            .wbuf_len = 0,
+            .written = 0,
+        };
+        errdefer conn.deinit(self.allocator);
+
+        try self.conns.put(token, conn);
+
+        try self.ring.connect(token, fd, &addr.any, addr.getOsSockLen());
+        _ = self.ring.submit() catch {};
+        return conn;
+    }
+
+    pub fn attachStream(self: *Self, conn: *TcpConn, stream: *StreamHandle) void {
+        conn.stream = stream;
+        if (conn.state == .idle) {
+            conn.submitRead(&self.ring) catch self.removeConn(conn);
+        }
+    }
+
+    pub fn write(self: *Self, conn: *TcpConn, data: []const u8) !void {
+        if (conn.wbuf_len + data.len > conn.wbuf.len) {
+            return error.WriteBufferFull;
+        }
+        @memcpy(conn.wbuf[conn.wbuf_len..][0..data.len], data);
+        conn.wbuf_len += data.len;
+        if (conn.state == .idle) {
+            conn.submitWrite(&self.ring) catch self.removeConn(conn);
+        }
+    }
+
+    fn removeConn(self: *Self, conn: *TcpConn) void {
+        _ = self.conns.remove(conn.token);
+        conn.deinit(self.allocator);
+    }
+};
+
+pub const TcpConn = struct {
+    fd: i32,
+    token: u64,
+    state: State,
+    stream: ?*StreamHandle,
+    on_read: ?*const fn (ctx: ?*anyopaque, data: []const u8) void,
+    on_read_ctx: ?*anyopaque,
+    read_buf: []u8,
+    wbuf: [65536]u8, // 64KB, 对齐 read_buf
+    wbuf_len: usize,
+    written: usize,
+
+    pub const State = enum(u8) { connecting, idle, reading, writing, closing };
+
+    fn submitRead(self: *TcpConn, ring: *linux.IoUring) !void {
+        self.state = .reading;
+        const sqe = try ring.read(self.token, self.fd, .{ .buffer = self.read_buf }, 0);
+        _ = sqe;
+        _ = try ring.submit();
+    }
+
+    fn submitWrite(self: *TcpConn, ring: *linux.IoUring) !void {
+        self.state = .writing;
+        const pending = self.wbuf[self.written..self.wbuf_len];
+        const sqe = try ring.write(self.token, self.fd, pending, 0);
+        _ = sqe;
+        _ = try ring.submit();
+    }
+
+    fn deinit(self: *TcpConn, allocator: Allocator) void {
+        if (self.fd >= 0) { _ = linux.close(self.fd); self.fd = -1; }
+        allocator.free(self.read_buf);
+        allocator.destroy(self);
+    }
+};

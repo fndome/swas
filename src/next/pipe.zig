@@ -14,6 +14,9 @@ pub const Pipe = struct {
 
     read_buf: std.ArrayList(u8),
     write_buf: std.ArrayList(u8),
+    max_read: usize,
+
+    const DEFAULT_MAX_READ: usize = 1024 * 1024; // 1MB
 
     pub fn init(allocator: Allocator, stream: *RingSharedClient) !Pipe {
         return Pipe{
@@ -21,7 +24,14 @@ pub const Pipe = struct {
             .stream = stream,
             .read_buf = std.ArrayList(u8).empty,
             .write_buf = std.ArrayList(u8).empty,
+            .max_read = DEFAULT_MAX_READ,
         };
+    }
+
+    pub fn initWithLimit(allocator: Allocator, stream: *RingSharedClient, max_read: usize) !Pipe {
+        var p = try Pipe.init(allocator, stream);
+        p.max_read = max_read;
+        return p;
     }
 
     pub fn deinit(self: *Pipe) void {
@@ -37,9 +47,16 @@ pub const Pipe = struct {
         return Writer{ .pipe = self };
     }
 
-    /// RingSharedClient.on_data 回调入口：喂数据进读缓冲区，
-    /// 标记 fiber 待恢复，由 IO 主循环在 CQE 收割后统一 resume。
+    /// RingSharedClient.on_data 回调入口。
+    /// 超出 max_read 时丢弃数据、唤醒 fiber 报错。
     pub fn feed(self: *Pipe, data: []const u8) !void {
+        if (self.read_buf.items.len + data.len > self.max_read) {
+            // 缓冲区满, 丢弃新数据, 唤醒 fiber 报 BufferFull
+            if (Fiber.isYielded()) {
+                Fiber.pushResume(0, 0, &.{});
+            }
+            return;
+        }
         try self.read_buf.appendSlice(self.allocator, data);
         if (Fiber.isYielded()) {
             Fiber.pushResume(0, 0, data);

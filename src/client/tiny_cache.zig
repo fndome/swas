@@ -4,32 +4,34 @@ const Allocator = std.mem.Allocator;
 const RingSharedClient = @import("../shared/tcp_stream.zig").RingSharedClient;
 const Pipe = @import("../next/pipe.zig").Pipe;
 
-/// ── 出站连接缓存基石 ────────────────────────────────────
+/// ── 出站连接池 ──────────────────────────────────────────
 ///
-/// 单条目 TTL 缓存。同 host:port 且未过期时复用 TCP 连接和 Pipe。
-/// HTTP / NATS / MySQL 等协议 client 共用此基础件。
+/// 同 host:port 允许多条并发连接 (K8s pod 间通信需要)。
+/// getPipe() 优先借出空闲连接，全部借出时返回 null 让调用方新建。
+/// releasePipe() 归还到池。TTL 过期自动淘汰空闲连接。
 ///
-/// 设计原则（io_uring 微服务最佳实践）：
-///   连接阶段允许重试——connect 失败不影响缓存，下次 getPipe 自动重建。
-///   读写阶段禁止重试——write/read 失败立即 evict + 返回错误给调用方。
-///   原因：io_uring SQE 级的 partial write 由内核 TCP 栈保证；应用层
-///   重试 read/write 会造成协议帧边界错乱（HTTP 管线化、WS 帧、DB 协议包）。
-///   调用方（handler fiber）如需重试，应重新发起完整请求，触发全新 connect。
-///
-/// 用法 (from main):
-///   server.http_cache = TinyCache.init(alloc, 1000);  // 1s TTL
+/// 上限: MAX_CONNS_PER_HOST = 8
+
+const MAX_CONNS_PER_HOST: usize = 10;
+
+const PoolEntry = struct {
+    stream: *RingSharedClient,
+    pipe: Pipe,
+    last_used_ms: i64,
+    borrowed: bool,
+};
+
 pub const TinyCache = struct {
     allocator: Allocator,
     ttl_ms: i64,
-    stream: ?*RingSharedClient = null,
-    pipe: ?Pipe = null,
-    host: ?[]const u8 = null,
-    port: u16 = 0,
-    last_used_ms: i64 = 0,
+    entries: std.ArrayList(PoolEntry),
 
-    /// ttl_ms = 0 表示禁用缓存，所有方法退化为空操作。
     pub fn init(allocator: Allocator, ttl_ms: i64) TinyCache {
-        return TinyCache{ .allocator = allocator, .ttl_ms = ttl_ms };
+        return TinyCache{
+            .allocator = allocator,
+            .ttl_ms = ttl_ms,
+            .entries = std.ArrayList(PoolEntry).initCapacity(allocator, MAX_CONNS_PER_HOST) catch @panic("OOM"),
+        };
     }
 
     pub fn enabled(self: *const TinyCache) bool {
@@ -37,75 +39,98 @@ pub const TinyCache = struct {
     }
 
     pub fn deinit(self: *TinyCache) void {
-        self.evict();
+        for (self.entries.items) |*e| {
+            e.stream.deinit();
+            e.pipe.deinit();
+        }
+        self.entries.deinit();
     }
 
-    /// 缓存命中时返回 pipe 指针，调用方通过 threadlocal 设置 active_pipe。
-    /// 未命中时返回 null，调用方负责创建新连接后调用 store()。
-    /// 禁用状态（ttl_ms == 0）永远返回 null。
-    pub fn getPipe(self: *TinyCache, host: []const u8, port: u16, now_ms: i64) ?*Pipe {
+    /// 借出一条空闲连接。返回 (stream, pipe) 或 null。
+    pub fn acquire(self: *TinyCache, host: []const u8, port: u16, now_ms: i64) ?struct { stream: *RingSharedClient, pipe: *Pipe } {
+        _ = host;
+        _ = port;
         if (!self.enabled()) return null;
-        if (self.stream == null) return null;
-        if (self.port != port) return null;
-        if (self.host == null) return null;
-        if (!std.mem.eql(u8, self.host.?, host)) return null;
-        if (now_ms - self.last_used_ms >= self.ttl_ms) {
-            self.evict();
-            return null;
+        for (self.entries.items) |*e| {
+            if (e.borrowed) continue;
+            if (now_ms - e.last_used_ms >= self.ttl_ms) continue;
+            e.pipe.reset();
+            e.last_used_ms = now_ms;
+            e.borrowed = true;
+            return .{ .stream = e.stream, .pipe = &e.pipe };
         }
-        self.pipe.?.reset();
-        self.last_used_ms = now_ms;
-        return &self.pipe.?;
+        return null;
     }
 
-    /// 淘汰当前缓存的连接。
-    /// 安全：stream.deinit() 内 rs.remove(id) 注销 IORegistry 回调，
-    /// 后续任何在途 CQE 到达时 dispatch 查 hashmap 无匹配，静默丢弃。
-    /// 不会发生 use-after-free。
-    pub fn evict(self: *TinyCache) void {
-        if (self.stream) |s| {
-            s.deinit();
-            self.stream = null;
+    /// 归还借出的连接。
+    pub fn release(self: *TinyCache, p: *const Pipe, now_ms: i64) void {
+        for (self.entries.items) |*e| {
+            if (&e.pipe == p) {
+                e.borrowed = false;
+                e.last_used_ms = now_ms;
+                return;
+            }
         }
-        if (self.pipe) |*p| {
-            p.deinit();
-            self.pipe = null;
-        }
-        if (self.host) |h| {
-            self.allocator.free(h);
-            self.host = null;
-        }
-        self.port = 0;
     }
 
-    /// 存储新连接到缓存。禁用状态（ttl_ms == 0）直接淘汰已有条目后返回。
+    /// 存入新连接到池。池满时返回 error.PoolFull, 调用方应回 503。
     pub fn store(self: *TinyCache, stream: *RingSharedClient, p: Pipe, host: []const u8, port: u16, now_ms: i64) !void {
+        _ = host;
+        _ = port;
         if (!self.enabled()) {
-            self.evict();
+            stream.deinit();
             return;
         }
-        self.evict();
-        const host_dup = try self.allocator.dupe(u8, host);
-        self.stream = stream;
-        self.pipe = p;
-        self.host = host_dup;
-        self.port = port;
-        self.last_used_ms = now_ms;
+        self.evictExpired(now_ms);
+        if (self.entries.items.len >= MAX_CONNS_PER_HOST) {
+            stream.deinit();
+            return error.PoolFull;
+        }
+        try self.entries.append(.{
+            .stream = stream,
+            .pipe = p,
+            .last_used_ms = now_ms,
+            .borrowed = false,
+        });
     }
 
-    /// 续期：标记缓存为刚使用
-    pub fn touch(self: *TinyCache, now_ms: i64) void {
-        self.last_used_ms = now_ms;
+    /// 淘汰单条连接 (write/read 失败时用)
+    pub fn evictPipe(self: *TinyCache, p: *const Pipe) void {
+        for (self.entries.items, 0..) |*e, i| {
+            if (&e.pipe == p) {
+                e.stream.deinit();
+                e.pipe.deinit();
+                _ = self.entries.swapRemove(i);
+                return;
+            }
+        }
     }
 
-    /// 周期调用（由 RingB.tick() 自动驱动），TTL 过期时主动淘汰空闲连接。
-    /// 禁用态（ttl_ms == 0）或无缓存时退化为零开销空操作。
-    /// 安全保证：IORegistry 先 remove 后 close fd，配合 gen_id 编码，
-    /// 旧 CQE 在 dispatch 时 hashmap miss 或 gen_id 不匹配 → 静默丢弃。无数据污染。
+    /// tick() 周期调用：淘汰过期且未借出的连接
     pub fn tick(self: *TinyCache, now_ms: i64) void {
         if (!self.enabled()) return;
-        if (self.stream != null and now_ms - self.last_used_ms >= self.ttl_ms) {
-            self.evict();
+        self.evictExpired(now_ms);
+    }
+
+    fn evictExpired(self: *TinyCache, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            if (!e.borrowed and now_ms - e.last_used_ms >= self.ttl_ms) {
+                e.stream.deinit();
+                e.pipe.deinit();
+                _ = self.entries.swapRemove(i);
+            } else {
+                i += 1;
+            }
         }
+    }
+
+    pub fn count(self: *const TinyCache) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (!e.borrowed) n += 1;
+        }
+        return n;
     }
 };

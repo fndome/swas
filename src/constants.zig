@@ -1,7 +1,7 @@
 pub const MAX_HEADER_BUFFER_SIZE = 8192;
 pub const MAX_RESPONSE_BUFFER_SIZE = 4096;
-pub const MAX_CQES_BATCH = 64;
-pub const RING_ENTRIES = 2048;
+pub const MAX_CQES_BATCH = 128;
+pub const RING_ENTRIES = 4096;
 pub const TASK_QUEUE_SIZE = 1024;
 pub const RESPONSE_QUEUE_SIZE = 1024;
 /// io_uring provided buffer block size. 4KB is the sweet spot for 1M connections.

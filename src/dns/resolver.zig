@@ -152,6 +152,7 @@ pub const DnsResolver = struct {
             .addr = self.nameserver_ip,
             .zero = [_]u8{0} ** 8,
         };
+        // UDP sendto on non-blocking socket: small packet (<100B) always succeeds
         _ = linux.sendto(self.udp_fd, &query, query.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
         self.submitRecv();
     }
