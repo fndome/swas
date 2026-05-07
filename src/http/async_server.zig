@@ -872,6 +872,7 @@ pub const AsyncServer = struct {
             }
 
             self.large_pool.release(body_buf);
+            self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
 
             const extra_headers = if (temp_ctx.headers) |h| h.items else "";
