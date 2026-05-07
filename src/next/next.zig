@@ -49,12 +49,18 @@ fn makeFiberCall(task: *PoolTask) @import("fiber.zig").FiberCall {
 }
 
 const WorkerPool = struct {
+    const STACK_POOL_SIZE = 64;
+
     allocator: Allocator,
     workers: []std.Thread,
     head: ?*PoolTask,
     tail: ?*PoolTask,
     mutex: std.Io.Mutex,
     stop: bool,
+
+    stack_pool: [STACK_POOL_SIZE][]u8,
+    stack_freelist: [STACK_POOL_SIZE]usize,
+    stack_freelist_top: usize,
 
     fn lockMutex(m: *std.Io.Mutex) void {
         while (!m.tryLock()) std.Thread.yield() catch {};
@@ -66,6 +72,12 @@ const WorkerPool = struct {
 
     fn init(allocator: Allocator, count: u8) !WorkerPool {
         const workers = try allocator.alloc(std.Thread, count);
+        var stack_pool: [STACK_POOL_SIZE][]u8 = undefined;
+        var stack_freelist: [STACK_POOL_SIZE]usize = undefined;
+        for (0..STACK_POOL_SIZE) |i| {
+            stack_pool[i] = try allocator.alloc(u8, FIBER_STACK);
+            stack_freelist[i] = STACK_POOL_SIZE - 1 - i;
+        }
         var pool = WorkerPool{
             .allocator = allocator,
             .workers = workers,
@@ -73,6 +85,9 @@ const WorkerPool = struct {
             .tail = null,
             .mutex = .init,
             .stop = false,
+            .stack_pool = stack_pool,
+            .stack_freelist = stack_freelist,
+            .stack_freelist_top = STACK_POOL_SIZE,
         };
         for (workers, 0..) |*w, i| {
             w.* = std.Thread.spawn(.{}, workerLoop, .{ &pool, @as(u8, @intCast(i)) }) catch {
@@ -93,7 +108,26 @@ const WorkerPool = struct {
             self.allocator.destroy(task);
         }
         for (self.workers) |w| w.join();
+        for (self.stack_pool[0..]) |stack| {
+            self.allocator.free(stack);
+        }
         self.allocator.free(self.workers);
+    }
+
+    fn acquireStack(self: *WorkerPool) ?[]u8 {
+        if (self.stack_freelist_top == 0) return null;
+        self.stack_freelist_top -= 1;
+        return self.stack_pool[self.stack_freelist[self.stack_freelist_top]];
+    }
+
+    fn releaseStack(self: *WorkerPool, stack: []u8) void {
+        for (self.stack_pool, 0..) |s, i| {
+            if (s.ptr == stack.ptr) {
+                self.stack_freelist[self.stack_freelist_top] = i;
+                self.stack_freelist_top += 1;
+                return;
+            }
+        }
     }
 
     fn submit(self: *WorkerPool, task: *PoolTask) void {
@@ -146,8 +180,8 @@ const WorkerPool = struct {
 };
 
 fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask)) void {
-    const stack = pool.allocator.alloc(u8, FIBER_STACK) catch {
-        task.exec(task.ctx, task.alloc);
+    const stack = pool.acquireStack() orelse {
+        task.exec(task.ctx, task.alloc); // 池满退化: 无 fiber 直接跑
         pool.allocator.destroy(task);
         return;
     };
@@ -157,17 +191,17 @@ fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask
 
     if (Fiber.isYielded()) {
         const ctx = @import("fiber.zig").parked_ctx orelse {
-            pool.allocator.free(stack);
+            pool.releaseStack(stack);
             pool.allocator.destroy(task);
             return;
         };
         const poll = @import("fiber.zig").parked_poll orelse {
-            pool.allocator.free(stack);
+            pool.releaseStack(stack);
             pool.allocator.destroy(task);
             return;
         };
         const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse {
-            pool.allocator.free(stack);
+            pool.releaseStack(stack);
             pool.allocator.destroy(task);
             return;
         };
@@ -185,7 +219,7 @@ fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;
     } else {
-        pool.allocator.free(stack);
+        pool.releaseStack(stack);
         pool.allocator.destroy(task);
     }
 }
@@ -196,17 +230,17 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
 
     if (Fiber.isYielded()) {
         const ctx = @import("fiber.zig").parked_ctx orelse {
-            pool.allocator.free(pt.stack);
+            pool.releaseStack(pt.stack);
             pool.allocator.destroy(pt.task);
             return;
         };
         const poll = @import("fiber.zig").parked_poll orelse {
-            pool.allocator.free(pt.stack);
+            pool.releaseStack(pt.stack);
             pool.allocator.destroy(pt.task);
             return;
         };
         const poll_ctx = @import("fiber.zig").parked_poll_ctx orelse {
-            pool.allocator.free(pt.stack);
+            pool.releaseStack(pt.stack);
             pool.allocator.destroy(pt.task);
             return;
         };
@@ -221,7 +255,7 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;
     } else {
-        pool.allocator.free(pt.stack);
+        pool.releaseStack(pt.stack);
         pool.allocator.destroy(pt.task);
     }
 }
