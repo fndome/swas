@@ -625,10 +625,11 @@ pub const AsyncServer = struct {
         // iovecs from StackSlot (Line4) — kernel-safe during async write, never freed
         const slot = &self.pool.slots[conn.pool_idx];
 
-        // Guard: refuse to overwrite iovecs while kernel is still reading them
-        if (@atomicLoad(u8, &slot.line4.writev_in_flight, .acquire) != 0) {
+        // Guard: refuse to overwrite iovecs while a write is still in-flight.
+        // IO thread only — no atomic needed.
+        if (slot.line4.writev_in_flight != 0) {
             logErr("submitWrite: writev already in-flight for fd={d}, skipping", .{conn.fd});
-            return;
+            return error.WriteInFlight;
         }
 
         const iovs = &slot.line4.write_iovs;
@@ -663,14 +664,14 @@ pub const AsyncServer = struct {
                 count += 1;
             }
 
-            // Publish writev_in_flight BEFORE submitting to kernel
-            @atomicStore(u8, &slot.line4.writev_in_flight, 1, .release);
+            // Mark in-flight before submitting to kernel
+            slot.line4.writev_in_flight = 1;
             const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         } else {
             if (conn.write_offset >= header_len) return;
             const to_send = resp_buf[conn.write_offset..header_len];
-            @atomicStore(u8, &slot.line4.writev_in_flight, 1, .release);
+            slot.line4.writev_in_flight = 1;
             const sqe = try self.ring.write(user_data, fd, to_send, 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         }
@@ -1497,7 +1498,7 @@ pub const AsyncServer = struct {
             const conn = self.getConn(conn_id) orelse return;
             // Clear in-flight flag on error before closing
             if (conn.pool_idx != 0xFFFFFFFF) {
-                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
             }
             self.closeConn(conn_id, conn.fd);
             return;
@@ -1509,7 +1510,7 @@ pub const AsyncServer = struct {
             conn.write_retries = 0;
             // Write complete: clear in-flight flag before recycling buffers
             if (conn.pool_idx != 0xFFFFFFFF) {
-                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
             }
             if (conn.write_body) |b| {
                 self.allocator.free(b);
@@ -1547,19 +1548,19 @@ pub const AsyncServer = struct {
             if (conn.write_retries > maxWriteRetries(total)) {
                 logErr("write retries exceeded for fd {} ({} attempts, {} bytes total)", .{ conn.fd, conn.write_retries, total });
                 if (conn.pool_idx != 0xFFFFFFFF) {
-                    @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                    self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
                 }
                 self.closeConn(conn_id, conn.fd);
                 return;
             }
             // Clear in-flight flag before retrying; submitWrite will re-set it
             if (conn.pool_idx != 0xFFFFFFFF) {
-                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
             }
             self.submitWrite(conn_id, conn) catch |err| {
                 logErr("submitWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
                 if (conn.pool_idx != 0xFFFFFFFF) {
-                    @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                    self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
                 }
                 self.closeConn(conn_id, conn.fd);
             };
@@ -1825,9 +1826,10 @@ fn executeNext(self: *Self, req: *const Item) void {
     fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
         if (conn.response_buf) |existing| {
             if (existing.len >= min_size) return true;
-            // Guard: if writev is in-flight, do NOT free the buffer the kernel is reading
+            // Guard: if writev is in-flight, do NOT free the buffer the kernel is reading.
+            // IO thread only — plain field access.
             if (conn.pool_idx != 0xFFFFFFFF) {
-                if (@atomicLoad(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, .acquire) != 0) {
+                if (self.pool.slots[conn.pool_idx].line4.writev_in_flight != 0) {
                     logErr("ensureWriteBuf: refusing to replace in-flight write buffer for fd={d}", .{conn.fd});
                     return false;
                 }
@@ -2471,6 +2473,15 @@ fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []con
     const path = t.path_buf[0..t.path_len];
     const req_data = t.request_data;
 
+    // If body came from LargeBufferPool (processBodyRequest path), dupe it to
+    // GPA memory and release the pool buffer immediately. This prevents
+    // ctx.deinit() / ctx.text() / ctx.json() from freeing pool memory via GPA.
+    var req_body: ?[]u8 = null;
+    if (t.body_data) |bd| {
+        req_body = server.allocator.dupe(u8, bd) catch null;
+        server.large_pool.release(bd);
+    }
+
     var ctx = Context{
         .request_data = req_data,
         .path = path,
@@ -2478,7 +2489,7 @@ fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []con
         .allocator = server.allocator,
         .status = 200,
         .content_type = .plain,
-        .body = t.body_data,
+        .body = req_body,
         .headers = null,
         .conn_id = t.conn_id,
         .server = @ptrCast(server),
