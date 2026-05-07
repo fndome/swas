@@ -48,8 +48,8 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
-            for (self.freelist[0..self.freelist_top]) |idx| {
-                allocator.free(self.blocks[idx]);
+            for (self.blocks) |block| {
+                allocator.free(block);
             }
         }
 

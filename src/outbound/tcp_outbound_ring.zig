@@ -27,6 +27,8 @@ pub const TcpOutboundRing = struct {
     ring: linux.IoUring,
     allocator: Allocator,
     conns: std.AutoHashMap(u64, *TcpConn),
+    next_token: u64 = 1,
+    cqes: [256]linux.io_uring_cqe = [_]linux.io_uring_cqe{std.mem.zeroes(linux.io_uring_cqe)} ** 256,
 
     /// 非阻塞 tick: 投递 SQEs → 收已有 CQEs → 处理。
     /// 在主 event loop 中每轮调用一次。

@@ -70,6 +70,7 @@ pub fn slotAlloc(pool: anytype, fd: i32, conn_gen_id: *u32, now_ms: i64) struct 
     slot.line2.birth_ms = now_ms;
     slot.line2.is_writing = false;
     slot.line2.active_list_pos = pool.liveAdd(idx);
+    slot.line4.writev_in_flight = 0; // clear stale flag from previous slot user
 
     return .{ .idx = idx, .token = packUserData(gen_id, idx) };
 }

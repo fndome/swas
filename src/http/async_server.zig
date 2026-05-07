@@ -1283,14 +1283,35 @@ pub const AsyncServer = struct {
             const hw4 = sticker.httpWork(slot);
             const headers_end = if (hw4.headers_end > 0) hw4.headers_end + 4 else effective_nread;
             if (headers_end >= effective_nread) {
-                // 未达到 Body，等待继续读
+                // Body starts in later TCP segment — transition to receiving_body
+                slot.line5.ws.compute.job_id = conn_id;
+                slot.line5.ws.compute.buffer_ptr = hw4.content_length;
+
+                const large_buf = self.large_pool.acquire() orelse {
+                    self.buffer_pool.markReplenish(bid);
+                    conn.read_len = 0;
+                    self.respond(conn, 413, "Content Too Large");
+                    return;
+                };
+                slot.line3.large_buf_ptr = @intFromPtr(large_buf.ptr);
+                slot.line3.large_buf_len = @intCast(@min(hw4.content_length, large_buf.len));
+                slot.line3.large_buf_offset = 0;
+
+                conn.read_len = 0;
+                conn.state = .receiving_body;
+                self.submitBodyRead(conn, large_buf, slot) catch {
+                    self.large_pool.release(large_buf);
+                    slot.line3.large_buf_ptr = 0;
+                    self.closeConn(conn_id, conn.fd);
+                };
+                return;
             } else {
                 // 保存请求头元数据到 StackSlot（供 body 收齐后 handler 使用）
                 slot.line5.ws.compute.job_id = conn_id;
                 slot.line5.ws.compute.buffer_ptr = hw4.content_length; // 复用：存 content_length
 
                 const body_fragment = effective_buf[headers_end..effective_nread];
-                var large_buf = self.large_pool.acquire() orelse {
+                const large_buf = self.large_pool.acquire() orelse {
                     self.buffer_pool.markReplenish(bid);
                     conn.read_len = 0;
                     self.respond(conn, 413, "Content Too Large");
