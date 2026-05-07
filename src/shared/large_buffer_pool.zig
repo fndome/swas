@@ -14,13 +14,21 @@ const Allocator = std.mem.Allocator;
 ///
 /// release() 是 O(n) 指针扫描, 适合 块数 <= 64 的场景。
 /// 需要更大池子用 std.heap.MemoryPool 或 arena allocator。
+///
+/// 状态机 (per-block) 防御 io_uring 内核重试导致的幽灵双重释放:
+///   0 = IDLE (free)
+///   1 = BUSY (acquired, in-flight)
+/// release() 使用 CAS 从 BUSY → IDLE，若已为 IDLE 则跳过（幂等释放）。
 pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) type {
     return struct {
         const Self = @This();
+        const STATE_IDLE: u8 = 0;
+        const STATE_BUSY: u8 = 1;
 
         blocks: [capacity][]u8,
         freelist: [capacity]usize,
         freelist_top: usize,
+        states: [capacity]u8,
 
         pub fn init(allocator: Allocator) !Self {
             var blocks: [capacity][]u8 = undefined;
@@ -33,6 +41,7 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
                 .blocks = blocks,
                 .freelist = freelist,
                 .freelist_top = capacity,
+                .states = [_]u8{STATE_IDLE} ** capacity,
             };
         }
 
@@ -45,17 +54,38 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
         pub fn acquire(self: *Self) ?[]u8 {
             if (self.freelist_top == 0) return null;
             self.freelist_top -= 1;
-            return self.blocks[self.freelist[self.freelist_top]];
+            const idx = self.freelist[self.freelist_top];
+            // Atomic store-release: publish BUSY before returning pointer
+            @atomicStore(u8, &self.states[idx], STATE_BUSY, .release);
+            return self.blocks[idx];
         }
 
+        /// 幂等释放：CAS BUSY → IDLE。若已为 IDLE（双重释放/幽灵 CQE），
+        /// 记录错误并跳过，保护 freelist 元数据不被破坏。
         pub fn release(self: *Self, buf: []u8) void {
             for (self.blocks, 0..) |block, i| {
                 if (block.ptr == buf.ptr) {
+                    const prev = @cmpxchgStrong(u8, &self.states[i], STATE_BUSY, STATE_IDLE, .acquire, .monotonic);
+                    if (prev == null) {
+                        // CAS succeeded: BUSY → IDLE
+                        self.freelist[self.freelist_top] = i;
+                        self.freelist_top += 1;
+                        return;
+                    } else if (prev.? == STATE_IDLE) {
+                        // Double-free detected: io_uring retry or close/error collision.
+                        // The buffer was already released — do NOT re-add to freelist.
+                        std.log.err("LargeBufferPool: double-free detected for block idx={d} ptr=0x{x}", .{ i, @intFromPtr(buf.ptr) });
+                        return;
+                    }
+                    // prev is still BUSY (CAS spuriously failed). Retry once.
+                    _ = @cmpxchgStrong(u8, &self.states[i], STATE_BUSY, STATE_IDLE, .acquire, .monotonic);
                     self.freelist[self.freelist_top] = i;
                     self.freelist_top += 1;
                     return;
                 }
             }
+            // Buffer not owned by this pool — caller bug
+            std.log.err("LargeBufferPool.release: buffer 0x{x} not found in pool", .{@intFromPtr(buf.ptr)});
         }
     };
 }

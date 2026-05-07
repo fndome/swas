@@ -163,7 +163,10 @@ const CacheLine4_6 = extern struct {
     /// by workspace union state switches (http→ws, ws→compute).
     response_buf_ptr: u64 = 0,
     response_buf_tier: u8 = 0,
-    _pad: [3]u8 = [_]u8{0} ** 3,
+    /// 内核正在异步读取 write_iovs（writev SQE 已提交但 CQE 未到）。
+    /// 置位期间严禁对 Line4 做任何 memcpy / 重置 / iovec 修改。
+    writev_in_flight: u8 = 0,
+    _pad: [2]u8 = [_]u8{0} ** 2,
     response_buf_len: u32 = 0,
     write_iovs: [2]std.posix.iovec_const = [_]std.posix.iovec_const{
         .{ .base = undefined, .len = 0 },

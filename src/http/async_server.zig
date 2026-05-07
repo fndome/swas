@@ -623,7 +623,15 @@ pub const AsyncServer = struct {
         const resp_buf = conn.response_buf orelse return;
 
         // iovecs from StackSlot (Line4) — kernel-safe during async write, never freed
-        const iovs = &self.pool.slots[conn.pool_idx].line4.write_iovs;
+        const slot = &self.pool.slots[conn.pool_idx];
+
+        // Guard: refuse to overwrite iovecs while kernel is still reading them
+        if (@atomicLoad(u8, &slot.line4.writev_in_flight, .acquire) != 0) {
+            logErr("submitWrite: writev already in-flight for fd={d}, skipping", .{conn.fd});
+            return;
+        }
+
+        const iovs = &slot.line4.write_iovs;
 
         // Bounds-safe header end: clamp to actual buffer length to prevent
         // index-out-of-bounds panic when write_offset drifts past the buffer.
@@ -655,11 +663,14 @@ pub const AsyncServer = struct {
                 count += 1;
             }
 
+            // Publish writev_in_flight BEFORE submitting to kernel
+            @atomicStore(u8, &slot.line4.writev_in_flight, 1, .release);
             const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         } else {
             if (conn.write_offset >= header_len) return;
             const to_send = resp_buf[conn.write_offset..header_len];
+            @atomicStore(u8, &slot.line4.writev_in_flight, 1, .release);
             const sqe = try self.ring.write(user_data, fd, to_send, 0);
             if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
         }
@@ -975,6 +986,16 @@ pub const AsyncServer = struct {
 
             // Drain any queued WebSocket frames
             self.drainWsWriteQueue(conn);
+
+            // Release large_pool buffer if still held (TTL close while body read in-flight)
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                const slot = &self.pool.slots[conn.pool_idx];
+                if (slot.line3.large_buf_ptr != 0) {
+                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+                    self.large_pool.release(buf);
+                    slot.line3.large_buf_ptr = 0;
+                }
+            }
 
             // Always free write buffers — do NOT gate on read_buf_recycled.
             // read_buf_recycled only protects the read (provided) buffer path.
@@ -1465,6 +1486,10 @@ pub const AsyncServer = struct {
         _ = user_data;
         if (res <= 0) {
             const conn = self.getConn(conn_id) orelse return;
+            // Clear in-flight flag on error before closing
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+            }
             self.closeConn(conn_id, conn.fd);
             return;
         }
@@ -1473,6 +1498,10 @@ pub const AsyncServer = struct {
         const total = conn.write_headers_len + if (conn.write_body) |b| b.len else 0;
         if (conn.write_offset >= total) {
             conn.write_retries = 0;
+            // Write complete: clear in-flight flag before recycling buffers
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+            }
             if (conn.write_body) |b| {
                 self.allocator.free(b);
                 conn.write_body = null;
@@ -1508,11 +1537,21 @@ pub const AsyncServer = struct {
             conn.write_retries += 1;
             if (conn.write_retries > maxWriteRetries(total)) {
                 logErr("write retries exceeded for fd {} ({} attempts, {} bytes total)", .{ conn.fd, conn.write_retries, total });
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                }
                 self.closeConn(conn_id, conn.fd);
                 return;
             }
+            // Clear in-flight flag before retrying; submitWrite will re-set it
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+            }
             self.submitWrite(conn_id, conn) catch |err| {
                 logErr("submitWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    @atomicStore(u8, &self.pool.slots[conn.pool_idx].line4.writev_in_flight, 0, .release);
+                }
                 self.closeConn(conn_id, conn.fd);
             };
         }
@@ -1696,9 +1735,16 @@ pub const AsyncServer = struct {
         }
     }
 
+    /// 每轮 IO 循环最多消费 64 个 Next 任务，防止深度优先生成的新任务
+    /// 挤占 ReadyQueue 后续就绪任务和 CQE 收割的公平性。
+    /// 剩余任务留给下一轮循环，确保 1M 连接的响应是匀速的（P99 稳定）。
+    const IO_QUANTUM: usize = 64;
+
     fn drainNextTasks(self: *Self) void {
         if (self.next) |*n| {
-            while (n.ringbuffer.pop()) |item| {
+            var count: usize = 0;
+            while (count < IO_QUANTUM) : (count += 1) {
+                const item = n.ringbuffer.pop() orelse break;
                 self.executeNext(&item);
             }
         }
