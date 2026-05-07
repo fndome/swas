@@ -27,6 +27,7 @@ pub const TcpOutboundRing = @import("outbound/tcp_outbound_ring.zig").TcpOutboun
 pub const mysqlConnect = @import("outbound/mysql.zig").mysqlConnect;
 pub const mysqlAuth = @import("outbound/mysql.zig").mysqlAuth;
 pub const mysqlQuery = @import("outbound/mysql.zig").mysqlQuery;
+pub const BufferBlockPool = @import("shared/large_buffer_pool.zig").BufferBlockPool;
 
 /// 高级范式：用户自定义 I/O 请求，push 到 SubmitQueue，
 /// IO 线程执行 execute，完成后调 on_complete。
