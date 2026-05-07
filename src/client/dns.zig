@@ -117,6 +117,7 @@ pub const CaresDns = struct {
                 fd_ptr.* = -1;
             }
         }
+        _ = self.rs.ring.submit() catch {};
     }
 
     fn dnsCallback(
