@@ -22,9 +22,7 @@ pub const StreamHandle = @import("next/chunk_stream.zig").StreamHandle;
 pub const setStream = @import("stack_pool_sticker.zig").setStream;
 pub const clearStream = @import("stack_pool_sticker.zig").clearStream;
 pub const TcpOutboundRing = @import("outbound/tcp_outbound_ring.zig").TcpOutboundRing;
-pub const mysqlConnect = @import("outbound/mysql.zig").mysqlConnect;
-pub const mysqlAuth = @import("outbound/mysql.zig").mysqlAuth;
-pub const mysqlQuery = @import("outbound/mysql.zig").mysqlQuery;
+pub const TcpConn = @import("outbound/tcp_outbound_ring.zig").TcpConn;
 pub const BufferBlockPool = @import("shared/large_buffer_pool.zig").BufferBlockPool;
 pub const DeferredResponse = @import("deferred.zig").DeferredResponse;
 

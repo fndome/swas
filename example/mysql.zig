@@ -1,6 +1,6 @@
 const std = @import("std");
-const TcpOutboundRing = @import("tcp_outbound_ring.zig").TcpOutboundRing;
-const TcpConn = @import("tcp_outbound_ring.zig").TcpConn;
+const TcpOutboundRing = @import("../outbound/tcp_outbound_ring.zig").TcpOutboundRing;
+const TcpConn = @import("../outbound/tcp_outbound_ring.zig").TcpConn;
 
 /// ── MySQL 协议薄层 on TcpOutboundRing ────────────────────
 ///
