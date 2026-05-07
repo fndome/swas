@@ -87,6 +87,8 @@ pub const HttpClient = struct {
     req_pool_free: [REQUEST_POOL_SIZE]usize,
     req_pool_top: usize,
     req_pool_items: [REQUEST_POOL_SIZE]RequestContext,
+    req_gen: [REQUEST_POOL_SIZE]u64,
+    next_gen: u64,
     stop: bool,
 
     const REQUEST_TIMEOUT_US: usize = 5_000_000; // 5s
@@ -104,6 +106,8 @@ pub const HttpClient = struct {
             .req_pool_free = freelist,
             .req_pool_top = REQUEST_POOL_SIZE,
             .req_pool_items = undefined,
+            .req_gen = [_]u64{0} ** REQUEST_POOL_SIZE,
+            .next_gen = 0,
             .stop = false,
         };
         return self;
@@ -145,12 +149,14 @@ pub const HttpClient = struct {
             .client = self,
             .pool_id = idx,
             .from_pool = true,
+            .gen = self.req_gen[idx],
         };
         return ctx;
     }
 
     fn releaseReq(self: *HttpClient, ctx: *RequestContext) void {
         ctx.cleanup();
+        self.req_gen[ctx.pool_id] +%= 1; // bump gen → 旧 fiber notify 失效
         self.req_pool_free[self.req_pool_top] = ctx.pool_id;
         self.req_pool_top += 1;
     }
@@ -210,10 +216,11 @@ pub const HttpClient = struct {
                 std.Thread.yield() catch {};
                 waited += 1; // ~1µs per iteration
                 if (waited > max_wait or @atomicLoad(bool, &self.stop, .acquire)) {
-                    // Timeout: fiber 可能还在运行, 不能归还 slot (防 use-after-free)
-                    // fiber 自然完成后 notify 是 no-op (done 已 true)
+                    // cancel → release 槽位: gen 自增, 旧 fiber notify 失效
+                    @atomicStore(bool, &ctx.cancelled, true, .release);
                     @atomicStore(bool, &ctx.done, true, .release);
                     ctx.mutex.state.store(.unlocked, .release);
+                    self.releaseReq(ctx);
                     return error.RequestTimeout;
                 }
                 while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
@@ -239,11 +246,14 @@ const RequestContext = struct {
     client: *HttpClient,
     pool_id: usize,
     from_pool: bool,
+    gen: u64,
+    cancelled: bool,
 
     fn notify(self: *RequestContext) void {
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.state.store(.unlocked, .release);
+        if (@atomicLoad(bool, &self.cancelled, .acquire)) return;
         self.done = true;
-        self.mutex.state.store(.unlocked, .release);
     }
 
     fn cleanup(self: *RequestContext) void {
