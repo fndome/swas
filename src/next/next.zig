@@ -115,12 +115,16 @@ const WorkerPool = struct {
     }
 
     fn acquireStack(self: *WorkerPool) ?[]u8 {
+        WorkerPool.lockMutex(&self.mutex);
+        defer WorkerPool.unlockMutex(&self.mutex);
         if (self.stack_freelist_top == 0) return null;
         self.stack_freelist_top -= 1;
         return self.stack_pool[self.stack_freelist[self.stack_freelist_top]];
     }
 
     fn releaseStack(self: *WorkerPool, stack: []u8) void {
+        WorkerPool.lockMutex(&self.mutex);
+        defer WorkerPool.unlockMutex(&self.mutex);
         for (self.stack_pool, 0..) |s, i| {
             if (s.ptr == stack.ptr) {
                 self.stack_freelist[self.stack_freelist_top] = i;
