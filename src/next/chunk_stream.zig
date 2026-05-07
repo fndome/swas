@@ -45,13 +45,32 @@ pub const StreamHandle = struct {
 
     pub fn feed(self: *Self, data: []const u8) bool {
         if (self.eof) return false;
-        const space = self.large_buf.len -| self.offset;
-        if (space == 0) { self.dispatch(); return self.feed(data); }
-        const n = @min(data.len, space);
-        @memcpy(self.large_buf[self.offset..][0..n], data[0..n]);
-        self.offset += n;
-        if (self.offset >= self.threshold) { self.dispatch(); return true; }
-        return false;
+        var remaining = data;
+        var dispatched = false;
+        while (remaining.len > 0) {
+            if (self.offset >= self.threshold) {
+                self.dispatch();
+                dispatched = true;
+            }
+            const space = self.large_buf.len -| self.offset;
+            if (space == 0) {
+                self.dispatch();
+                dispatched = true;
+                continue;
+            }
+            // Cap copy to threshold boundary to prevent exceeding worker_buf
+            const to_threshold = self.threshold -| self.offset;
+            const n = @min(@min(remaining.len, space), to_threshold);
+            @memcpy(self.large_buf[self.offset..][0..n], remaining[0..n]);
+            self.offset += n;
+            remaining = remaining[n..];
+        }
+        // Trigger dispatch if we hit the threshold on the last chunk
+        if (self.offset >= self.threshold) {
+            self.dispatch();
+            dispatched = true;
+        }
+        return dispatched;
     }
 
     pub fn finish(self: *Self) bool {
@@ -62,10 +81,9 @@ pub const StreamHandle = struct {
 
     fn dispatch(self: *Self) void {
         if (self.offset == 0) return;
-        // Cap: offset may exceed worker_buf.len if feed() hits threshold boundary
-        const copy_len = @min(self.offset, self.worker_buf.len);
-        @memcpy(self.worker_buf[0..copy_len], self.large_buf[0..copy_len]);
-        const chunk_len = copy_len;
+        std.debug.assert(self.offset <= self.worker_buf.len);
+        @memcpy(self.worker_buf[0..self.offset], self.large_buf[0..self.offset]);
+        const chunk_len = self.offset;
         self.offset = 0;
 
         const ctx = ChunkDispatchCtx{

@@ -277,7 +277,12 @@ pub fn connFree(
 ) void {
     if (connections.getPtr(conn_id)) |conn| {
         if (conn.pool_idx != 0xFFFFFFFF) {
-            slotFree(pool, conn.pool_idx);
+            const slot = &pool.slots[conn.pool_idx];
+            // Guard: if slot was reused (gen_id changed), this connection
+            // no longer owns it. Only free the slot if gen_id still matches.
+            if (slot.line1.gen_id == conn.gen_id) {
+                slotFree(pool, conn.pool_idx);
+            }
         }
     }
     _ = connections.remove(conn_id);
