@@ -30,6 +30,24 @@ pub const TcpOutboundRing = struct {
     next_token: u64 = 1,
     cqes: [256]linux.io_uring_cqe = [_]linux.io_uring_cqe{std.mem.zeroes(linux.io_uring_cqe)} ** 256,
 
+    pub fn init(allocator: Allocator, entries: u12) !TcpOutboundRing {
+        const ring = try linux.IoUring.init(entries, 0);
+        return TcpOutboundRing{
+            .ring = ring,
+            .allocator = allocator,
+            .conns = std.AutoHashMap(u64, *TcpConn).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.conns.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.conns.deinit();
+        self.ring.deinit();
+    }
+
     /// 非阻塞 tick: 投递 SQEs → 收已有 CQEs → 处理。
     /// 在主 event loop 中每轮调用一次。
     pub fn tick(self: *Self) void {
