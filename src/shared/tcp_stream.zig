@@ -136,11 +136,7 @@ pub const RingSharedClient = struct {
         sqe.addr = @intFromPtr(&self.connect_addr);
         sqe.off = self._connect_addrlen;
         if (timeout_ms > 0) {
-            sqe.flags |= linux.IOSQE_IO_LINK; // 链接下一个 SQE (LINK_TIMEOUT)
-        }
-        _ = self.rs.ringPtr().submit() catch {};
-
-        if (timeout_ms > 0) {
+            sqe.flags |= linux.IOSQE_IO_LINK; // link LINK_TIMEOUT next
             const tsqe = self.rs.ringPtr().nop(0) catch return;
             tsqe.opcode = @enumFromInt(15); // IORING_OP_LINK_TIMEOUT
             var ts = linux.timespec{
@@ -149,8 +145,9 @@ pub const RingSharedClient = struct {
             };
             tsqe.addr = @intFromPtr(&ts);
             tsqe.len = 1;
-            _ = self.rs.ringPtr().submit() catch {};
+            // CONNECT + LINK_TIMEOUT submitted together — no orphan window
         }
+        _ = self.rs.ringPtr().submit() catch {};
     }
 
     pub fn write(self: *RingSharedClient, data: []const u8) !void {

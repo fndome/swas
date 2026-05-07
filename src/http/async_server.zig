@@ -383,6 +383,15 @@ pub const AsyncServer = struct {
                 if (conn.write_body) |b| self.allocator.free(b);
                 if (conn.ws_token) |t| self.allocator.free(t);
                 if (conn.response_buf) |buf| self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                // Release large_pool buffer if connection still holds one
+                if (conn.pool_idx != 0xFFFFFFFF) {
+                    const slot = &self.pool.slots[conn.pool_idx];
+                    if (slot.line3.large_buf_ptr != 0) {
+                        const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+                        self.large_pool.release(buf);
+                        slot.line3.large_buf_ptr = 0;
+                    }
+                }
                 _ = linux.close(conn.fd);
                 if (conn.pool_idx != 0xFFFFFFFF) {
                     sticker.slotFree(&self.pool, conn.pool_idx);
@@ -2130,6 +2139,7 @@ fn executeNext(self: *Self, req: *const Item) void {
                     conn.write_headers_len = close_len;
                     conn.write_offset = 0;
                     conn.state = .ws_writing;
+                    conn.keep_alive = false; // close after write completes
                     self.submitWrite(conn_id, conn) catch {
                         self.closeConn(conn_id, conn.fd);
                     };
@@ -2279,6 +2289,11 @@ fn executeNext(self: *Self, req: *const Item) void {
             }
             conn.write_offset = 0;
             conn.write_headers_len = 0;
+            // If this was a close frame (keep_alive cleared by sender), close now
+            if (!conn.keep_alive) {
+                self.closeConn(conn_id, conn.fd);
+                return;
+            }
             // Flush any queued WebSocket frames before resuming reads
             self.flushWsWriteQueue(conn_id, conn);
         } else {
