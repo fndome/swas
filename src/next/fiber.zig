@@ -92,14 +92,17 @@ pub const ResumeEntry = struct {
     data: []const u8,
 };
 
-const RESUME_QUEUE_CAP = 256;
+const RESUME_QUEUE_CAP = 512;
 pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
-pub threadlocal var resume_head: u8 = 0;
-pub threadlocal var resume_tail: u8 = 0;
+pub threadlocal var resume_head: u16 = 0;
+pub threadlocal var resume_tail: u16 = 0;
 
 pub fn pushResume(slot_idx: u32, gen_id: u32, data: []const u8) void {
     const next = resume_tail +% 1;
-    if (next == resume_head) return;
+    if (next == resume_head) {
+        std.log.err("Fiber.pushResume: resume queue full (cap={d}), entry dropped — slot={d} gen={d}", .{ RESUME_QUEUE_CAP -| 1, slot_idx, gen_id });
+        return;
+    }
     resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .gen_id = gen_id, .data = data };
     resume_tail = next;
 }
