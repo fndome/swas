@@ -41,7 +41,7 @@ zig build run
 const sws = @import("sws");
 
 pub fn main() !void {
-    var server = try sws.AsyncServer.init(alloc, io, "0.0.0.0:9090", null, 64);
+    var server = try sws.AsyncServer.init(alloc, io, "0.0.0.0:9090", null, 0);
     defer server.deinit();
 
     server.GET("/hello", myHandler);
@@ -90,7 +90,7 @@ Each connection slot is split across independent cache lines for contention-free
 line1 ( 64B): fd, gen_id, state, write_offset, req_count — CQE dispatch (hottest)
 line2 ( 64B): conn_id, last_active_ms, active_list_pos — TTL scanning
 line3 ( 64B): fiber_context, large_buf_ptr — async anchors, Worker Pool, oversized body
-line4 (128B): response_buf, write_iovs, ws_write_queue — write path (low frequency)
+line4 (128B): writev_in_flight, response_buf, write_iovs, ws_write_queue — write path (low frequency)
 line5 ( 64B): sentinel (0x53574153) + workspace union — HTTP/WS/Compute view
 ```
 
@@ -153,7 +153,7 @@ Contract that every outbound ring must implement:
 
 ```zig
 var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", app_ctx, fiber_stack_size_kb);
-//                                                                    ↑ 0 = 64KB
+//                                                                    ↑ 0 = 256KB
 ```
 
 First handler/middleware registration calls `ensureNext()` → creates `Next` (ringbuffer) + `setDefault()`.
@@ -512,8 +512,10 @@ try cs.connect("localhost", 5432);
 
 ### LargeBufferPool
 
-For oversized requests (Content-Length > 32KB) that can't fit in the 64KB shared fiber stack.
-Pre-allocated 1MB blocks with O(1) freelist acquire/release.
+For oversized requests (Content-Length > 32KB) that can't fit in the 256KB shared fiber stack.
+Pre-allocated 1MB blocks with O(1) freelist acquire/release. Each block carries an atomic
+**IDLE/BUSY state** — release is idempotent via CAS, preventing double-free from io_uring
+kernel retries or TTL-close vs. CQE-collision paths.
 
 ```zig
 const LargeBufferPool = @import("sws").LargeBufferPool;
@@ -525,6 +527,12 @@ const buf = self.large_pool.acquire() orelse return error.OutOfLargeBuffers;
 // ... process body ...
 self.large_pool.release(buf);
 ```
+
+### IO_QUANTUM — Next task fairness
+
+`drainNextTasks` is capped at 64 tasks per event loop iteration (`IO_QUANTUM`). This prevents
+depth-first starvation: when a handler's `Next.go()` spawns new tasks, they don't preempt
+the remaining ReadyQueue entries or CQE harvesting. P99 tail latency stays uniform under load.
 
 ### HttpRing + HttpClient (Ring B)
 
@@ -573,7 +581,7 @@ const HttpCaresDns = sws.HttpCaresDns;
 
 ### Fiber
 
-Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre-allocated stack buffer** (stored in `AsyncServer.shared_fiber_stack`) — sequential execution, no per-request stack allocation, zero contention.
+Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre-allocated stack buffer** (stored in `AsyncServer.shared_fiber_stack`, default 256KB) — sequential execution, no per-request stack allocation, zero contention.
 
 > ⚠️ **Do NOT use `std.Io.async()` / `future.await()` in handlers.**
 >
@@ -594,7 +602,7 @@ Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre
 > ctx.json(200, result);              // resumes here — expects data still intact
 > ```
 >
-> SWS uses a **shared stack** (one 64KB buffer, all fibers reuse it). When a fiber
+> SWS uses a **shared stack** (one 256KB buffer, all fibers reuse it). When a fiber
 > yields in `await()`, the next fiber's execution overwrites that same memory. The
 > resumed fiber's stack frame is corrupted.
 >
@@ -602,10 +610,10 @@ Built-in fiber (x86_64 and ARM64 Linux). All handler fibers share a **single pre
 >
 > | Concurrent requests | Per-fiber stack | Shared stack |
 > |---|---:|---:|
-> | 1K | 16 MB | 64 KB |
-> | 20K | 320 MB | 64 KB |
-> | 200K | 3.2 GB | 64 KB |
-> | 1M | 16 GB | 64 KB |
+> | 1K | 16 MB | 256 KB |
+> | 20K | 320 MB | 256 KB |
+> | 200K | 3.2 GB | 256 KB |
+> | 1M | 16 GB | 256 KB |
 >
 > *(per-fiber stack at 16KB — the practical minimum for HTTP handlers)*
 >
@@ -647,15 +655,15 @@ See `example/` and `src/example.zig`.
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| StackSlot (per connection) | 320 bytes | 5 cache-line-aligned sub-structures |
-| StackPool (1M slots) | ~400 MB | 384B per StackSlot, contiguous, warmup-touched |
+| StackSlot (per connection) | 384 bytes | 5 cache-line-aligned sub-structures |
+| StackPool (1M slots) | ~384 MB | contiguous, warmup-touched |
 | Freelist (1M u32) | 4 MB | O(1) acquire/release |
 | Read buffer (idle) | 0 bytes | io_uring provided buffers, returned on idle |
 | Slab for io_uring reads | 64 MB | 16384 × 4KB blocks, kernel-recycled |
 | Tiered write pool | dynamic | 8 size classes (512B–64KB), freelist-recycled |
-| Shared fiber stack | 64 KB | All fibers share one pre-allocated stack |
+| Shared fiber stack | 256 KB | All fibers share one pre-allocated stack |
 | LargeBufferPool | 64 MB | 64 × 1MB blocks for oversized requests |
-| **1M idle connections** | **~540 MB** | No per-thread stack overhead |
+| **1M idle connections** | **~520 MB** | No per-thread stack overhead |
 
 Like [greatws](https://github.com/antlabs/greatws), idle connections consume zero buffer memory.
 
@@ -666,7 +674,7 @@ The 384-byte StackSlot is split across independent cache lines:
 - **line1 (64B):** fd, gen_id, state, write_offset — only this is touched during CQE dispatch
 - **line2 (64B):** conn_id, last_active_ms, active_list_pos — only touched during TTL scanning
 - **line3 (64B):** fiber_context, large_buf_ptr — async anchors (Worker Pool / oversized bodies)
-- **line4 (128B):** response_buf, write_iovs, WS queue — write path, not in the hot path
+- **line4 (128B):** writev_in_flight, response_buf, write_iovs, WS queue — write path, not in the hot path
 - **line5 (64B):** sentinel + workspace union — protocol parser scratch, zero extra allocation
 
 The IO loop's hottest path (CQE dispatch → slot lookup) only touches line1. TTL scanning only touches line2. No cache-line ping-pong between unrelated operations.
@@ -689,7 +697,7 @@ WS handlers may offload frame data asynchronously, so frame payloads must remain
 
 | key | default | description |
 |-----|---------|-------------|
-| `fiber_stack_size_kb` | 64 | fiber stack size (KB). 0 = 64 |
+| `fiber_stack_size_kb` | 256 | fiber stack size (KB). 0 = 256 |
 | `io_cpu` | null | pin IO thread to CPU core |
 | `idle_timeout_ms` | 30000 | close idle connections |
 | `write_timeout_ms` | 5000 | close stuck-write connections |

@@ -10,19 +10,19 @@
 
 | 场景 | 触发条件 | 表现 | 缓解 |
 |------|---------|------|------|
-| 共享栈溢出 | handler 递归/大局部变量 > 64KB | 栈帧破坏, 未定义行为 | fiber_stack_size_kb 可配; 禁止 handler 做大变量 |
+| 共享栈溢出 | handler 递归/大局部变量 > 256KB | 栈帧破坏, 未定义行为 | fiber_stack_size_kb 可配; 禁止 handler 做大变量 |
 | shared_fiber_active 卡死 | 前一个 fiber yield 后未 resume | 后续所有请求走 per-task stack (Next.push) | ringbuffer 4096 容量, 满则丢任务 |
 | LargeBufferPool 枯竭 | 65 连接同时需要 >32KB body | acquire()=null, 413 Content Too Large | 当前上限 64, 可调大 |
 | CQE ring 溢出 | cqe_seen 比内核生产慢 | 内核丢事件 → 连接静默失败 | ring_entries=2048, 需保持 dispatchCqes < 50µs/CQE |
 | buffer_pool 枯竭 | 连接数超 pool_size(1024) | read 无 buffer → 连接关闭 | 当前上限 1024, 连接数超 1024 时退化 |
 | Middleware/hook panic | 用户代码异常 | 连接直接关闭, 不波及其他连接 | handler 内部 try/catch |
 
-**最脆弱点: 共享栈 64KB 限制。** 所有 handler fiber 共用 64KB 栈。FIBER_STACK 改为 128KB 可消解大部分风险。
+**最脆弱点: 共享栈 256KB 限制。** 所有 handler fiber 共用 256KB 栈。fiber_stack_size_kb 可调大。
 
 ## 2. StackPool
 
 **正常:**
-- 1M slot × 320B = 320MB 预分配。
+- 1M slot × 384B = 384MB 预分配。
 - 5 cache line 热冷分离。gen_id 幽灵防御。
 
 **极端条件:**
@@ -80,7 +80,7 @@
 
 | 组件 | 最脆弱点 | 评级 | 修复优先级 |
 |------|---------|------|-----------|
-| Ring A | 共享栈 64KB | 🔶 中 | FIBER_STACK → 128KB |
+| Ring A | 共享栈 256KB | 🔶 中 | fiber_stack_size_kb 可调大 |
 | StackPool | 1M 前 CPU 先到瓶颈 | 🟢 低 | 不修 |
 | HTTP Client | DNS resolve 阻塞 RingB 线程 | 🔴 高 | 用 c-ares / io_uring DNS |
 | TinyCache | Pipe 无背压 → OOM | 🔶 中 | Pipe buffer 加上限 |
