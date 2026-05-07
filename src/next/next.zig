@@ -443,9 +443,10 @@ pub const Next = struct {
                 fn done(_: ?*anyopaque, _: []const u8) void {}
             }.done,
         })) {
+            // Ring full → yield + 1 retry built into ringbuffer.push()
             self.allocator.destroy(gc);
             self.allocator.destroy(user);
-            std.log.err("Next.push: ringbuffer full, task dropped", .{});
+            std.log.err("Next.push: ringbuffer full after retry, task dropped", .{});
         }
     }
 

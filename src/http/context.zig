@@ -72,7 +72,7 @@ pub const Context = struct {
         const uri_end = if (std.mem.indexOfScalar(u8, self.request_data, ' ')) |sp| sp else self.request_data.len;
         const first_line = self.request_data[0..uri_end];
         const method_end = std.mem.indexOfScalar(u8, first_line, ' ') orelse return null;
-        const uri_part = std.mem.trimLeft(u8, first_line[method_end + 1 ..], " ");
+        const uri_part = std.mem.trimStart(u8, first_line[method_end + 1 ..], " ");
         const uri = uri_part[0 .. (std.mem.indexOfScalar(u8, uri_part, ' ') orelse uri_part.len)];
 
         const q_pos = std.mem.indexOfScalar(u8, uri, '?') orelse return null;

@@ -605,9 +605,9 @@ pub const AsyncServer = struct {
         _ = conn_id;
         const user_data = packUserData(conn.gen_id, conn.pool_idx);
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
-        const sqe = try self.ring.read(user_data, fd, .{
+        const sqe = self.ring.read(user_data, fd, .{
             .buffer_selection = .{ .group_id = READ_BUF_GROUP_ID, .len = BUFFER_SIZE },
-        }, 0);
+        }, 0) catch return error.RingFull;
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
     }
 
@@ -1098,8 +1098,12 @@ pub const AsyncServer = struct {
             return;
         };
         self.submitRead(conn_id, conn_ptr) catch |err| {
-            logErr("submitRead failed for fd {}: {s}", .{ conn_fd, @errorName(err) });
-            self.closeConn(conn_id, conn_fd);
+            if (err == error.RingFull) {
+                // ring full → read delayed to next tick
+            } else {
+                logErr("submitRead failed for fd {}: {s}", .{ conn_fd, @errorName(err) });
+                self.closeConn(conn_id, conn_fd);
+            }
             self.accept_stalled = true;
             self.submitAccept() catch |err2| logErr("failed to resubmit accept after read error: {s}", .{@errorName(err2)});
             return;
