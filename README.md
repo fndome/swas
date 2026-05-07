@@ -22,6 +22,63 @@ Handlers run as **fibers on the IO thread** by default.
 - `Next.go()` — fiber on IO thread, zero thread switch. Use for DB io_uring, async I/O.
 - `Next.submit()` — worker pool. Use **only for CPU-intensive computation** that would block.
 
+## Concurrency Model (Must Read Before Code Review)
+
+sws is a **single-threaded** system with explicit handoff points. This is the
+single most important fact about the codebase. Internalizing it prevents an
+entire class of false bug reports.
+
+### The One Rule
+
+```
+IO thread owns everything. Worker threads own nothing except their own stack.
+
+IO thread ──[submit]──→ mutex queue ──→ worker pops task
+Worker    ──[invoke]──→ CAS list    ──→ IO thread drains next tick
+              ↑                           ↑
+         one-way handoff             one-way handoff
+```
+
+There is **no shared mutable state** between the IO thread and worker threads.
+They communicate only through two unidirectional handoff queues.
+
+### Code Review Checklist
+
+- **Do NOT add atomics.** `@atomicStore`, `@cmpxchgStrong`, `@atomicLoad` have
+  no place in IO-thread-only data paths. They don't protect anything (there is
+  no concurrent access) and actively mislead future readers into thinking
+  multi-threaded access exists. Use plain `field = value` / `if field != 0`.
+
+- **Do NOT add mutexes** to IO-thread data structures (StackSlot, Connection,
+  BufferPool, LargeBufferPool, DnsResolver, WsServer). They are accessed by
+  exactly one thread.
+
+- **WorkerPool internals** (`stack_freelist`, `stack_pool`) are shared among
+  workers. With the default `initPool4NextSubmit(1)`, there is exactly one
+  worker — no concurrency. The race only exists with `n > 1`.
+
+- **The `Next.go()` ringbuffer** (`SubmitQueue`) is IO-thread push, IO-thread
+  pop (`drainNextTasks`). Single-threaded despite the "SPSC" name.
+
+- **`shared_fiber_active`** is read and written only by the IO thread. No
+  atomic needed. The per-task-stack wrappers (`httpTaskCleanup`,
+  `wsTaskCleanup`) do not touch it.
+
+- **When auditing code**, start by verifying which execution context each
+  piece of data lives in. If both ends are in the IO thread, any concern
+  about "thread safety" is a false alarm. If a worker thread touches it,
+  trace the handoff — is it through `submit()` (mutex) or `invoke.push()`
+  (CAS)? If neither, it's a bug.
+
+### Common Mistakes in Past Audits
+
+| Mistake | Why Wrong |
+|---------|-----------|
+| "`shared_fiber_active` should be atomic" | IO thread only. No other thread reads or writes it |
+| "`LargeBufferPool.freelist_top` needs a lock" | IO thread only. Worker never touches this pool |
+| "`ensureWriteBuf` races with `submitWrite`" | Both run on IO thread, sequentially |
+| "`ConnState` transitions need atomics" | IO thread only. State changes happen in event loop order |
+
 ## Requirements
 
 - Linux 5.1+ (io_uring)
