@@ -378,11 +378,11 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             ctx.notify();
             return;
         };
-        active_pipe = cache.pipe orelse unreachable;
+        active_pipe = (cache.acquire(parsed.host, parsed.port, now) orelse unreachable).pipe;
     }
     defer active_pipe = null;
 
-    const reader = cache.pipe.?.reader();
+    const reader = active_pipe.?.reader();
 
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
