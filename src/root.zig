@@ -14,11 +14,9 @@ pub const WsHandler = @import("ws/server.zig").WsHandler;
 pub const Frame = @import("ws/types.zig").Frame;
 pub const Opcode = @import("ws/types.zig").Opcode;
 
-/// 用户自定义 io_uring 提交队列（Worker → IO 线程）
 pub const SubmitQueue = @import("next/queue.zig").SubmitQueue;
 pub const QueueItem = @import("next/queue.zig").Item;
 pub const Next = @import("next/next.zig").Next;
-/// Next.chainGoSubmit: execGo(fiber, IO 线程) 异步集齐数据 → complete 触发 → execSubmit(worker 池) → respond 响应
 pub const chainGoSubmit = @import("next/next.zig").Next.chainGoSubmit;
 pub const StreamHandle = @import("next/chunk_stream.zig").StreamHandle;
 pub const setStream = @import("stack_pool_sticker.zig").setStream;
@@ -28,26 +26,16 @@ pub const mysqlConnect = @import("outbound/mysql.zig").mysqlConnect;
 pub const mysqlAuth = @import("outbound/mysql.zig").mysqlAuth;
 pub const mysqlQuery = @import("outbound/mysql.zig").mysqlQuery;
 pub const BufferBlockPool = @import("shared/large_buffer_pool.zig").BufferBlockPool;
+pub const DeferredResponse = @import("deferred.zig").DeferredResponse;
 
-/// 高级范式：用户自定义 I/O 请求，push 到 SubmitQueue，
-/// IO 线程执行 execute，完成后调 on_complete。
-/// 同一范式适用于 DB、Redis、NATS、HTTP Client。
 pub const Fiber = @import("next/fiber.zig").Fiber;
-
-/// IO 线程 TCP 出站客户端（io_uring 驱动），用于集成 NATS / Redis / HTTP client 等
 pub const RingShared = @import("shared/ring_shared.zig").RingShared;
 pub const RingSharedClient = @import("shared/tcp_stream.zig").RingSharedClient;
-/// RingSharedClient / FileRead 等 io_uring 句柄的统一注册表
 pub const IORegistry = @import("shared/io_registry.zig").IORegistry;
-/// 将 RingSharedClient 推模型适配为读写拉模型（通过 fiber yield/resume），
-/// 使同步风格的协议库（pgz/myqzl 等）可直接跑在 IO 线程
 pub const Pipe = @import("next/pipe.zig").Pipe;
-
 pub const DnsCache = @import("dns/cache.zig").DnsCache;
 pub const DnsResolver = @import("dns/resolver.zig").DnsResolver;
 pub const InvokeQueue = @import("shared/io_invoke.zig").InvokeQueue;
-
-/// 独立 HTTP 客户端 Ring (Ring B) + HttpClient + c-ares DNS
 pub const HttpRing = @import("client/ring.zig").HttpRing;
 pub const HttpClient = @import("client/http_client.zig").HttpClient;
 pub const HttpCaresDns = @import("client/dns.zig").CaresDns;
@@ -68,27 +56,6 @@ pub const CustomTemplate = struct {
     }
 };
 
-/// 在链式异步 I/O 结束时向客户端发 HTTP 响应。
-/// handler 设 ctx.deferred = true，链式调用末端调 resp.json/text 发回数据。
-pub const DeferredResponse = struct {
-    server: *AsyncServer,
-    conn_id: u64,
-    allocator: Allocator,
-
-    pub fn json(self: *const DeferredResponse, status: u16, body: []const u8) void {
-        const duped = self.allocator.dupe(u8, body) catch return;
-        self.server.sendDeferredResponse(self.conn_id, status, .json, duped);
-    }
-
-    pub fn text(self: *const DeferredResponse, status: u16, body: []const u8) void {
-        const duped = self.allocator.dupe(u8, body) catch return;
-        self.server.sendDeferredResponse(self.conn_id, status, .plain, duped);
-    }
-};
-
-/// 封装 ctx.deferred=true + DeferredResponse 创建 + push SubmitQueue。
-/// handler 里一行搞定：
-///   try deferToQueue(DbCtx, ctx, db_queue, .{ .sql = "..." }, execFn, doneFn);
 pub fn deferToQueue(
     comptime T: type,
     ctx: *Context,

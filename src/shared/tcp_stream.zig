@@ -97,7 +97,7 @@ pub const RingSharedClient = struct {
     }
 
     pub fn connectRaw(self: *RingSharedClient, ip: u32, port: u16) !void {
-        self.connectRawTimeout(ip, port, 5000); // default 5s
+        try self.connectRawTimeout(ip, port, 5000); // default 5s
     }
 
     pub fn connectRawTimeout(self: *RingSharedClient, ip: u32, port: u16, timeout_ms: u32) !void {
@@ -143,9 +143,9 @@ pub const RingSharedClient = struct {
         if (timeout_ms > 0) {
             const tsqe = self.rs.ringPtr().nop(0) catch return;
             tsqe.opcode = @enumFromInt(15); // IORING_OP_LINK_TIMEOUT
-            var ts = linux.__kernel_timespec{
-                .tv_sec = @intCast(timeout_ms / 1000),
-                .tv_nsec = @intCast((timeout_ms % 1000) * 1_000_000),
+            var ts = linux.timespec{
+                .sec = @intCast(timeout_ms / 1000),
+                .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
             };
             tsqe.addr = @intFromPtr(&ts);
             tsqe.len = 1;

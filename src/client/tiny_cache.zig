@@ -43,7 +43,7 @@ pub const TinyCache = struct {
             e.stream.deinit();
             e.pipe.deinit();
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     /// 借出一条空闲连接。返回 (stream, pipe) 或 null。

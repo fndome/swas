@@ -537,7 +537,7 @@ pub const Next = struct {
         alloc.destroy(w);
     }
 
-    const DeferredResponse = @import("../root.zig").DeferredResponse;
+    const DeferredResponse = @import("../deferred.zig").DeferredResponse;
     const Context = @import("../http/context.zig").Context;
     const AsyncServer = @import("../http/async_server.zig").AsyncServer;
 };

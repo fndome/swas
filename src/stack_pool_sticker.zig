@@ -106,6 +106,7 @@ pub fn ttlScan(
 
     for (live[start..end]) |idx| {
         const slot = &pool.slots[idx];
+        if (slot.line1.state == .processing) continue; // Worker 在飞, 不杀
         if (now_ms - slot.line2.last_active_ms >= timeout_ms) {
             out.append(allocator, idx) catch {};
         }
