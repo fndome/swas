@@ -273,7 +273,7 @@ pub const AsyncServer = struct {
 
         var params = std.mem.zeroes(linux.io_uring_params);
         params.flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN;
-        params.sq_entries = 256;
+        params.sq_entries = 512;
         params.cq_entries = 256;
         var ring = linux.IoUring.init_params(RING_ENTRIES, &params) catch blk: {
             break :blk try linux.IoUring.init(RING_ENTRIES, 0);
