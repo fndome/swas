@@ -87,6 +87,9 @@ pub const HttpClient = struct {
     req_pool_free: [REQUEST_POOL_SIZE]usize,
     req_pool_top: usize,
     req_pool_items: [REQUEST_POOL_SIZE]RequestContext,
+    stop: bool,
+
+    const REQUEST_TIMEOUT_US: usize = 5_000_000; // 5s
 
     pub fn init(allocator: Allocator, ring_b: *RingB) !*HttpClient {
         const self = try allocator.create(HttpClient);
@@ -101,12 +104,27 @@ pub const HttpClient = struct {
             .req_pool_free = freelist,
             .req_pool_top = REQUEST_POOL_SIZE,
             .req_pool_items = undefined,
+            .stop = false,
         };
         return self;
     }
 
     pub fn deinit(self: *HttpClient) void {
+        @atomicStore(bool, &self.stop, true, .release);
+        // 唤醒所有等待中的请求
+        for (self.req_pool_items[0..], 0..) |*ctx, i| {
+            if (self.isBorrowed(i)) {
+                @atomicStore(bool, &ctx.done, true, .release);
+            }
+        }
         self.allocator.destroy(self);
+    }
+
+    fn isBorrowed(self: *HttpClient, idx: usize) bool {
+        for (0..self.req_pool_top) |j| {
+            if (self.req_pool_free[j] == idx) return false;
+        }
+        return true;
     }
 
     fn acquireReq(self: *HttpClient) ?*RequestContext {
@@ -158,10 +176,11 @@ pub const HttpClient = struct {
     }
 
     pub fn request(self: *HttpClient, method: []const u8, url: []const u8, headers: ?[]const u8, body: ?[]const u8) !Response {
-        const headers_dup: ?[]u8 = if (headers) |h| self.allocator.dupe(u8, h) catch null else null;
+        var headers_dup: ?[]u8 = if (headers) |h| self.allocator.dupe(u8, h) catch null else null;
         errdefer if (headers_dup) |h| self.allocator.free(h);
-        const body_dup: ?[]u8 = if (body) |b| self.allocator.dupe(u8, b) catch {
+        var body_dup: ?[]u8 = if (body) |b| self.allocator.dupe(u8, b) catch {
             if (headers_dup) |h| self.allocator.free(h);
+            headers_dup = null;
             return error.OutOfMemory;
         } else null;
         errdefer if (body_dup) |b| self.allocator.free(b);
@@ -169,22 +188,38 @@ pub const HttpClient = struct {
         const ctx = self.acquireReq() orelse {
             if (headers_dup) |h| self.allocator.free(h);
             if (body_dup) |b| self.allocator.free(b);
+            headers_dup = null; body_dup = null;
             return error.PoolFull;
         };
+        errdefer self.releaseReq(ctx);
         ctx.method = method;
         ctx.url = url;
         ctx.headers = headers_dup;
         ctx.body = body_dup;
         ctx.done = false;
+        headers_dup = null; // 所有权已移交给 ctx
+        body_dup = null;
 
         try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
-        while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
-        while (!ctx.done) {
-            ctx.mutex.state.store(.unlocked, .release);
-            std.Thread.yield() catch {};
+        {
+            var waited: usize = 0;
+            const max_wait = REQUEST_TIMEOUT_US;
             while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
+            while (!ctx.done) {
+                ctx.mutex.state.store(.unlocked, .release);
+                std.Thread.yield() catch {};
+                waited += 1; // ~1µs per iteration
+                if (waited > max_wait or @atomicLoad(bool, &self.stop, .acquire)) {
+                    // Timeout: fiber 可能还在运行, 不能归还 slot (防 use-after-free)
+                    // fiber 自然完成后 notify 是 no-op (done 已 true)
+                    @atomicStore(bool, &ctx.done, true, .release);
+                    ctx.mutex.state.store(.unlocked, .release);
+                    return error.RequestTimeout;
+                }
+                while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
+            }
+            ctx.mutex.state.store(.unlocked, .release);
         }
-        ctx.mutex.state.store(.unlocked, .release);
         const resp = ctx.response;
         self.releaseReq(ctx);
         return resp;
@@ -298,12 +333,27 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             ctx.notify();
             return;
         };
-        stream.connectRaw(ip, parsed.port) catch {
+        // Connect with 5s io_uring timeout + 1 retry (non-timeout only)
+        var connect_ok = false;
+        var retries: u8 = 0;
+        while (retries < 2) : (retries += 1) {
+            stream.connectRawTimeout(ip, parsed.port, 5000) catch {
+                if (retries == 0) {
+                    stream.deinit();
+                    stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch break;
+                    continue;
+                }
+                break;
+            };
+            connect_ok = true;
+            break;
+        }
+        if (!connect_ok) {
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "connection failed");
             ctx.notify();
             return;
-        };
+        }
         var pipe = Pipe.init(ctx.allocator, stream) catch {
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "pipe init failed");
@@ -336,7 +386,12 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     stream.write(req) catch {
         ctx.cleanup();
         cache.evictPipe(active_pipe.?);
-        ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
+        // Timeout → target 关服, 不重试
+        if (stream.conn_errno == -125 or stream.conn_errno == -110) {
+            ctx.response = makeErrorResponse(ctx.allocator, 504, "upstream timeout");
+        } else {
+            ctx.response = makeErrorResponse(ctx.allocator, 502, "write failed");
+        }
         ctx.notify();
         return;
     };

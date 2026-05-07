@@ -24,6 +24,7 @@ pub const RingSharedClient = struct {
     callback_ctx: ?*anyopaque,
 
     read_buf: []u8,
+    conn_errno: i32 = 0, // connect CQE 错误码 (0=成功, -ETIMEDOUT=超时)
     connect_addr: linux.sockaddr = undefined,
     _connect_addrlen: u32 = 0,
 
@@ -96,6 +97,10 @@ pub const RingSharedClient = struct {
     }
 
     pub fn connectRaw(self: *RingSharedClient, ip: u32, port: u16) !void {
+        self.connectRawTimeout(ip, port, 5000); // default 5s
+    }
+
+    pub fn connectRawTimeout(self: *RingSharedClient, ip: u32, port: u16, timeout_ms: u32) !void {
         const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
         const fd: i32 = @intCast(raw_fd);
         if (fd < 0) return error.SocketFailed;
@@ -121,15 +126,31 @@ pub const RingSharedClient = struct {
         self.state = .connecting;
 
         _ = linux.connect(fd, @ptrCast(&addr_in), @sizeOf(linux.sockaddr.in));
-        try self.submitPollOut();
+        try self.submitPollOut(timeout_ms);
     }
 
-    fn submitPollOut(self: *RingSharedClient) !void {
+    fn submitPollOut(self: *RingSharedClient, timeout_ms: u32) !void {
         const sqe = self.rs.ringPtr().nop(self.id) catch return;
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
         sqe.addr = @intFromPtr(&self.connect_addr);
         sqe.off = self._connect_addrlen;
+        if (timeout_ms > 0) {
+            sqe.flags |= linux.IOSQE_IO_LINK; // 链接下一个 SQE (LINK_TIMEOUT)
+        }
+        _ = self.rs.ringPtr().submit() catch {};
+
+        if (timeout_ms > 0) {
+            const tsqe = self.rs.ringPtr().nop(0) catch return;
+            tsqe.opcode = @enumFromInt(15); // IORING_OP_LINK_TIMEOUT
+            var ts = linux.__kernel_timespec{
+                .tv_sec = @intCast(timeout_ms / 1000),
+                .tv_nsec = @intCast((timeout_ms % 1000) * 1_000_000),
+            };
+            tsqe.addr = @intFromPtr(&ts);
+            tsqe.len = 1;
+            _ = self.rs.ringPtr().submit() catch {};
+        }
     }
 
     pub fn write(self: *RingSharedClient, data: []const u8) !void {
@@ -176,9 +197,11 @@ pub const RingSharedClient = struct {
         switch (self.state) {
             .connecting => {
                 if (res < 0) {
+                    self.conn_errno = res;
                     self.onClose();
                     return;
                 }
+                self.conn_errno = 0;
                 var so_err: i32 = 0;
                 var so_len: linux.socklen_t = @sizeOf(i32);
                 const rc = linux.getsockopt(self.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&so_err), &so_len);
