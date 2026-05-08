@@ -171,26 +171,6 @@ pub fn computeWork(slot: *StackSlot) *ComputeWork {
     return &slot.line5.ws.compute;
 }
 
-/// ── 协议嗅探 ──────────────────────────────────────────
-///
-/// IO 线程轻量判定（1 cycle），不做解析。
-/// 0x01=JSON, 0x02=PB, 0x03=CUSTOM, 0x00=未知
-
-pub fn sniffProto(slot: *StackSlot, buf: []const u8) u8 {
-    if (buf.len == 0) return 0;
-    const tag = switch (buf[0]) {
-        '{', '[' => @as(u8, 1),   // JSON
-        0xFF => @as(u8, 3),       // CUSTOM marker
-        else => if (buf[0] & 0x80 == 0) @as(u8, 2) else @as(u8, 0), // PB varint
-    };
-    slot.line5.proto_tag = tag;
-    return tag;
-}
-
-pub fn getProtoTag(slot: *const StackSlot) u8 {
-    return slot.line5.proto_tag;
-}
-
 /// ── Worker Pool 零拷贝移交 ────────────────────────────
 /// 将大块 buffer 指针和 slot index 存入 workspace.compute，
 /// Worker 处理完后通过 index 找回 slot 写入 result_code。
