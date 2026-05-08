@@ -24,6 +24,20 @@ pub fn stop(self: *AsyncServer) void {
     self.should_stop = true;
 }
 
+var sigterm_server: ?*AsyncServer = null;
+
+pub fn installSigterm(self: *AsyncServer) void {
+    var act = std.mem.zeroes(linux.Sigaction);
+    act.handler = .{ .handler = sigtermHandler };
+    _ = linux.sigaction(linux.SIG.TERM, &act, null);
+    _ = linux.sigaction(linux.SIG.INT, &act, null);
+    sigterm_server = self;
+}
+
+fn sigtermHandler(_: linux.SIG) callconv(.c) void {
+    if (sigterm_server) |s| s.should_stop = true;
+}
+
 pub fn drainPendingResumes(self: *AsyncServer) void {
     while (Fiber.popResume()) |entry| {
         if (entry.slot_idx != 0 and entry.gen_id != 0) {

@@ -541,6 +541,10 @@ pub const AsyncServer = struct {
         event_loop.stop(self);
     }
 
+    pub fn installSigterm(self: *Self) void {
+        event_loop.installSigterm(self);
+    }
+
     pub fn run(self: *Self) !void {
         return event_loop.run(self);
     }

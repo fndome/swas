@@ -147,4 +147,16 @@ pub const BufferPool = struct {
             self.allocator.free(buf);
         }
     }
+
+    pub fn readPoolStats(self: *const BufferPool) ReadPoolStats {
+        return .{
+            .total = self.block_count,
+            .pending_replenish = self.replenish_queue.items.len,
+        };
+    }
+
+    pub const ReadPoolStats = struct {
+        total: usize,
+        pending_replenish: usize,
+    };
 };

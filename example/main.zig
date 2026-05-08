@@ -22,6 +22,8 @@ pub fn main() !void {
     try server.GET("/users", query_go.findUsers);
     try server.POST("/infer", llmr_submit.inferHandler);
 
+    server.installSigterm();
+
     std.debug.print("listening on :9090\n", .{});
     try server.run();
 }
