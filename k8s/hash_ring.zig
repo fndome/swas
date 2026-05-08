@@ -3,11 +3,15 @@ const Allocator = std.mem.Allocator;
 
 /// ── 一致性哈希环 (虚节点) ─────────────────────────────────
 ///
+/// 基于 sws 的 IM 应用在 K8s 中部署时，用此模块做用户→Pod 路由。
+/// im-router (Go) 和 im-ws (Zig) 各持一份同算法实现。
+/// 两层用同一套 FNV-1a + 150 虚节点 + 二分查找，扩容零漂移。
+///
 /// 每个物理节点占 150 个虚节点，分散在环上各处。
-/// 扩容时只有 ~25% 的 key 需要迁移（vs 取模 75%）。
+/// 扩容时只有 ~39% 的 key 需要迁移（vs 取模 75%）。
 ///
 /// 用法:
-///   var ring = try HashRing.init(alloc, local_id);
+///   var ring = HashRing.init(alloc, local_id);
 ///   try ring.addNode(0);
 ///   try ring.addNode(1);
 ///   const target = ring.route(user_id);  // → 目标节点 ID
@@ -145,7 +149,6 @@ fn sortRing(vnodes: []HashRing.VNode) void {
     std.sort.insertion(HashRing.VNode, vnodes, {}, HashRing.VNode.lessThan);
 }
 
-/// 生成虚节点种子字符串: "{node_id}-{vi}"
 fn hashVnodeSeed(node_id: u8, vi: u16) []u8 {
     const s = std.fmt.bufPrint(&seed_buf, "{d}-{d}", .{ node_id, vi }) catch unreachable;
     return seed_buf[0..s.len];

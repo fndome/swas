@@ -141,7 +141,6 @@ Lock held only during brief freelist operations, not during fiber execution.
 | 出站 HTTP 客户端 | `src/client/http_client.zig` + `ring.zig` |
 | DNS 解析 | `src/dns/resolver.zig` |
 | WebSocket 帧 | `src/ws/frame.zig` |
-| 一致性哈希环 | `src/hash_ring.zig` |
 | HTTP 路由 + Fiber 分发 | `src/http/http_routing.zig` |
 | TCP read/header 解析 | `src/http/tcp_read.zig` |
 | 连接管理 | `src/http/connection_mgr.zig` |

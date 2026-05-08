@@ -1,7 +1,12 @@
 const std = @import("std");
-const sws = @import("sws");
+const hash_ring = @import("hash_ring.zig");
+const HashRing = hash_ring.HashRing;
+const hash64 = hash_ring.hash64;
 
 /// ── im-ws 一致性哈希环初始化 ──────────────────────────────
+///
+/// 基于 sws 的 IM 应用，部署在 K8s StatefulSet + NodePort 模式。
+/// im-router (Go) 和 im-ws (Zig) 各持一份同算法 hash_ring 实现。
 ///
 /// 每个 im-ws Pod 启动时调用 initRing(local_id)。
 /// local_id 从 POD_NAME 环境变量解析: "im-ws-2" → 2。
@@ -28,8 +33,8 @@ fn parseLocalId() u8 {
         @panic("invalid POD_NAME ordinal");
 }
 
-pub fn initRing(alloc: std.mem.Allocator, node_count: u8) !sws.HashRing {
-    var ring = sws.HashRing.init(alloc, local_id);
+pub fn initRing(alloc: std.mem.Allocator, node_count: u8) !HashRing {
+    var ring = HashRing.init(alloc, local_id);
     var i: u8 = 0;
     while (i < node_count) : (i += 1) {
         try ring.addNode(i);
@@ -48,10 +53,10 @@ pub fn initRing(alloc: std.mem.Allocator, node_count: u8) !sws.HashRing {
 //   }
 //   sessions.add(conn_id, uid);
 
-pub fn isLocal(ring: *const sws.HashRing, user_id: u64) bool {
+pub fn isLocal(ring: *const HashRing, user_id: u64) bool {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, user_id, .little);
-    const key_hash: u32 = @truncate(sws.hash64(&buf));
+    const key_hash: u32 = @truncate(hash64(&buf));
     return ring.routeIsLocal(key_hash);
 }
 
@@ -64,9 +69,9 @@ pub fn isLocal(ring: *const sws.HashRing, user_id: u64) bool {
 //       forwardToPeer(target, frame);
 //   }
 
-pub fn routeToNode(ring: *const sws.HashRing, user_id: u64) u8 {
+pub fn routeToNode(ring: *const HashRing, user_id: u64) u8 {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, user_id, .little);
-    const key_hash: u32 = @truncate(sws.hash64(&buf));
+    const key_hash: u32 = @truncate(hash64(&buf));
     return ring.route(key_hash);
 }

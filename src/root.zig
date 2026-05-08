@@ -44,9 +44,6 @@ pub const RingTrait = @import("shared/fiber_shared.zig").RingTrait;
 pub const StackSlot = @import("stack_pool.zig").StackSlot;
 pub const LargeBufferPool = @import("shared/large_buffer_pool.zig").LargeBufferPool;
 pub const OVERSIZED_THRESHOLD = @import("stack_pool.zig").OVERSIZED_THRESHOLD;
-pub const HashRing = @import("hash_ring.zig").HashRing;
-pub const hash32 = @import("hash_ring.zig").hash32;
-pub const hash64 = @import("hash_ring.zig").hash64;
 
 pub const CustomTemplate = struct {
     pub fn createAndRegister(server: *AsyncServer) !*SubmitQueue {

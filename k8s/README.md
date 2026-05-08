@@ -180,10 +180,12 @@ NATS 仅用于**离线消息持久化**。在线消息走 HTTP 直连。
 ### 初始化
 
 ```zig
-const sws = @import("sws");
+const hash_ring = @import("hash_ring.zig");
+const HashRing = hash_ring.HashRing;
+const hash64 = hash_ring.hash64;
 // im-ws 启动时
-pub fn initRing(alloc: std.mem.Allocator, local_id: u8) !sws.HashRing {
-    var ring = sws.HashRing.init(alloc, local_id);
+pub fn initRing(alloc: std.mem.Allocator, local_id: u8) !HashRing {
+    var ring = HashRing.init(alloc, local_id);
     try ring.addNode(0);
     try ring.addNode(1);
     try ring.addNode(2);
@@ -196,8 +198,10 @@ pub fn initRing(alloc: std.mem.Allocator, local_id: u8) !sws.HashRing {
 im-router 已用 `hash % N` 做第一次路由，Pod 内做二次校验防 ring 漂移：
 
 ```zig
-fn wsOnConnect(ring: *sws.HashRing, local_id: u8, user_id: u64) bool {
-    if (ring.routeIsRemote(sws.hash64(std.mem.asBytes(&user_id)))) {
+fn wsOnConnect(ring: *HashRing, user_id: u64) bool {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, user_id, .little);
+    if (ring.routeIsRemote(@truncate(hash64(&buf)))) {
         return false; // ring 漂移，发 redirect
     }
     return true;
