@@ -59,7 +59,9 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         slot.line4.writev_in_flight = 1;
         const sqe = self.ring.writev(user_data, fd, iovs[0..count], 0) catch {
             slot.line4.writev_in_flight = 0;
-            self.pending_writes.append(self.allocator, conn_id) catch {};
+            self.pending_writes.append(self.allocator, conn_id) catch {
+                logErr("submitWrite: pend queue full, drop write for fd={d}", .{conn.fd});
+            };
             return;
         };
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -69,7 +71,9 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         slot.line4.writev_in_flight = 1;
         const sqe = self.ring.write(user_data, fd, to_send, 0) catch {
             slot.line4.writev_in_flight = 0;
-            self.pending_writes.append(self.allocator, conn_id) catch {};
+            self.pending_writes.append(self.allocator, conn_id) catch {
+                logErr("submitWrite: pend queue full, drop write for fd={d}", .{conn.fd});
+            };
             return;
         };
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;

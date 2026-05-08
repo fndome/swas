@@ -164,6 +164,9 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                     const bid = @as(u16, @truncate(cqe.flags >> 16));
                     self.buffer_pool.markReplenish(bid);
                 }
+                if (conn_ptr.pool_idx != 0xFFFFFFFF) {
+                    self.pool.slots[conn_ptr.pool_idx].line4.writev_in_flight = 0;
+                }
                 self.closeConn(conn_id, conn_ptr.fd);
             } else {
                 self.closeConn(conn_id, conn_ptr.fd);
@@ -193,8 +196,8 @@ fn retryPendingWrites(self: *AsyncServer) void {
         const conn_id = self.pending_writes.items[i];
         if (getConn(self, conn_id)) |conn| {
             if (conn.state == .writing or conn.state == .ws_writing) {
-                self.submitWrite(conn_id, conn) catch {
-                    break; // SQ still full, retry next iteration
+                self.submitWrite(conn_id, conn) catch |err| {
+                    if (err != error.WriteInFlight) break;
                 };
             }
         }
