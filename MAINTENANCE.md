@@ -1,5 +1,7 @@
 # MAINTENANCE.md — 维护指导
 
+> `async_server.zig` 已拆分为 12 个子模块 (2725→526 行)。模块速查见底部关键文件表。
+
 > 基于 8 轮深度分析 + 20 项修复的实战经验。简洁有效。
 
 ---
@@ -128,8 +130,8 @@ Lock held only during brief freelist operations, not during fiber execution.
 
 | 想了解 | 看这里 |
 |--------|--------|
-| IO 线程主循环 | `src/http/async_server.zig:run()` |
-| CQE 分发 | `src/http/async_server.zig:dispatchCqes()` |
+| IO 线程主循环 | `src/http/event_loop.zig:run()` |
+| CQE 分发 | `src/http/event_loop.zig:dispatchCqes()` |
 | 连接槽位布局 | `src/stack_pool.zig` (StackSlot + CacheLine1-5) |
 | Sticker 层（gen_id 校验） | `src/stack_pool_sticker.zig` |
 | Fiber 上下文切换 | `src/next/fiber.zig` |
@@ -139,4 +141,8 @@ Lock held only during brief freelist operations, not during fiber execution.
 | 出站 HTTP 客户端 | `src/client/http_client.zig` + `ring.zig` |
 | DNS 解析 | `src/dns/resolver.zig` |
 | WebSocket 帧 | `src/ws/frame.zig` |
+| 一致性哈希环 | `src/hash_ring.zig` |
+| HTTP 路由 + Fiber 分发 | `src/http/http_routing.zig` |
+| TCP read/header 解析 | `src/http/tcp_read.zig` |
+| 连接管理 | `src/http/connection_mgr.zig` |
 | 所有常量 | `src/constants.zig` |

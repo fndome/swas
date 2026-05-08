@@ -108,6 +108,32 @@ pub fn main() !void {
 
 ## Architecture
 
+### Source Layout (refactored)
+
+```
+src/http/
+├── async_server.zig   (526)  facade — init/deinit + public API forwarding
+├── event_loop.zig     (215)  run / dispatchCqes / drain* / TTL
+├── http_routing.zig   (310)  use / GET/POST / processBodyRequest + fiber dispatch
+├── http_response.zig  (163)  respond / respondJson / respondZeroCopy
+├── http_fiber.zig     (182)  HttpTaskCtx + httpTaskExec/Cleanup/Complete
+├── http_body.zig      (110)  submitBodyRead / onBodyChunk / onStreamRead
+├── ws_handler.zig     (381)  tryWsUpgrade / onWsFrame / sendWsFrame / write queue
+├── ws_fiber.zig       ( 50)  WsTaskCtx + wsTaskExec/Cleanup/Complete
+├── tcp_accept.zig     (114)  onAcceptComplete / allocFixedIndex
+├── tcp_read.zig       (367)  submitRead / onReadComplete (header parse + body route)
+├── tcp_write.zig      (128)  submitWrite / onWriteComplete
+├── connection_mgr.zig ( 82)  closeConn / getConn / nextUserData
+├── hook_system.zig    ( 48)  DeferredNode / addHook* / sendDeferredResponse
+├── connection.zig     ( 51)  Connection type
+├── context.zig        (118)  Context type
+├── types.zig          (  5)  Middleware / Handler types
+├── http_helpers.zig   ( 87)  request parsing utilities
+└── middleware_store.zig( 28)  MiddlewareStore
+```
+
+Extracted from a 2725-line God Object in 5 sessions. Each module ≤381 lines, single responsibility. `async_server.zig` is now 526 lines of pure struct definition + init/deinit + forwarding shell.
+
 ### Single IO thread + fiber
 
 The entire event loop runs on **one IO thread**. Handlers execute as **fibers** (user-space coroutines) on the same thread.
