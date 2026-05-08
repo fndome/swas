@@ -63,6 +63,7 @@ const ws_fiber = @import("ws_fiber.zig");
 const http_fiber = @import("http_fiber.zig");
 const http_body = @import("http_body.zig");
 const ws_handler = @import("ws_handler.zig");
+const event_loop = @import("event_loop.zig");
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const WsTaskCtx = ws_fiber.WsTaskCtx;
 const httpTaskExec = http_fiber.httpTaskExec;
@@ -71,10 +72,7 @@ const httpTaskComplete = http_fiber.httpTaskComplete;
 const wsTaskExec = ws_fiber.wsTaskExec;
 const wsTaskComplete = ws_fiber.wsTaskComplete;
 
-fn milliTimestamp(io: std.Io) i64 {
-    const ts = std.Io.Timestamp.now(io, .real);
-    return @as(i64, @intCast(@divTrunc(ts.nanoseconds, @as(i96, std.time.ns_per_ms))));
-}
+const milliTimestamp = event_loop.milliTimestamp;
 
 fn readResolvConfNameserver() !u32 {
     const path = "/etc/resolv.conf\x00";
@@ -584,7 +582,7 @@ pub const AsyncServer = struct {
         try self.rs.invoke.push(self.allocator, T, ctx, execFn);
     }
 
-    fn nextUserData(self: *Self) u64 {
+    pub fn nextUserData(self: *Self) u64 {
         const id = self.next_user_data;
         self.next_user_data +%= 1;
         var ud = id & ~ACCEPT_USER_DATA;
@@ -614,7 +612,7 @@ pub const AsyncServer = struct {
         };
     }
 
-    fn submitAccept(self: *Self) !void {
+    pub fn submitAccept(self: *Self) !void {
         var addr: linux.sockaddr = undefined;
         var addrlen: u32 = @sizeOf(linux.sockaddr);
         _ = try self.ring.accept(ACCEPT_USER_DATA, @intCast(self.listen_fd), &addr, &addrlen, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
@@ -701,11 +699,11 @@ pub const AsyncServer = struct {
         return http_body.submitBodyRead(self, conn, large_buf, slot);
     }
 
-    fn onBodyChunk(self: *Self, conn_id: u64, res: i32) void {
+    pub fn onBodyChunk(self: *Self, conn_id: u64, res: i32) void {
         http_body.onBodyChunk(self, conn_id, res);
     }
 
-    fn onStreamRead(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
+    pub fn onStreamRead(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
         http_body.onStreamRead(self, conn_id, res, user_data, cqe_flags);
     }
 
@@ -956,7 +954,7 @@ pub const AsyncServer = struct {
         }
     }
 
-    fn onAcceptComplete(self: *Self, res: i32, user_data: u64) void {
+    pub fn onAcceptComplete(self: *Self, res: i32, user_data: u64) void {
         _ = user_data;
         if (res < 0) {
             logErr("accept failed: {}", .{res});
@@ -1051,7 +1049,7 @@ pub const AsyncServer = struct {
         };
     }
 
-    fn onReadComplete(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
+    pub fn onReadComplete(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
         _ = user_data;
         if (res <= 0) {
             const conn = self.getConn(conn_id) orelse return;
@@ -1428,7 +1426,7 @@ pub const AsyncServer = struct {
         self.respond(conn, 404, "Not Found");
     }
 
-    fn onWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
+    pub fn onWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
         _ = user_data;
         if (res <= 0) {
             const conn = self.getConn(conn_id) orelse return;
@@ -1520,243 +1518,39 @@ pub const AsyncServer = struct {
     }
 
     pub fn stop(self: *Self) void {
-        self.should_stop = true;
-    }
-
-    fn drainPendingResumes(self: *Self) void {
-        while (Fiber.popResume()) |entry| {
-            // Ghost fiber defense: slot may have been released and reused.
-            // Verify gen_id matches before allowing resume.
-            if (entry.slot_idx != 0 and entry.gen_id != 0) {
-                const slot = &self.pool.slots[entry.slot_idx];
-                if (slot.line1.gen_id != entry.gen_id) continue;
-            }
-            Fiber.resumeYielded(entry.data);
-        }
+        event_loop.stop(self);
     }
 
     pub fn run(self: *Self) !void {
-        if (self.cfg.io_cpu) |cpu| {
-            var mask: linux.cpu_set_t = [_]usize{0} ** (linux.CPU_SETSIZE / @sizeOf(usize));
-            mask[0] = @as(usize, 1) << @as(u6, cpu);
-            var orig_mask: linux.cpu_set_t = undefined;
-            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &orig_mask);
-            self.worker_orig_cpu_mask = orig_mask[0];
-            self.io_pinned = if (linux.sched_setaffinity(0, &mask)) true else |_| false;
-        }
+        return event_loop.run(self);
+    }
 
-        try self.submitAccept();
-
-        var cqes: [MAX_CQES_BATCH]linux.io_uring_cqe = undefined;
-        var user_tasks_buf: [USER_TASK_BATCH]Item = undefined;
-        while (!self.should_stop) {
-            try self.buffer_pool.flushReplenish(&self.ring);
-
-            // Recover broken accept chain: if submitAccept previously failed,
-            // retry now that the ring may have drained.
-            if (self.accept_stalled) {
-                self.submitAccept() catch |err| {
-                    logErr("accept chain recovery failed: {s}", .{@errorName(err)});
-                    // accept_stalled stays true; retry next iteration
-                };
-            }
-
-            // 提交待处理的 SQE（可能来自上轮处理的 submitRead/submitWrite）
-            _ = self.ring.submit() catch |err| {
-                logErr("submit failed: {s}", .{@errorName(err)});
-            };
-
-            // 非阻塞收割
-            const n = try self.ring.copy_cqes(&cqes, 0);
-            if (n > 0) {
-                // 高速路径: 有事件就处理，不阻塞
-                self.dispatchCqes(&cqes, n);
-                self.drainPendingResumes();
-                // Next.go() 任务: 同一线程 fiber 执行
-                self.drainNextTasks();
-                // tick 钩子: 每轮必触发（倒计时、超时检测等）
-                self.drainTick();
-                // 出站 ring CQE 收割（HTTP client / NATS / MySQL 等）
-                if (self.fiber_shared) |fs| fs.tick();
-                // TTL 增量扫描（每轮 512 个活跃槽位）
-                self.ttlScanTick();
-                // 处理中可能产生新 SQE → 下一轮 submit 带出去
-                continue;
-            }
-
-            // 低速路径: 没事做，补 timeout/用户任务
-            if (self.timeout_user_data == 0) {
-                self.submitIdleTimeout() catch |err| {
-                    logErr("submitIdleTimeout failed: {s}", .{@errorName(err)});
-                };
-            }
-
-            {
-                const n_user = self.submit_registry.drain(&user_tasks_buf);
-                for (user_tasks_buf[0..n_user]) |*req| {
-                    self.executeNext(req);
-                }
-            }
-
-            // Next.go() 任务
-            self.drainNextTasks();
-            // tick 钩子: 每轮必触发
-            self.drainTick();
-            // 出站 ring CQE 收割
-            if (self.fiber_shared) |fs| fs.tick();
-            // TTL 增量扫描
-            self.ttlScanTick();
-
-            // 提交 + 阻塞等至少 1 个完成事件
-            _ = try self.ring.submit_and_wait(1);
-            const n2 = try self.ring.copy_cqes(&cqes, 0);
-            self.dispatchCqes(&cqes, n2);
-            self.drainPendingResumes();
-            if (self.fiber_shared) |fs| fs.tick();
-            self.ttlScanTick();
-        }
+    fn drainPendingResumes(self: *Self) void {
+        event_loop.drainPendingResumes(self);
     }
 
     fn dispatchCqes(self: *Self, cqes: []linux.io_uring_cqe, n: usize) void {
-        for (cqes[0..n], 0..) |cqe, i| {
-            const user_data = cqe.user_data;
-            const res = cqe.res;
-
-            if (self.timeout_user_data != 0 and user_data == self.timeout_user_data) {
-                self.timeout_user_data = 0;
-                self.ring.cqe_seen(&cqes[i]);
-                continue;
-            }
-
-            if (user_data == ACCEPT_USER_DATA) {
-                self.ring.cqe_seen(&cqes[i]);
-                self.onAcceptComplete(res, user_data);
-            } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
-                const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
-                const close_conn_id: u64 = if (sticker.getSlotChecked(&self.pool, raw_ud)) |slot|
-                    slot.line2.conn_id
-                else
-                    raw_ud;
-                self.closeConn(close_conn_id, 0);
-                self.ring.cqe_seen(&cqes[i]);
-            } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
-                defer self.ring.cqe_seen(&cqes[i]);
-                self.io_registry.dispatch(user_data, res);
-            } else {
-                const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
-                const conn_ptr = if (disp) |d| @as(*Connection, @ptrCast(@alignCast(d.conn))) else {
-                    if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
-                    }
-                    self.ring.cqe_seen(&cqes[i]);
-                    continue;
-                };
-                const conn_id = conn_ptr.id;
-                defer self.ring.cqe_seen(&cqes[i]);
-
-                if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
-                    self.onReadComplete(conn_id, res, user_data, cqe.flags);
-                } else if (conn_ptr.state == .receiving_body) {
-                    self.onBodyChunk(conn_id, res);
-                } else if (conn_ptr.state == .streaming) {
-                    self.onStreamRead(conn_id, res, user_data, cqe.flags);
-                } else if (conn_ptr.state == .writing) {
-                    self.onWriteComplete(conn_id, res, user_data);
-                } else if (conn_ptr.state == .ws_reading) {
-                    self.onWsFrame(conn_id, res, user_data, cqe.flags);
-                } else if (conn_ptr.state == .ws_writing) {
-                    self.onWsWriteComplete(conn_id, res, user_data);
-                } else if (conn_ptr.state == .closing) {
-                    // Recycle provided buffer for orphaned read CQE after fd close
-                    if (!conn_ptr.read_buf_recycled and cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
-                        conn_ptr.read_buf_recycled = true;
-                        const bid = @as(u16, @truncate(cqe.flags >> 16));
-                        self.buffer_pool.markReplenish(bid);
-                    }
-                    self.closeConn(conn_id, conn_ptr.fd);
-                } else {
-                    self.closeConn(conn_id, conn_ptr.fd);
-                }
-            }
-        }
+        event_loop.dispatchCqes(self, cqes, n);
     }
-
-    /// 每轮 IO 循环最多消费 64 个 Next 任务，防止深度优先生成的新任务
-    /// 挤占 ReadyQueue 后续就绪任务和 CQE 收割的公平性。
-    /// 剩余任务留给下一轮循环，确保 1M 连接的响应是匀速的（P99 稳定）。
-    const IO_QUANTUM: usize = 64;
 
     fn drainNextTasks(self: *Self) void {
-        if (self.next) |*n| {
-            var count: usize = 0;
-            while (count < IO_QUANTUM) : (count += 1) {
-                const item = n.ringbuffer.pop() orelse break;
-                self.executeNext(&item);
-            }
-        }
+        event_loop.drainNextTasks(self);
     }
 
-    /// 消费用户 Next，调 execute。
-fn executeNext(self: *Self, req: *const Item) void {
-    _ = self;
-    req.execute(req.ctx, req.on_complete);
-}
+    fn executeNext(req: *const Item) void {
+        event_loop.executeNext(req);
+    }
 
     fn submitIdleTimeout(self: *Self) !void {
-        const user_data = self.nextUserData();
-        _ = self.ring.timeout(user_data, &self.timeout_ts, 0, 0) catch {
-            self.timeout_user_data = 0;
-            return;
-        };
-        self.timeout_user_data = user_data;
+        return event_loop.submitIdleTimeout(self);
     }
 
     fn ttlScanTick(self: *Self) void {
-        const now = milliTimestamp(self.io);
-        self.ttl_scan_out.clearRetainingCapacity();
-        sticker.ttlScan(
-            &self.pool,
-            self.allocator,
-            now,
-            @intCast(self.cfg.idle_timeout_ms),
-            &self.ttl_scan_cursor,
-            512,
-            &self.ttl_scan_out,
-        );
-        for (self.ttl_scan_out.items) |idx| {
-            const slot = &self.pool.slots[idx];
-            self.closeConn(slot.line2.conn_id, slot.line1.fd);
-        }
+        event_loop.ttlScanTick(self);
     }
 
     fn checkIdleConnections(self: *Self) void {
-        const now = milliTimestamp(self.io);
-        var to_remove = std.ArrayList(u64).empty;
-        defer to_remove.deinit(self.allocator);
-
-        var it = self.connections.iterator();
-        while (it.next()) |entry| {
-            const conn = entry.value_ptr;
-            if (conn.state == .reading and conn.last_active_ms > 0) {
-                const idle_ms = now - conn.last_active_ms;
-                if (idle_ms >= @as(i64, @intCast(self.cfg.idle_timeout_ms))) {
-                    to_remove.append(self.allocator, entry.key_ptr.*) catch {};
-                }
-            }
-            if (conn.state == .writing and conn.write_start_ms > 0) {
-                const write_ms = now - conn.write_start_ms;
-                if (write_ms >= @as(i64, @intCast(self.cfg.write_timeout_ms))) {
-                    to_remove.append(self.allocator, entry.key_ptr.*) catch {};
-                }
-            }
-        }
-
-        for (to_remove.items) |conn_id| {
-            logErr("closing idle connection conn_id={d}", .{conn_id});
-            if (self.getConn(conn_id)) |conn| {
-                self.closeConn(conn_id, conn.fd);
-            }
-        }
+        event_loop.checkIdleConnections(self);
     }
 
     pub fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
@@ -1930,22 +1724,18 @@ fn executeNext(self: *Self, req: *const Item) void {
     }
 
     fn drainTick(self: *Self) void {
-        self.dns_resolver.tick();
-        self.rs.invoke.drain(self.allocator);
-        for (self.tick_hooks.items) |hook| {
-            hook(self);
-        }
+        event_loop.drainTick(self);
     }
 
     fn tryWsUpgrade(self: *Self, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
         ws_handler.tryWsUpgrade(self, conn_id, conn, path, data, bid);
     }
 
-    fn onWsFrame(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
+    pub fn onWsFrame(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
         ws_handler.onWsFrame(self, conn_id, res, user_data, cqe_flags);
     }
 
-    fn onWsWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
+    pub fn onWsWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
         ws_handler.onWsWriteComplete(self, conn_id, res, user_data);
     }
 
