@@ -203,36 +203,6 @@ pub fn ttlScanTick(self: *AsyncServer) void {
     }
 }
 
-pub fn checkIdleConnections(self: *AsyncServer) void {
-    const now = milliTimestamp(self.io);
-    var to_remove = std.ArrayList(u64).empty;
-    defer to_remove.deinit(self.allocator);
-
-    var it = self.connections.iterator();
-    while (it.next()) |entry| {
-        const conn = entry.value_ptr;
-        if (conn.state == .reading and conn.last_active_ms > 0) {
-            const idle_ms = now - conn.last_active_ms;
-            if (idle_ms >= @as(i64, @intCast(self.cfg.idle_timeout_ms))) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch {};
-            }
-        }
-        if (conn.state == .writing and conn.write_start_ms > 0) {
-            const write_ms = now - conn.write_start_ms;
-            if (write_ms >= @as(i64, @intCast(self.cfg.write_timeout_ms))) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch {};
-            }
-        }
-    }
-
-    for (to_remove.items) |conn_id| {
-        logErr("closing idle connection conn_id={d}", .{conn_id});
-        if (self.getConn(conn_id)) |conn| {
-            self.closeConn(conn_id, conn.fd);
-        }
-    }
-}
-
 pub fn drainTick(self: *AsyncServer) void {
     self.dns_resolver.tick();
     self.rs.invoke.drain(self.allocator);

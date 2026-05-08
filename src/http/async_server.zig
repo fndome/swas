@@ -564,10 +564,6 @@ pub const AsyncServer = struct {
         event_loop.ttlScanTick(self);
     }
 
-    fn checkIdleConnections(self: *Self) void {
-        event_loop.checkIdleConnections(self);
-    }
-
     pub fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
         return http_response.ensureWriteBuf(self, conn, min_size);
     }
