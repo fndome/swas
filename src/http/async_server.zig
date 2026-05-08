@@ -316,7 +316,7 @@ pub const AsyncServer = struct {
             .use_fixed_files = use_ff,
             .fixed_file_freelist = ff_freelist,
             .fixed_file_next = 0,
-            .ws_server = WsServer.init(allocator, wsSendFn),
+            .ws_server = WsServer.init(allocator, ws_handler.wsSendFn),
             .middlewares = mw_store,
             .respond_middlewares = respond_mw_store,
             .handlers = std.StringHashMap(Handler).init(allocator),
@@ -618,14 +618,6 @@ pub const AsyncServer = struct {
 
     pub fn onWsWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
         ws_handler.onWsWriteComplete(self, conn_id, res, user_data);
-    }
-
-    fn wsSendFn(ctx: *anyopaque, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
-        return ws_handler.wsSendFn(ctx, conn_id, opcode, payload);
-    }
-
-    pub fn sendWsFrame(self: *Self, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
-        return ws_handler.sendWsFrame(self, conn_id, opcode, payload);
     }
 
     fn submitWsWrite(self: *Self, conn_id: u64, conn: *Connection, opcode: Opcode, payload: []const u8) !void {
