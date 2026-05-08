@@ -1,0 +1,95 @@
+const std = @import("std");
+const linux = std.os.linux;
+
+const AsyncServer = @import("async_server.zig").AsyncServer;
+const Connection = @import("connection.zig").Connection;
+const sticker = @import("../stack_pool_sticker.zig");
+const packUserData = @import("../stack_pool.zig").packUserData;
+const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
+const ACCEPT_USER_DATA = @import("../constants.zig").ACCEPT_USER_DATA;
+
+pub fn getConn(self: *AsyncServer, conn_id: u64) ?*Connection {
+    if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
+        return @ptrCast(@alignCast(r.conn));
+    }
+    return null;
+}
+
+pub fn getConnToken(self: *AsyncServer, conn_id: u64) ?[]const u8 {
+    if (getConn(self, conn_id)) |conn| {
+        return conn.ws_token;
+    }
+    return null;
+}
+
+pub fn nextUserData(self: *AsyncServer) u64 {
+    const id = self.next_user_data;
+    self.next_user_data +%= 1;
+    var ud = id & ~ACCEPT_USER_DATA;
+    if (ud == 0) ud = 1;
+    return ud;
+}
+
+pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
+    self.ws_server.removeActive(conn_id);
+
+    if (getConn(self, conn_id)) |conn| {
+        if (conn.ws_token) |t| {
+            self.allocator.free(t);
+            conn.ws_token = null;
+        }
+
+        self.drainWsWriteQueue(conn);
+
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            const slot = &self.pool.slots[conn.pool_idx];
+            if (slot.line3.large_buf_ptr != 0) {
+                const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
+                self.large_pool.release(buf);
+                slot.line3.large_buf_ptr = 0;
+            }
+        }
+
+        if (!conn.write_bufs_freed) {
+            conn.write_bufs_freed = true;
+            if (conn.write_body) |b| {
+                self.allocator.free(b);
+                conn.write_body = null;
+            }
+            if (conn.response_buf) |buf| {
+                self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                conn.response_buf = null;
+            }
+        }
+
+        if (conn.state == .closing or fd == 0) {
+            sticker.connFree(&self.pool, &self.connections, conn_id);
+            return;
+        }
+
+        conn.state = .closing;
+    }
+
+    if (self.use_fixed_files) {
+        if (getConn(self, conn_id)) |conn| {
+            const idx = conn.fixed_index;
+            _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
+            self.freeFixedIndex(idx);
+        }
+    }
+
+    if (fd > 0) {
+        const close_conn = getConn(self, conn_id) orelse return;
+        const close_ud = packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG;
+        const sqe = self.ring.nop(close_ud) catch {
+            _ = linux.close(fd);
+            if (getConn(self, conn_id)) |c| {
+                c.state = .closing;
+            }
+            closeConn(self, conn_id, 0);
+            return;
+        };
+        sqe.opcode = @enumFromInt(19);
+        sqe.fd = fd;
+    }
+}

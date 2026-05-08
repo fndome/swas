@@ -65,6 +65,8 @@ const http_body = @import("http_body.zig");
 const ws_handler = @import("ws_handler.zig");
 const event_loop = @import("event_loop.zig");
 const http_response = @import("http_response.zig");
+const tcp_accept = @import("tcp_accept.zig");
+const connection_mgr = @import("connection_mgr.zig");
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const WsTaskCtx = ws_fiber.WsTaskCtx;
 const httpTaskExec = http_fiber.httpTaskExec;
@@ -584,33 +586,19 @@ pub const AsyncServer = struct {
     }
 
     pub fn nextUserData(self: *Self) u64 {
-        const id = self.next_user_data;
-        self.next_user_data +%= 1;
-        var ud = id & ~ACCEPT_USER_DATA;
-        if (ud == 0) ud = 1;
-        return ud;
+        return connection_mgr.nextUserData(self);
     }
 
     fn nextConnId(self: *Self) u64 {
-        const id = self.next_conn_id;
-        self.next_conn_id +%= 1;
-        return id;
+        return tcp_accept.nextConnId(self);
     }
 
     fn allocFixedIndex(self: *Self) !u16 {
-        if (self.fixed_file_freelist.pop()) |idx| return idx;
-        if (self.fixed_file_next < MAX_FIXED_FILES) {
-            const idx = self.fixed_file_next;
-            self.fixed_file_next += 1;
-            return idx;
-        }
-        return error.OutOfFixedFileSlots;
+        return tcp_accept.allocFixedIndex(self);
     }
 
-    fn freeFixedIndex(self: *Self, idx: u16) void {
-        self.fixed_file_freelist.append(self.allocator, idx) catch |err| {
-            logErr("freeFixedIndex: append failed for idx {d}: {s}", .{ idx, @errorName(err) });
-        };
+    pub fn freeFixedIndex(self: *Self, idx: u16) void {
+        tcp_accept.freeFixedIndex(self, idx);
     }
 
     pub fn submitAccept(self: *Self) !void {
@@ -885,169 +873,16 @@ pub const AsyncServer = struct {
         self.respond(conn, 404, "Not Found");
     }
 
-    /// 统一连接查找：先走 sticker (pool slot)，再走 hashmap 兜底。
     pub fn getConn(self: *Self, conn_id: u64) ?*Connection {
-        if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
-            return @ptrCast(@alignCast(r.conn));
-        }
-        return null;
+        return connection_mgr.getConn(self, conn_id);
     }
 
     pub fn closeConn(self: *Self, conn_id: u64, fd: i32) void {
-        self.ws_server.removeActive(conn_id);
-
-        if (self.getConn(conn_id)) |conn| {
-            if (conn.ws_token) |t| { self.allocator.free(t); conn.ws_token = null; }
-
-            // Drain any queued WebSocket frames
-            self.drainWsWriteQueue(conn);
-
-            // Release large_pool buffer if still held (TTL close while body read in-flight)
-            if (conn.pool_idx != 0xFFFFFFFF) {
-                const slot = &self.pool.slots[conn.pool_idx];
-                if (slot.line3.large_buf_ptr != 0) {
-                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-                    self.large_pool.release(buf);
-                    slot.line3.large_buf_ptr = 0;
-                }
-            }
-
-            // Always free write buffers — do NOT gate on read_buf_recycled.
-            // read_buf_recycled only protects the read (provided) buffer path.
-            if (!conn.write_bufs_freed) {
-                conn.write_bufs_freed = true;
-                if (conn.write_body) |b| { self.allocator.free(b); conn.write_body = null; }
-                if (conn.response_buf) |buf| {
-                    self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                    conn.response_buf = null;
-                }
-            }
-
-            if (conn.state == .closing or fd == 0) {
-                sticker.connFree(&self.pool, &self.connections, conn_id);
-                return;
-            }
-
-            conn.state = .closing;
-        }
-
-        if (self.use_fixed_files) {
-            if (self.getConn(conn_id)) |conn| {
-                const idx = conn.fixed_index;
-                _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
-                self.freeFixedIndex(idx);
-            }
-        }
-
-        if (fd > 0) {
-            const close_conn = self.getConn(conn_id) orelse return;
-            const close_ud = packUserData(close_conn.gen_id, close_conn.pool_idx) | CLOSE_USER_DATA_FLAG;
-            const sqe = self.ring.nop(close_ud) catch {
-                _ = linux.close(fd);
-                if (self.getConn(conn_id)) |c| {
-                    c.state = .closing;
-                }
-                self.closeConn(conn_id, 0);
-                return;
-            };
-            sqe.opcode = @enumFromInt(19);
-            sqe.fd = fd;
-        }
+        connection_mgr.closeConn(self, conn_id, fd);
     }
 
     pub fn onAcceptComplete(self: *Self, res: i32, user_data: u64) void {
-        _ = user_data;
-        if (res < 0) {
-            logErr("accept failed: {}", .{res});
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| {
-                logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-                return;
-            };
-            return;
-        }
-        const conn_fd: i32 = @intCast(res);
-        const conn_id = self.nextConnId();
-
-        const alloc = sticker.slotAlloc(&self.pool, conn_fd, &self.conn_gen_id, milliTimestamp(self.io));
-        if (alloc.idx == 0xFFFFFFFF) {
-            const rc = linux.close(conn_fd);
-            if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| logErr("failed to resubmit accept (pool full): {s}", .{@errorName(err)});
-            return;
-        }
-        const pool_idx = alloc.idx;
-        self.pool.slots[pool_idx].line2.conn_id = conn_id;
-
-        var conn = Connection{
-            .id = conn_id,
-            .fd = conn_fd,
-            .last_active_ms = milliTimestamp(self.io),
-            .pool_idx = pool_idx,
-            .gen_id = self.pool.slots[pool_idx].line1.gen_id,
-            .active_list_pos = self.pool.slots[pool_idx].line2.active_list_pos,
-        };
-
-        if (self.use_fixed_files) {
-            const idx = self.allocFixedIndex() catch {
-                const rc = linux.close(conn_fd);
-                if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-                sticker.slotFree(&self.pool, pool_idx);
-                self.accept_stalled = true;
-                self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-                return;
-            };
-            if (self.ring.register_files_update(idx, &[_]linux.fd_t{conn_fd})) {
-                conn.fixed_index = idx;
-            } else |_| {
-                self.freeFixedIndex(idx);
-                const rc = linux.close(conn_fd);
-                if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-                sticker.slotFree(&self.pool, pool_idx);
-                self.accept_stalled = true;
-                self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-                return;
-            }
-        }
-
-        self.connections.put(conn_id, conn) catch {
-            sticker.slotFree(&self.pool, pool_idx);
-            if (self.use_fixed_files) {
-                const idx = conn.fixed_index;
-                _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
-                self.freeFixedIndex(idx);
-            }
-            const rc = linux.close(conn_fd);
-            if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| logErr("failed to resubmit accept after put error: {s}", .{@errorName(err)});
-            return;
-        };
-        const conn_ptr = self.getConn(conn_id) orelse {
-            // Defensive: conn_fd was accepted but the map entry disappeared.
-            // Close it immediately to prevent a zombie FD leak.
-            const rc = linux.close(conn_fd);
-            if (rc != 0) logErr("close orphan conn_fd={d} failed: {d}", .{ conn_fd, rc });
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-            return;
-        };
-        self.submitRead(conn_id, conn_ptr) catch |err| {
-            if (err == error.RingFull) {
-                // ring full → read delayed to next tick
-            } else {
-                logErr("submitRead failed for fd {}: {s}", .{ conn_fd, @errorName(err) });
-                self.closeConn(conn_id, conn_fd);
-            }
-            self.accept_stalled = true;
-            self.submitAccept() catch |err2| logErr("failed to resubmit accept after read error: {s}", .{@errorName(err2)});
-            return;
-        };
-        self.submitAccept() catch |err| {
-            self.accept_stalled = true;
-            logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-        };
+        tcp_accept.onAcceptComplete(self, res, user_data);
     }
 
     pub fn onReadComplete(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
@@ -1503,10 +1338,7 @@ pub const AsyncServer = struct {
     }
 
     pub fn getConnToken(self: *Self, conn_id: u64) ?[]const u8 {
-        if (self.getConn(conn_id)) |conn| {
-            return conn.ws_token;
-        }
-        return null;
+        return connection_mgr.getConnToken(self, conn_id);
     }
 
     pub fn registerSubmitQueue(self: *Self, queue: *uring_submit.SubmitQueue) !void {
@@ -1646,7 +1478,7 @@ pub const AsyncServer = struct {
         ws_handler.flushWsWriteQueue(self, conn_id, conn);
     }
 
-    fn drainWsWriteQueue(self: *Self, conn: *Connection) void {
+    pub fn drainWsWriteQueue(self: *Self, conn: *Connection) void {
         ws_handler.drainWsWriteQueue(self, conn);
     }
 
