@@ -173,22 +173,32 @@ pub fn computeWork(slot: *StackSlot) *ComputeWork {
 
 /// ── 协议嗅探 ──────────────────────────────────────────
 ///
-/// IO 线程轻量判定（1 cycle），不做解析。
-/// 0x01=JSON, 0x02=PB, 0x03=CUSTOM, 0x00=未知
+/// proto_tag: 0=未知, 1=JSON, 2=PB, 3=CUSTOM
+///
+/// 用法：
+///   应用在 main 里按连接类型显式设置，不自作聪明嗅探。
+///   HTTP+JSON body → 第一字节是 P/G/D, 不是 {, 嗅探会错。
+///   WS upgrade 后 → 应用调 setProtoTag(slot, 1)。
+///   PB 接入后 → setProtoTag(slot, 2)。
+///   raw TCP (无 HTTP) → 可用 sniffProto 按首字节判定。
 
-pub fn sniffProto(slot: *StackSlot, buf: []const u8) u8 {
-    if (buf.len == 0) return 0;
-    const tag = switch (buf[0]) {
-        '{', '[' => @as(u8, 1),   // JSON
-        0xFF => @as(u8, 3),       // CUSTOM marker
-        else => if (buf[0] & 0x80 == 0) @as(u8, 2) else @as(u8, 0), // PB varint
-    };
+pub fn setProtoTag(slot: *StackSlot, tag: u8) void {
     slot.line5.proto_tag = tag;
-    return tag;
 }
 
 pub fn getProtoTag(slot: *const StackSlot) u8 {
     return slot.line5.proto_tag;
+}
+
+pub fn sniffProto(slot: *StackSlot, buf: []const u8) u8 {
+    if (buf.len == 0) return 0;
+    const tag = switch (buf[0]) {
+        '{', '[' => @as(u8, 1),
+        0xFF => @as(u8, 3),
+        else => if (buf[0] & 0x80 == 0) @as(u8, 2) else @as(u8, 0),
+    };
+    slot.line5.proto_tag = tag;
+    return tag;
 }
 
 /// ── Worker Pool 零拷贝移交 ────────────────────────────
