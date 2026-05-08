@@ -3,16 +3,11 @@
 # =============================================================================
 # 架构:
 #   Client → im-router (hash redirect) → NodePort → im-ws Pod → NATS
+#   Pod → Pod: DNS im-ws-{N}.im-ws-headless → getaddrinfo → Pod IP
 #
-# 负载均衡:
-#   不依赖 K8s Service 的随机分发 (iptables/IPVS)。
-#   用 im-router 做一致性哈希精确路由，确保同一用户始终落在同一 Pod。
-#   Pod 间通过 StatefulSet headless DNS 直连 (im-ws-{N}.im-ws-headless)。
-#
-# 为什么不用 K8s Service LB:
-#   随机分发会把同一个用户的消息打到不同 Pod，
-#   每个 Pod 都要维护一份 NATS consumer，消息量 ×N。
-#   hash-based redirect 避免了这个放大效应。
+# 部署约束: 每节点一个 im-ws Pod (podAntiAffinity)
+# 集群参数统一由 ConfigMap im-cluster-config 管理
+# 扩容: kubectl edit configmap im-cluster-config → 改 NODE_COUNT → 重启
 # =============================================================================
 
 ---
@@ -26,18 +21,22 @@ metadata:
 
 ---
 # =============================================================================
-# 2. im-ws StatefulSet —— WebSocket 网关 (sws/Zig)
+# 2. 共享 ConfigMap —— im-router 与 im-ws 统一参数来源
 # =============================================================================
-# 每个 Pod 是独立的 WebSocket 服务器:
-#   - 单 IO 线程 + 1 worker thread
-#   - StackPool 预分配 1M 槽位 (~400MB)
-#   - io_uring provided buffer 64MB
-#   - 通过 POD_NAME 环境变量获知自己是第几个 Pod (ordinal)
-#   - 启动时初始化一致性哈希环
-#
-# Pod 间通信:
-#   im-ws-0 通过 HTTP POST http://im-ws-1.im-ws-headless:9090/internal/msg
-#   直接向目标 Pod 推送消息。零中间代理，零广播。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: im-cluster-config
+  namespace: gw
+data:
+  NODE_COUNT: "3"                          # 集群节点数 = StatefulSet replicas
+  NODEPORT_BASE: "30001"                   # NodePort 起始端口
+  DOMAIN: "ws.example.com"                 # im-router 返回的域名
+  POD_DNS_FMT: "im-ws-{d}.im-ws-headless"  # Pod 间 DNS 模板
+
+---
+# =============================================================================
+# 3. im-ws StatefulSet —— WebSocket 网关 (sws/Zig)
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -52,9 +51,6 @@ spec:
   - port: 9090
     targetPort: 9090
     name: ws
-  - port: 9091
-    targetPort: 9091
-    name: internal
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -80,6 +76,13 @@ spec:
         app: im-ws
     spec:
       terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: im-ws
+            topologyKey: kubernetes.io/hostname
       securityContext:
         seccompProfile:
           type: Localhost
@@ -92,11 +95,10 @@ spec:
         - containerPort: 9090
           name: ws
           protocol: TCP
-        - containerPort: 9091
-          name: internal
-          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: im-cluster-config
         env:
-        # POD_NAME = im-ws-0, im-ws-1, ... → 解析 ordinal
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -112,8 +114,6 @@ spec:
             secretKeyRef:
               name: im-secrets
               key: jwt-secret
-        - name: NODE_COUNT
-          value: "3"
         readinessProbe:
           httpGet:
             path: /healthz
@@ -144,11 +144,7 @@ spec:
 
 ---
 # =============================================================================
-# 3. NodePort Services —— 每个 Pod 独立暴露
-# =============================================================================
-# im-router 做完 hash redirect 后，客户端直连对应 NodePort。
-# Cilium eBPF socket LB 处理 DNAT: NodeIP:30001 → im-ws-0 PodIP:9090。
-# NodePort 规则在所有 Node 上都生效，客户端连任意外网 Node IP 均可。
+# 4. NodePort Services —— 每个 Pod 独立暴露 (外部客户端入口)
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -197,15 +193,7 @@ spec:
 
 ---
 # =============================================================================
-# 4. im-router Deployment —— 建连时路由 (Go, ~80行)
-# =============================================================================
-# 不代理 WebSocket 帧流。仅处理建连时的 redirect 请求:
-#   GET /ws?uid=123456&token=xxx
-#   → HashRing.route(uid) → node → port
-#   → {"url":"ws://ws.example.com:30001/ws","node":0}
-#
-# 与 im-ws 使用完全一致的虚节点一致性哈希算法 (FNV-1a + 150 vnodes + 二分查找)。
-# 扩容时两层同步变化，不会出现路由漂移。
+# 5. im-router Deployment —— 建连时路由 (Go, ~80行)
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -230,13 +218,12 @@ spec:
         ports:
         - containerPort: 8080
           name: http
+        envFrom:
+        - configMapRef:
+            name: im-cluster-config
         env:
-        - name: BASE_PORT
-          value: "30001"
-        - name: DOMAIN
-          value: "ws.example.com"
-        - name: NODE_COUNT
-          value: "3"
+        - name: PORT
+          value: "8080"
         readinessProbe:
           httpGet:
             path: /healthz
@@ -267,11 +254,7 @@ spec:
 
 ---
 # =============================================================================
-# 5. NATS —— 离线消息持久化
-# =============================================================================
-# 仅用于离线消息存储，不用于路由/广播/在线消息投递。
-# im.msg.save → JetStream 持久化
-# 用户上线时从 NATS pull 离线消息，pull 后 delete。
+# 6. NATS —— 离线消息持久化
 # =============================================================================
 apiVersion: v1
 kind: Service
@@ -376,7 +359,7 @@ spec:
 
 ---
 # =============================================================================
-# 6. Secrets —— JWT 密钥
+# 7. Secrets —— JWT 密钥
 # =============================================================================
 apiVersion: v1
 kind: Secret
@@ -389,7 +372,7 @@ stringData:
 
 ---
 # =============================================================================
-# 7. DNS 配置说明 (手动操作)
+# 8. DNS 配置说明 (手动操作)
 # =============================================================================
 # 为 ws.example.com 配置 DNS A 记录 (多值, Round-Robin):
 #   ws.example.com → Node1-IP
@@ -397,9 +380,6 @@ stringData:
 #   ws.example.com → Node3-IP
 #
 # 端口区分 Pod:
-#   ws://ws.example.com:30001/ws → im-ws-0
-#   ws://ws.example.com:30002/ws → im-ws-1
-#   ws://ws.example.com:30003/ws → im-ws-2
-#
-# 不需要子域名 (ws0.example.com, ws1.example.com)。
-# 不需要负载均衡器 (ALB/NLB/Cilium eBPF socket LB 直接处理 NodePort)。
+#   wss://ws.example.com:30001/ws → im-ws-0
+#   wss://ws.example.com:30002/ws → im-ws-1
+#   wss://ws.example.com:30003/ws → im-ws-2
