@@ -1,0 +1,142 @@
+const std = @import("std");
+const linux = std.os.linux;
+
+const AsyncServer = @import("async_server.zig").AsyncServer;
+const Connection = @import("connection.zig").Connection;
+const packUserData = @import("../stack_pool.zig").packUserData;
+const logErr = @import("http_helpers.zig").logErr;
+const milliTimestamp = @import("event_loop.zig").milliTimestamp;
+
+const maxWriteRetries = @import("http_response.zig").maxWriteRetries;
+
+pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
+    _ = conn_id;
+    if (conn.write_offset == 0) {
+        conn.write_start_ms = milliTimestamp(self.io);
+        conn.write_retries = 0;
+    }
+    const user_data = packUserData(conn.gen_id, conn.pool_idx);
+    const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
+
+    const resp_buf = conn.response_buf orelse return;
+
+    const slot = &self.pool.slots[conn.pool_idx];
+
+    if (slot.line4.writev_in_flight != 0) {
+        logErr("submitWrite: writev already in-flight for fd={d}, skipping", .{conn.fd});
+        return error.WriteInFlight;
+    }
+
+    const iovs = &slot.line4.write_iovs;
+
+    const header_len = @min(conn.write_headers_len, resp_buf.len);
+
+    if (conn.write_body) |body| {
+        const total = header_len + body.len;
+        if (conn.write_offset >= total) return;
+
+        var count: usize = 0;
+
+        if (conn.write_offset < header_len) {
+            iovs[count] = .{
+                .base = resp_buf.ptr + conn.write_offset,
+                .len = header_len - conn.write_offset,
+            };
+            count += 1;
+        }
+
+        const body_start = if (conn.write_offset > header_len)
+            conn.write_offset - header_len
+        else
+            0;
+        if (body_start < body.len) {
+            iovs[count] = .{
+                .base = body.ptr + body_start,
+                .len = body.len - body_start,
+            };
+            count += 1;
+        }
+
+        slot.line4.writev_in_flight = 1;
+        const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
+        if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+    } else {
+        if (conn.write_offset >= header_len) return;
+        const to_send = resp_buf[conn.write_offset..header_len];
+        slot.line4.writev_in_flight = 1;
+        const sqe = try self.ring.write(user_data, fd, to_send, 0);
+        if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+}
+
+pub fn onWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64) void {
+    _ = user_data;
+    if (res <= 0) {
+        const conn = self.getConn(conn_id) orelse return;
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+        }
+        self.closeConn(conn_id, conn.fd);
+        return;
+    }
+    const conn = self.getConn(conn_id) orelse return;
+    conn.write_offset += @as(usize, @intCast(res));
+    const total = conn.write_headers_len + if (conn.write_body) |b| b.len else 0;
+    if (conn.write_offset >= total) {
+        conn.write_retries = 0;
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+        }
+        if (conn.write_body) |b| {
+            self.allocator.free(b);
+            conn.write_body = null;
+        }
+        conn.write_start_ms = 0;
+        if (conn.response_buf) |buf| {
+            self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+            conn.response_buf = null;
+        }
+        if (self.ws_server.getActive(conn_id) != null) {
+            conn.write_offset = 0;
+            conn.write_headers_len = 0;
+            conn.state = .ws_reading;
+            self.submitRead(conn_id, conn) catch |err| {
+                logErr("submitRead failed for WS upgrade fd {}: {s}", .{ conn.fd, @errorName(err) });
+                self.closeConn(conn_id, conn.fd);
+            };
+        } else if (conn.keep_alive) {
+            conn.write_start_ms = 0;
+            conn.state = .reading;
+            conn.read_len = 0;
+            conn.write_offset = 0;
+            conn.write_headers_len = 0;
+            conn.last_active_ms = milliTimestamp(self.io);
+            self.submitRead(conn_id, conn) catch |err| {
+                logErr("submitRead failed for keep-alive fd {}: {s}", .{ conn.fd, @errorName(err) });
+                self.closeConn(conn_id, conn.fd);
+            };
+        } else {
+            self.closeConn(conn_id, conn.fd);
+        }
+    } else {
+        conn.write_retries += 1;
+        if (conn.write_retries > maxWriteRetries(total)) {
+            logErr("write retries exceeded for fd {} ({} attempts, {} bytes total)", .{ conn.fd, conn.write_retries, total });
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+            }
+            self.closeConn(conn_id, conn.fd);
+            return;
+        }
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+        }
+        self.submitWrite(conn_id, conn) catch |err| {
+            logErr("submitWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+            }
+            self.closeConn(conn_id, conn.fd);
+        };
+    }
+}

@@ -2,7 +2,7 @@
 
 [中文文档](README_CN.md)
 
-A single-thread async HTTP + WebSocket server on Linux `io_uring`, in Zig 0.16.0.
+`io_uring` based Single Worker Server (HTTP + WebSocket) on Linux, in Zig 0.16.0.
 
 ```
 IO thread (io_uring Ring A + fiber):

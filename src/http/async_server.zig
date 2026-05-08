@@ -69,6 +69,8 @@ const tcp_accept = @import("tcp_accept.zig");
 const connection_mgr = @import("connection_mgr.zig");
 const http_routing = @import("http_routing.zig");
 const tcp_read = @import("tcp_read.zig");
+const tcp_write = @import("tcp_write.zig");
+const hook_system = @import("hook_system.zig");
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const WsTaskCtx = ws_fiber.WsTaskCtx;
 const httpTaskExec = http_fiber.httpTaskExec;
@@ -104,25 +106,8 @@ fn readResolvConfNameserver() !u32 {
     return error.NoNameserverFound;
 }
 
-const DeferredNode = struct {
-    server: *AsyncServer,
-    conn_id: u64,
-    status: u16,
-    ct: Context.ContentType,
-    body: []u8,
-};
-
-fn deferredRespond(allocator: Allocator, node: *DeferredNode) void {
-    const self = node.server;
-    for (self.deferred_hooks.items) |hook| {
-        hook(self, node);
-    }
-    if (self.getConn(node.conn_id)) |conn| {
-        self.respondZeroCopy(conn, node.status, node.ct, node.body, "");
-    } else {
-        allocator.free(node.body);
-    }
-}
+const DeferredNode = hook_system.DeferredNode;
+const deferredRespond = hook_system.deferredRespond;
 
 pub const AsyncServer = struct {
     allocator: Allocator,
@@ -485,14 +470,13 @@ pub const AsyncServer = struct {
         return http_routing.ws(self, path, handler);
     }
 
-    /// 跨线程安全投递回调到 IO 线程执行。execFn 负责释放 ctx 内部资源。
     pub fn invokeOnIoThread(
         self: *Self,
         comptime T: type,
         ctx: T,
         comptime execFn: fn (allocator: Allocator, ctx_ptr: *T) void,
     ) !void {
-        try self.rs.invoke.push(self.allocator, T, ctx, execFn);
+        return hook_system.invokeOnIoThread(self, T, ctx, execFn);
     }
 
     pub fn nextUserData(self: *Self) u64 {
@@ -523,69 +507,7 @@ pub const AsyncServer = struct {
     }
 
     pub fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
-        _ = conn_id;
-        if (conn.write_offset == 0) {
-            conn.write_start_ms = milliTimestamp(self.io);
-            conn.write_retries = 0;
-        }
-        const user_data = packUserData(conn.gen_id, conn.pool_idx);
-        const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
-
-        const resp_buf = conn.response_buf orelse return;
-
-        // iovecs from StackSlot (Line4) — kernel-safe during async write, never freed
-        const slot = &self.pool.slots[conn.pool_idx];
-
-        // Guard: refuse to overwrite iovecs while a write is still in-flight.
-        // IO thread only — no atomic needed.
-        if (slot.line4.writev_in_flight != 0) {
-            logErr("submitWrite: writev already in-flight for fd={d}, skipping", .{conn.fd});
-            return error.WriteInFlight;
-        }
-
-        const iovs = &slot.line4.write_iovs;
-
-        // Bounds-safe header end: clamp to actual buffer length to prevent
-        // index-out-of-bounds panic when write_offset drifts past the buffer.
-        const header_len = @min(conn.write_headers_len, resp_buf.len);
-
-        if (conn.write_body) |body| {
-            const total = header_len + body.len;
-            if (conn.write_offset >= total) return;
-
-            var count: usize = 0;
-
-            if (conn.write_offset < header_len) {
-                iovs[count] = .{
-                    .base = resp_buf.ptr + conn.write_offset,
-                    .len = header_len - conn.write_offset,
-                };
-                count += 1;
-            }
-
-            const body_start = if (conn.write_offset > header_len)
-                conn.write_offset - header_len
-            else
-                0;
-            if (body_start < body.len) {
-                iovs[count] = .{
-                    .base = body.ptr + body_start,
-                    .len = body.len - body_start,
-                };
-                count += 1;
-            }
-
-            // Mark in-flight before submitting to kernel
-            slot.line4.writev_in_flight = 1;
-            const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
-            if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
-        } else {
-            if (conn.write_offset >= header_len) return;
-            const to_send = resp_buf[conn.write_offset..header_len];
-            slot.line4.writev_in_flight = 1;
-            const sqe = try self.ring.write(user_data, fd, to_send, 0);
-            if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
-        }
+        return tcp_write.submitWrite(self, conn_id, conn);
     }
 
     pub fn submitBodyRead(self: *Self, conn: *Connection, large_buf: []u8, slot: *StackSlot) !void {
@@ -621,78 +543,7 @@ pub const AsyncServer = struct {
     }
 
     pub fn onWriteComplete(self: *Self, conn_id: u64, res: i32, user_data: u64) void {
-        _ = user_data;
-        if (res <= 0) {
-            const conn = self.getConn(conn_id) orelse return;
-            // Clear in-flight flag on error before closing
-            if (conn.pool_idx != 0xFFFFFFFF) {
-                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
-            }
-            self.closeConn(conn_id, conn.fd);
-            return;
-        }
-        const conn = self.getConn(conn_id) orelse return;
-        conn.write_offset += @as(usize, @intCast(res));
-        const total = conn.write_headers_len + if (conn.write_body) |b| b.len else 0;
-        if (conn.write_offset >= total) {
-            conn.write_retries = 0;
-            // Write complete: clear in-flight flag before recycling buffers
-            if (conn.pool_idx != 0xFFFFFFFF) {
-                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
-            }
-            if (conn.write_body) |b| {
-                self.allocator.free(b);
-                conn.write_body = null;
-            }
-            conn.write_start_ms = 0;
-            if (conn.response_buf) |buf| {
-                self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                conn.response_buf = null;
-            }
-            if (self.ws_server.getActive(conn_id) != null) {
-                conn.write_offset = 0;
-                conn.write_headers_len = 0;
-                conn.state = .ws_reading;
-                self.submitRead(conn_id, conn) catch |err| {
-                    logErr("submitRead failed for WS upgrade fd {}: {s}", .{ conn.fd, @errorName(err) });
-                    self.closeConn(conn_id, conn.fd);
-                };
-            } else if (conn.keep_alive) {
-                conn.write_start_ms = 0;
-                conn.state = .reading;
-                conn.read_len = 0;
-                conn.write_offset = 0;
-                conn.write_headers_len = 0;
-                conn.last_active_ms = milliTimestamp(self.io);
-                self.submitRead(conn_id, conn) catch |err| {
-                    logErr("submitRead failed for keep-alive fd {}: {s}", .{ conn.fd, @errorName(err) });
-                    self.closeConn(conn_id, conn.fd);
-                };
-            } else {
-                self.closeConn(conn_id, conn.fd);
-            }
-        } else {
-            conn.write_retries += 1;
-            if (conn.write_retries > maxWriteRetries(total)) {
-                logErr("write retries exceeded for fd {} ({} attempts, {} bytes total)", .{ conn.fd, conn.write_retries, total });
-                if (conn.pool_idx != 0xFFFFFFFF) {
-                    self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
-                }
-                self.closeConn(conn_id, conn.fd);
-                return;
-            }
-            // Clear in-flight flag before retrying; submitWrite will re-set it
-            if (conn.pool_idx != 0xFFFFFFFF) {
-                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
-            }
-            self.submitWrite(conn_id, conn) catch |err| {
-                logErr("submitWrite failed for fd {}: {s}", .{ conn.fd, @errorName(err) });
-                if (conn.pool_idx != 0xFFFFFFFF) {
-                    self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
-                }
-                self.closeConn(conn_id, conn.fd);
-            };
-        }
+        tcp_write.onWriteComplete(self, conn_id, res, user_data);
     }
 
     pub fn getConnToken(self: *Self, conn_id: u64) ?[]const u8 {
@@ -769,39 +620,15 @@ pub const AsyncServer = struct {
     }
 
     pub fn sendDeferredResponse(self: *Self, conn_id: u64, status: u16, ct: Context.ContentType, body: []u8) void {
-        const node = DeferredNode{
-            .server = self,
-            .conn_id = conn_id,
-            .status = status,
-            .ct = ct,
-            .body = body,
-        };
-        self.invokeOnIoThread(DeferredNode, node, deferredRespond) catch {
-            self.allocator.free(body);
-        };
+        hook_system.sendDeferredResponse(self, conn_id, status, ct, body);
     }
 
-    /// 添加 deferred 钩子，在 deferred 响应发送前调用。
-    ///
-    /// 钩子按注册顺序在 IO 线程执行，可安全访问 IO 线程独占数据。
-    ///
-    /// **重要提醒：**
-    /// - 钩子**不应 panic**（用 log 记录错误）
-    /// - **不应保存** `node` 指针引用 — 钩子返回后 node 被销毁
-    /// - **不应释放** `node.body` — body 由框架负责释放
-    pub fn addHookDeferred(self: *Self, hook: *const fn (self: *Self, node: *DeferredNode) void) !void {
-        try self.deferred_hooks.append(self.allocator, hook);
+    pub fn addHookDeferred(self: *Self, hook: *const fn (self_: *Self, node: *DeferredNode) void) !void {
+        return hook_system.addHookDeferred(self, hook);
     }
 
-    /// 添加 tick 钩子，每轮 IO 循环必触发（有/无 deferred 节点都跑）。
-    ///
-    /// 可用于倒计时、超时检测、定期广播等独立于 HTTP 请求的周期性逻辑。
-    ///
-    /// **重要提醒：**
-    /// - 钩子**不应 panic**（用 log 记录错误）
-    /// - tick 钩子在 IO 线程执行，应保持轻量（不做重计算，可用 Next.submit 卸货）
-    pub fn addHookTick(self: *Self, hook: *const fn (self: *Self) void) !void {
-        try self.tick_hooks.append(self.allocator, hook);
+    pub fn addHookTick(self: *Self, hook: *const fn (self_: *Self) void) !void {
+        return hook_system.addHookTick(self, hook);
     }
 
     fn drainTick(self: *Self) void {
