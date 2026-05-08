@@ -142,9 +142,10 @@ NATS 仅用于**离线消息持久化**。在线消息走 HTTP 直连。
 ### 初始化
 
 ```zig
+const sws = @import("sws");
 // im-ws 启动时
-fn initRing(alloc: Allocator, local_id: u8) !HashRing {
-    var ring = HashRing.init(alloc, local_id);
+pub fn initRing(alloc: std.mem.Allocator, local_id: u8) !sws.HashRing {
+    var ring = sws.HashRing.init(alloc, local_id);
     try ring.addNode(0);
     try ring.addNode(1);
     try ring.addNode(2);
@@ -157,14 +158,11 @@ fn initRing(alloc: Allocator, local_id: u8) !HashRing {
 im-router 已用 `hash % N` 做第一次路由，Pod 内做二次校验防 ring 漂移：
 
 ```zig
-fn wsHandler(conn_id: u64, frame: *const Frame, ctx: *anyopaque) void {
-    const node = ring.route(hash64(user_id));
-    if (node != local_id) {
-        // 极罕见: ring 刚变，用户被 hash 到了邻居
-        sendWsFrame(conn_id, .text, redirect_json);
-        return;
+fn wsOnConnect(ring: *sws.HashRing, local_id: u8, user_id: u64) bool {
+    if (ring.routeIsRemote(sws.hash64(std.mem.asBytes(&user_id)))) {
+        return false; // ring 漂移，发 redirect
     }
-    sessions.add(conn_id, user_id);
+    return true;
 }
 ```
 
