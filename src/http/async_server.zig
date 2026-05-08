@@ -160,6 +160,9 @@ pub const AsyncServer = struct {
     /// 标记共享栈是否有活跃的 fiber（保护 yield 场景下的栈安全）
     shared_fiber_active: bool = false,
 
+    /// SQ ring 溢出时暂存的写请求 (1M broadcast 场景的背压机制)
+    pending_writes: std.ArrayList(u64),
+
     worker_orig_cpu_mask: usize = 0,
 
     const Self = @This();
@@ -329,6 +332,7 @@ pub const AsyncServer = struct {
             .shared_fiber_stack = shared_stack,
             .dns_resolver = dns_resolver,
             .ttl_scan_out = std.ArrayList(u32).initCapacity(allocator, 512) catch @panic("OOM"),
+            .pending_writes = std.ArrayList(u64).empty,
         };
         server.rs = RingShared.bind(&server.ring, &server.io_registry);
 
@@ -398,6 +402,7 @@ pub const AsyncServer = struct {
         self.ws_ctx_pool.deinit(self.allocator);
         self.allocator.free(self.shared_fiber_stack);
         self.dns_resolver.deinit();
+        self.pending_writes.deinit(self.allocator);
         self.cfg = undefined;
     }
 

@@ -51,14 +51,21 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
         }
 
         if (!conn.write_bufs_freed) {
-            conn.write_bufs_freed = true;
-            if (conn.write_body) |b| {
-                self.allocator.free(b);
-                conn.write_body = null;
-            }
-            if (conn.response_buf) |buf| {
-                self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
-                conn.response_buf = null;
+            const write_inflight = if (conn.pool_idx != 0xFFFFFFFF)
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight != 0
+            else
+                false;
+
+            if (!write_inflight) {
+                conn.write_bufs_freed = true;
+                if (conn.write_body) |b| {
+                    self.allocator.free(b);
+                    conn.write_body = null;
+                }
+                if (conn.response_buf) |buf| {
+                    self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
+                    conn.response_buf = null;
+                }
             }
         }
 

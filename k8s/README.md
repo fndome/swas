@@ -201,8 +201,11 @@ affinity:
 
 | | sws (Zig) | Rust (tokio) | Erlang/Elixir |
 |---|---|---|---|
-| 单 Pod 连接数 | 1M | ~50K | ~100K |
-| 内存/连接 | 384B | ~16KB | ~2KB |
+| 单 Pod 连接数 | 1M | ~100K | ~100K |
+| 内存 / 连接 | 384B | ~1.5KB (极限调优) / 16KB (默认) | ~2KB |
+| 1M 连接需内存 | **600MB** | **1.5GB** (极限) / **16GB** (默认) | **2GB** |
 | 启动时间 | ~5ms | ~500ms | ~2s |
 | io_uring | 原生 | tokio-uring | 无 |
 | 二进制 | ~500KB | ~5MB | ~20MB |
+
+> tokio 的 1.5KB/conn 需要大幅调优 stack size + 规避 per-task 堆分配, 实际生产通常不敢压这么低。

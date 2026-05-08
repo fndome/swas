@@ -57,6 +57,8 @@ pub fn run(self: *AsyncServer) !void {
             };
         }
 
+        retryPendingWrites(self);
+
         _ = self.ring.submit() catch |err| {
             logErr("submit failed: {s}", .{@errorName(err)});
         };
@@ -66,6 +68,14 @@ pub fn run(self: *AsyncServer) !void {
             dispatchCqes(self, &cqes, n);
             drainPendingResumes(self);
             drainNextTasks(self);
+
+            // flush SQEs queued by dispatch/drain before next wait cycle.
+            // without this, fiber-generated writes (submitWrite) sit in
+            // userspace until the next loop, adding ~1 RTT of latency.
+            _ = self.ring.submit() catch |err| {
+                logErr("submit-after-drain failed: {s}", .{@errorName(err)});
+            };
+
             drainTick(self);
             if (self.fiber_shared) |fs| fs.tick();
             ttlScanTick(self);
@@ -175,6 +185,27 @@ pub fn drainNextTasks(self: *AsyncServer) void {
 pub fn executeNext(req: *const Item) void {
     req.execute(req.ctx, req.on_complete);
 }
+
+fn retryPendingWrites(self: *AsyncServer) void {
+    const count = self.pending_writes.items.len;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const conn_id = self.pending_writes.items[i];
+        if (getConn(self, conn_id)) |conn| {
+            if (conn.state == .writing or conn.state == .ws_writing) {
+                self.submitWrite(conn_id, conn) catch {
+                    break; // SQ still full, retry next iteration
+                };
+            }
+        }
+    }
+    if (i > 0) {
+        std.mem.copyForwards(u64, self.pending_writes.items, self.pending_writes.items[i..]);
+    }
+    self.pending_writes.shrinkRetainingCapacity(self.pending_writes.items.len - i);
+}
+
+const getConn = @import("connection_mgr.zig").getConn;
 
 pub fn submitIdleTimeout(self: *AsyncServer) !void {
     const user_data = self.nextUserData();

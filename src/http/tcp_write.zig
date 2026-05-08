@@ -10,7 +10,6 @@ const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 const maxWriteRetries = @import("http_response.zig").maxWriteRetries;
 
 pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
-    _ = conn_id;
     if (conn.write_offset == 0) {
         conn.write_start_ms = milliTimestamp(self.io);
         conn.write_retries = 0;
@@ -58,13 +57,21 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         }
 
         slot.line4.writev_in_flight = 1;
-        const sqe = try self.ring.writev(user_data, fd, iovs[0..count], 0);
+        const sqe = self.ring.writev(user_data, fd, iovs[0..count], 0) catch {
+            slot.line4.writev_in_flight = 0;
+            self.pending_writes.append(self.allocator, conn_id) catch {};
+            return;
+        };
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
     } else {
         if (conn.write_offset >= header_len) return;
         const to_send = resp_buf[conn.write_offset..header_len];
         slot.line4.writev_in_flight = 1;
-        const sqe = try self.ring.write(user_data, fd, to_send, 0);
+        const sqe = self.ring.write(user_data, fd, to_send, 0) catch {
+            slot.line4.writev_in_flight = 0;
+            self.pending_writes.append(self.allocator, conn_id) catch {};
+            return;
+        };
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
     }
 }
