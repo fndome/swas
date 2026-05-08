@@ -51,6 +51,11 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
         }
 
         if (!conn.write_bufs_freed) {
+            // guard: if a write SQE is still in-flight in the kernel,
+            // defer freeing write_body/response_buf to the CQE handler.
+            // freeing now would risk kernel use-after-free on the buffer.
+            // onWriteComplete / onWsWriteComplete + the .closing CQE path
+            // handle the deferred cleanup.
             const write_inflight = if (conn.pool_idx != 0xFFFFFFFF)
                 self.pool.slots[conn.pool_idx].line4.writev_in_flight != 0
             else

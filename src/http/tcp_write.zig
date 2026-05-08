@@ -57,6 +57,8 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         }
 
         slot.line4.writev_in_flight = 1;
+        // SQ full — push to pending queue so the event loop retries
+        // next iteration rather than dropping the write
         const sqe = self.ring.writev(user_data, fd, iovs[0..count], 0) catch {
             slot.line4.writev_in_flight = 0;
             self.pending_writes.append(self.allocator, conn_id) catch {
@@ -69,6 +71,7 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         if (conn.write_offset >= header_len) return;
         const to_send = resp_buf[conn.write_offset..header_len];
         slot.line4.writev_in_flight = 1;
+        // SQ full — push to pending queue for retry next iteration
         const sqe = self.ring.write(user_data, fd, to_send, 0) catch {
             slot.line4.writev_in_flight = 0;
             self.pending_writes.append(self.allocator, conn_id) catch {

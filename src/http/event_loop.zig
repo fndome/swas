@@ -57,6 +57,7 @@ pub fn run(self: *AsyncServer) !void {
             };
         }
 
+        // retry writes deferred by SQ backpressure (1M broadcast scenario)
         retryPendingWrites(self);
 
         _ = self.ring.submit() catch |err| {
@@ -69,9 +70,8 @@ pub fn run(self: *AsyncServer) !void {
             drainPendingResumes(self);
             drainNextTasks(self);
 
-            // flush SQEs queued by dispatch/drain before next wait cycle.
-            // without this, fiber-generated writes (submitWrite) sit in
-            // userspace until the next loop, adding ~1 RTT of latency.
+            // submit SQEs queued by dispatch/drain so they hit the ring
+            // now, not next iteration. avoids +1 RTT on fiber writes.
             _ = self.ring.submit() catch |err| {
                 logErr("submit-after-drain failed: {s}", .{@errorName(err)});
             };
@@ -164,6 +164,9 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                     const bid = @as(u16, @truncate(cqe.flags >> 16));
                     self.buffer_pool.markReplenish(bid);
                 }
+                // write just completed — clear flag so closeConn can
+                // enter its normal buffer-freeing path (see closeConn
+                // writev_in_flight guard).
                 if (conn_ptr.pool_idx != 0xFFFFFFFF) {
                     self.pool.slots[conn_ptr.pool_idx].line4.writev_in_flight = 0;
                 }
@@ -189,6 +192,13 @@ pub fn executeNext(req: *const Item) void {
     req.execute(req.ctx, req.on_complete);
 }
 
+/// SQ backpressure: retry writes that were deferred when ring.write()
+/// failed (SQ full). called before each ring.submit() to drain the
+/// pending queue into the fresh SQ ring.
+///
+/// WriteInFlight is not a retryable error — the write is already queued,
+/// so just skip it. other errors mean the SQ is still full; break and
+/// retry next iteration.
 fn retryPendingWrites(self: *AsyncServer) void {
     const count = self.pending_writes.items.len;
     var i: usize = 0;

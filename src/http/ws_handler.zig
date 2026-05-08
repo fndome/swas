@@ -275,6 +275,7 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
     _ = user_data;
     if (res <= 0) {
         const conn = self.getConn(conn_id) orelse return;
+        // CQE means kernel is done — clear flag for closeConn & retry
         if (conn.pool_idx != 0xFFFFFFFF) {
             self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
         }
@@ -285,6 +286,8 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
     conn.write_offset += @as(usize, @intCast(res));
     if (conn.write_offset >= conn.write_headers_len) {
         conn.write_retries = 0;
+        // write completed — clear flag before flushWsWriteQueue may call
+        // submitWrite again (which checks writev_in_flight)
         if (conn.pool_idx != 0xFFFFFFFF) {
             self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
         }
@@ -309,6 +312,7 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
             self.closeConn(conn_id, conn.fd);
             return;
         }
+        // clear flag so submitWrite retry can set it again
         if (conn.pool_idx != 0xFFFFFFFF) {
             self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
         }
