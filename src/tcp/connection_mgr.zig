@@ -1,8 +1,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const AsyncServer = @import("async_server.zig").AsyncServer;
-const Connection = @import("connection.zig").Connection;
+const AsyncServer = @import("../http/async_server.zig").AsyncServer;
+const Connection = @import("../http/connection.zig").Connection;
 const sticker = @import("../stack_pool_sticker.zig");
 const packUserData = @import("../stack_pool.zig").packUserData;
 const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;

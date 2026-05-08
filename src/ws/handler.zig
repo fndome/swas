@@ -2,17 +2,17 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
-const AsyncServer = @import("async_server.zig").AsyncServer;
-const Connection = @import("connection.zig").Connection;
-const WsWriteQueueNode = @import("connection.zig").WsWriteQueueNode;
-const WsHandler = @import("../ws/server.zig").WsHandler;
-const Opcode = @import("../ws/types.zig").Opcode;
-const ws_frame = @import("../ws/frame.zig");
-const ws_upgrade = @import("../ws/upgrade.zig");
-const helpers = @import("http_helpers.zig");
+const AsyncServer = @import("../http/async_server.zig").AsyncServer;
+const Connection = @import("../http/connection.zig").Connection;
+const WsWriteQueueNode = @import("../http/connection.zig").WsWriteQueueNode;
+const WsHandler = @import("server.zig").WsHandler;
+const Opcode = @import("types.zig").Opcode;
+const ws_frame = @import("frame.zig");
+const ws_upgrade = @import("upgrade.zig");
+const helpers = @import("../http/http_helpers.zig");
 const sticker = @import("../stack_pool_sticker.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
-const ws_fiber = @import("ws_fiber.zig");
+const ws_fiber = @import("fiber.zig");
 const logErr = helpers.logErr;
 
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {

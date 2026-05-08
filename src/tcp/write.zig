@@ -1,13 +1,13 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const AsyncServer = @import("async_server.zig").AsyncServer;
-const Connection = @import("connection.zig").Connection;
+const AsyncServer = @import("../http/async_server.zig").AsyncServer;
+const Connection = @import("../http/connection.zig").Connection;
 const packUserData = @import("../stack_pool.zig").packUserData;
-const logErr = @import("http_helpers.zig").logErr;
-const milliTimestamp = @import("event_loop.zig").milliTimestamp;
+const logErr = @import("../http/http_helpers.zig").logErr;
+const milliTimestamp = @import("../http/event_loop.zig").milliTimestamp;
 
-const maxWriteRetries = @import("http_response.zig").maxWriteRetries;
+const maxWriteRetries = @import("../http/http_response.zig").maxWriteRetries;
 
 pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
     _ = conn_id;

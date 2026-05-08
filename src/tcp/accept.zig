@@ -1,11 +1,11 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const AsyncServer = @import("async_server.zig").AsyncServer;
-const Connection = @import("connection.zig").Connection;
+const AsyncServer = @import("../http/async_server.zig").AsyncServer;
+const Connection = @import("../http/connection.zig").Connection;
 const sticker = @import("../stack_pool_sticker.zig");
-const logErr = @import("http_helpers.zig").logErr;
-const milliTimestamp = @import("event_loop.zig").milliTimestamp;
+const logErr = @import("../http/http_helpers.zig").logErr;
+const milliTimestamp = @import("../http/event_loop.zig").milliTimestamp;
 
 const MAX_FIXED_FILES = @import("../constants.zig").MAX_FIXED_FILES;
 const ACCEPT_USER_DATA = @import("../constants.zig").ACCEPT_USER_DATA;
