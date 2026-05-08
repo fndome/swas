@@ -17,7 +17,6 @@ const hash64 = hash_ring.hash64;
 ///   2. 消息路由: hash(to_uid) → 目标 Pod ordinal，
 ///      判断目标在本地还是远程。
 ///   3. 扩容减震: 虚节点环迁移率 ~25%，vs 取模 75%。
-
 pub var local_id: u8 = 0;
 
 pub fn loadLocalId() void {
