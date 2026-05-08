@@ -5,15 +5,34 @@ const Allocator = std.mem.Allocator;
 const RingShared = @import("../shared/ring_shared.zig").RingShared;
 const Fiber = @import("../next/fiber.zig").Fiber;
 
-const c = @cImport({
-    @cInclude("ares.h");
-});
-
 pub const DNS_FD_MAGIC: u64 = 0xCADE_0000_0000_0000;
+
+// c-ares externs (replace @cImport for Zig 0.16.0 compatibility)
+const fd_set = extern struct {
+    fds_bits: [32]u32 align(8),
+};
+
+const struct_hostent = extern struct {
+    h_name: [*:0]u8,
+    h_aliases: [*:0][*:0]u8,
+    h_addrtype: i32,
+    h_length: i32,
+    h_addr_list: [*:0][*:0]u8,
+};
+
+const ARES_SUCCESS: i32 = 0;
+const AF_INET: i32 = 2;
+
+extern fn ares_init(channel: *?*anyopaque) i32;
+extern fn ares_destroy(channel: ?*anyopaque) void;
+extern fn ares_gethostbyname(channel: ?*anyopaque, name: [*:0]const u8, family: i32, callback: ?*anyopaque, arg: ?*anyopaque) void;
+extern fn ares_process_fd(channel: ?*anyopaque, read_fd: i32, write_fd: i32) void;
+extern fn ares_fds(channel: ?*anyopaque, read_fds: *fd_set, write_fds: *fd_set) i32;
+extern fn ares_strerror(status: i32) [*:0]const u8;
 
 pub const CaresDns = struct {
     allocator: Allocator,
-    channel: c.ares_channel,
+    channel: ?*anyopaque,
     rs: RingShared,
     result_ip: u32 = 0,
     result_ok: bool = false,
@@ -21,10 +40,10 @@ pub const CaresDns = struct {
     registered_fds: [8]i32 = [_]i32{-1} ** 8,
 
     pub fn init(allocator: Allocator, rs: RingShared) !CaresDns {
-        var channel: c.ares_channel = undefined;
-        const status = c.ares_init(&channel);
-        if (status != c.ARES_SUCCESS) {
-            std.log.err("c-ares init failed: {s}", .{c.ares_strerror(status)});
+        var channel: ?*anyopaque = null;
+        const status = ares_init(&channel);
+        if (status != ARES_SUCCESS) {
+            std.log.err("c-ares init failed: {s}", .{std.mem.span(ares_strerror(status))});
             return error.DnsInitFailed;
         }
         return CaresDns{
@@ -36,7 +55,7 @@ pub const CaresDns = struct {
 
     pub fn deinit(self: *CaresDns) void {
         self.removeFds();
-        c.ares_destroy(self.channel);
+        ares_destroy(self.channel);
     }
 
     pub fn resolve(self: *CaresDns, hostname: []const u8) !u32 {
@@ -48,18 +67,16 @@ pub const CaresDns = struct {
         self.result_ok = false;
         self.result_ip = 0;
 
-        c.ares_gethostbyname(
+        ares_gethostbyname(
             self.channel,
             @ptrCast(host_z.ptr),
-            c.AF_INET,
-            dnsCallback,
+            AF_INET,
+            @ptrCast(&dnsCallback),
             self,
         );
 
         self.registerFds();
-
         Fiber.dnsYield(&self.slot);
-
         self.removeFds();
 
         if (!self.result_ok) return error.DomainNotFound;
@@ -67,42 +84,42 @@ pub const CaresDns = struct {
     }
 
     pub fn tick(self: *CaresDns) void {
-        c.ares_process_fd(self.channel, c.ARES_SOCKET_BAD, c.ARES_SOCKET_BAD);
+        ares_process_fd(self.channel, -1, -1);
     }
 
     pub fn handleCqe(self: *CaresDns, ud: u64, res: i32) void {
         _ = res;
-        const fd: c_int = @intCast(ud - DNS_FD_MAGIC);
-        c.ares_process_fd(self.channel, fd, c.ARES_SOCKET_BAD);
+        const fd: i32 = @intCast(ud - DNS_FD_MAGIC);
+        ares_process_fd(self.channel, fd, -1);
         self.registerFds();
     }
 
     fn registerFds(self: *CaresDns) void {
         self.removeFds();
-        var fds: c.fd_set = undefined;
-        var wfds: c.fd_set = undefined;
-        _ = @memset(@as([*]u8, @ptrCast(&fds))[0..@sizeOf(c.fd_set)], 0);
-        _ = @memset(@as([*]u8, @ptrCast(&wfds))[0..@sizeOf(c.fd_set)], 0);
+        var fds: fd_set = undefined;
+        var wfds: fd_set = undefined;
+        _ = @memset(@as([*]u8, @ptrCast(&fds))[0..@sizeOf(fd_set)], 0);
+        _ = @memset(@as([*]u8, @ptrCast(&wfds))[0..@sizeOf(fd_set)], 0);
 
-        const nfds = c.ares_fds(self.channel, &fds, &wfds);
+        const nfds = ares_fds(self.channel, &fds, &wfds);
         var registered_count: usize = 0;
-        var fd: c_int = 0;
+        var fd: i32 = 0;
         while (fd < nfds and registered_count < self.registered_fds.len) : (fd += 1) {
-            const need_read = c.FD_ISSET(fd, &fds) != 0;
-            const need_write = c.FD_ISSET(fd, &wfds) != 0;
-            if (!need_read and !need_write) continue;
+            const bit = @as(u32, 1) << @as(u5, @truncate(@as(u32, @bitCast(fd))));
+            const read_set = (fds.fds_bits[@intCast(@as(u32, @bitCast(fd)) / 32)] & bit) != 0;
+            const write_set = (wfds.fds_bits[@intCast(@as(u32, @bitCast(fd)) / 32)] & bit) != 0;
+            if (!read_set and !write_set) continue;
 
             const user_data = DNS_FD_MAGIC + @as(u64, @intCast(fd));
             const sqe = self.rs.ring.nop(user_data) catch continue;
-            sqe.opcode = @enumFromInt(6); // IORING_OP_POLL_ADD
+            sqe.opcode = @enumFromInt(6);
             sqe.fd = @intCast(fd);
-            sqe.poll_events = if (need_write) @as(u32, 5) else @as(u32, 1);
+            sqe.poll_events = if (write_set) @as(u32, 5) else @as(u32, 1);
             sqe.len = 1;
 
             self.registered_fds[registered_count] = @intCast(fd);
             registered_count += 1;
         }
-        // Ensure SQEs are visible to kernel before caller yields or returns
         _ = self.rs.ring.submit() catch {};
     }
 
@@ -112,33 +129,32 @@ pub const CaresDns = struct {
                 const fd = fd_ptr.*;
                 const user_data = DNS_FD_MAGIC + @as(u64, @intCast(fd));
                 const sqe = self.rs.ring.nop(user_data) catch continue;
-                sqe.opcode = @enumFromInt(7); // IORING_OP_POLL_REMOVE
+                sqe.opcode = @enumFromInt(7);
                 sqe.fd = @intCast(fd);
                 fd_ptr.* = -1;
             }
         }
         _ = self.rs.ring.submit() catch {};
     }
-
-    fn dnsCallback(
-        arg: ?*anyopaque,
-        status: c_int,
-        timeouts: c_int,
-        hostent: ?*c.struct_hostent,
-    ) callconv(.c) void {
-        _ = timeouts;
-        const self: *CaresDns = @ptrCast(@alignCast(arg));
-        if (status != c.ARES_SUCCESS or hostent == null) {
-            self.result_ok = false;
-            return;
-        }
-        const h = hostent.?;
-        if (h.h_addr_list == null or h.h_addr_list.?[0] == null) {
-            self.result_ok = false;
-            return;
-        }
-        const addr: *align(1) const u32 = @ptrCast(h.h_addr_list.?[0]);
-        self.result_ip = addr.*;
-        self.result_ok = true;
-    }
 };
+
+fn dnsCallback(
+    arg: ?*anyopaque,
+    status: i32,
+    timeouts: i32,
+    hostent: ?*struct_hostent,
+) callconv(.c) void {
+    _ = timeouts;
+    const self: *CaresDns = @ptrCast(@alignCast(arg));
+    if (status != ARES_SUCCESS or hostent == null) {
+        self.result_ok = false;
+        return;
+    }
+    const h = hostent.?;
+    if (h.h_addr_list[0]) |first_addr| {
+        self.result_ip = @as(*align(1) const u32, @ptrCast(first_addr)).*;
+        self.result_ok = true;
+    } else {
+        self.result_ok = false;
+    }
+}
