@@ -6,6 +6,27 @@
 
 ---
 
+## 四层系统架构
+
+sws 不是一个简单的 WebSocket 服务器。任何改动都会跨越四层系统，必须推演每一层的影响：
+
+| 层 | 核心概念 | 关键文件 | 典型问题 |
+|---|---------|---------|---------|
+| **io_uring 协议层** | SQ/CQE 时序、零拷贝、固定文件 | `event_loop.zig`, `tcp_write.zig` | SQ 满丢弃写, CQE 到但 buffer 已释放, `writev_in_flight` 跨层的 flag 生命周期 |
+| **Fiber 调度层** | 共享栈、yield/resume、CAS 链表移交 | `next/fiber.zig`, `next/next.zig` | IO 线程 fiber 与 Worker 线程的栈隔离, `drainPendingResumes` 时序, `submitAndWait` vs `submit` 选择 |
+| **连接状态机** | 7 状态 × 3 CQE 类型 = 21 转移 | `event_loop.zig:dispatchCqes()`, `connection_mgr.zig` | `.closing` 状态 CQE 处理器不清理 `writev_in_flight` 导致泄漏, 状态转换中 buffer 所有权转移 |
+| **K8s 路由层** | 虚节点环、headless DNS、NodePort 亲和 | `k8s/pod_hash.zig`, `k8s/router_hash.zig` | Go/Zig 两端 `trunc32` 不一致导致路由漂移, DNS 模板与 ConfigMap 不同步 |
+
+**四层不是四个模块，是四套同时生效的约束。** 改 `closeConn` 的释放逻辑，要推演：
+1. io_uring 层 — 内核是否还在读这个 buffer？
+2. Fiber 层 — 是否有 fiber 的 completed callback 引用了它？
+3. 状态机 — `.closing` CQE handler 是否会在 flag 归零前调用 closeConn？
+4. K8s 层 — 跨 Pod 转发是否有 buffer 被引用？
+
+实际案例：closeConn 的 `writev_in_flight` 守卫涉及了前三层的完整推演（详见最近两个 commit 的 commit message）。
+
+---
+
 ## 维护流程（每次至少 3 轮）
 
 ```
