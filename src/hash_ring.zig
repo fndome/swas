@@ -146,13 +146,12 @@ fn sortRing(vnodes: []HashRing.VNode) void {
 }
 
 /// 生成虚节点种子字符串: "{node_id}-{vi}"
-fn hashVnodeSeed(node_id: u8, vi: u16) [64]u8 {
-    var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}-{d}", .{ node_id, vi }) catch unreachable;
-    var seed: [64]u8 = [_]u8{0} ** 64;
-    @memcpy(seed[0..s.len], s);
-    return seed;
+fn hashVnodeSeed(node_id: u8, vi: u16) []u8 {
+    const s = std.fmt.bufPrint(&seed_buf, "{d}-{d}", .{ node_id, vi }) catch unreachable;
+    return seed_buf[0..s.len];
 }
+
+var seed_buf: [64]u8 = undefined;
 
 /// FNV-1a 32-bit hash
 pub fn hash32(data: []const u8) u32 {
