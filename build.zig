@@ -83,6 +83,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(example_exe);
 
+    const im_bench_exe = b.addExecutable(.{
+        .name = "im-bench",
+        .root_module = b.createModule(.{
+            .link_libc = true,
+            .root_source_file = b.path("example/im_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sws", .module = mod }},
+        }),
+    });
+    b.installArtifact(im_bench_exe);
+
+    const run_im_bench = b.step("run-im-bench", "Run IM-scenario WebSocket benchmark");
+    const run_im_bench_cmd = b.addRunArtifact(im_bench_exe);
+    run_im_bench_cmd.step.dependOn(b.getInstallStep());
+    run_im_bench.dependOn(&run_im_bench_cmd.step);
+
     const run_example = b.step("run-example", "Run example/main.zig");
     const run_example_cmd = b.addRunArtifact(example_exe);
     run_example_cmd.step.dependOn(b.getInstallStep());
