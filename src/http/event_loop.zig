@@ -27,11 +27,11 @@ pub fn stop(self: *AsyncServer) void {
 var sigterm_server: ?*AsyncServer = null;
 
 pub fn installSigterm(self: *AsyncServer) void {
+    sigterm_server = self;
     var act = std.mem.zeroes(linux.Sigaction);
     act.handler = .{ .handler = sigtermHandler };
     _ = linux.sigaction(linux.SIG.TERM, &act, null);
     _ = linux.sigaction(linux.SIG.INT, &act, null);
-    sigterm_server = self;
 }
 
 fn sigtermHandler(_: linux.SIG) callconv(.c) void {
