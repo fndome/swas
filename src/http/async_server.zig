@@ -8,25 +8,17 @@ const constants = @import("../constants.zig");
 const RING_ENTRIES = constants.RING_ENTRIES;
 const TASK_QUEUE_SIZE = constants.TASK_QUEUE_SIZE;
 const BUFFER_POOL_SIZE = constants.BUFFER_POOL_SIZE;
-const MAX_CQES_BATCH = constants.MAX_CQES_BATCH;
 const ACCEPT_USER_DATA = constants.ACCEPT_USER_DATA;
-const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_DATA_FLAG;
 const IORegistry = @import("../shared/io_registry.zig").IORegistry;
 
-const USER_TASK_BATCH = constants.USER_TASK_BATCH;
 const MAX_FIXED_FILES = constants.MAX_FIXED_FILES;
-const BUFFER_SIZE = constants.BUFFER_SIZE;
-const READ_BUF_GROUP_ID = constants.READ_BUF_GROUP_ID;
 
-const PathRule = @import("../antpath.zig").PathRule;
 const uring_submit = @import("../next/queue.zig");
 const SubmitQueueRegistry = uring_submit.SubmitQueueRegistry;
 const Item = uring_submit.Item;
 const Next = @import("../next/next.zig").Next;
-const Fiber = @import("../next/fiber.zig").Fiber;
 
 const Connection = @import("connection.zig").Connection;
-const WsWriteQueueNode = @import("connection.zig").WsWriteQueueNode;
 const Context = @import("context.zig").Context;
 const Middleware = @import("types.zig").Middleware;
 const Handler = @import("types.zig").Handler;
@@ -34,31 +26,19 @@ const MiddlewareStore = @import("middleware_store.zig").MiddlewareStore;
 const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 
 const helpers = @import("http_helpers.zig");
-const getMethodFromRequest = helpers.getMethodFromRequest;
-const getPathFromRequest = helpers.getPathFromRequest;
-const isKeepAliveConnection = helpers.isKeepAliveConnection;
 const parseIpv4 = helpers.parseIpv4;
-const logErr = helpers.logErr;
 
 const WsServer = @import("../ws/server.zig").WsServer;
 const WsHandler = @import("../ws/server.zig").WsHandler;
 const Opcode = @import("../ws/types.zig").Opcode;
-const ws_frame = @import("../ws/frame.zig");
-const ws_upgrade = @import("../ws/upgrade.zig");
 
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 const RingShared = @import("../shared/ring_shared.zig").RingShared;
 const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
 const StackPool = @import("../stack_pool.zig").StackPool;
 const StackSlot = @import("../stack_pool.zig").StackSlot;
-const packUserData = @import("../stack_pool.zig").packUserData;
-const unpackGenId = @import("../stack_pool.zig").unpackGenId;
-const unpackIdx = @import("../stack_pool.zig").unpackIdx;
-const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
-const sticker = @import("../stack_pool_sticker.zig");
-const StreamHandle = @import("../next/chunk_stream.zig").StreamHandle;
-const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const LargeBufferPool = @import("../shared/large_buffer_pool.zig").LargeBufferPool;
+const sticker = @import("../stack_pool_sticker.zig");
 const ws_fiber = @import("ws_fiber.zig");
 const http_fiber = @import("http_fiber.zig");
 const http_body = @import("http_body.zig");
@@ -73,13 +53,9 @@ const tcp_write = @import("tcp_write.zig");
 const hook_system = @import("hook_system.zig");
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const WsTaskCtx = ws_fiber.WsTaskCtx;
-const httpTaskExec = http_fiber.httpTaskExec;
-const httpTaskExecWrapperWithOwnership = http_fiber.httpTaskExecWrapperWithOwnership;
-const httpTaskComplete = http_fiber.httpTaskComplete;
-const wsTaskExec = ws_fiber.wsTaskExec;
-const wsTaskComplete = ws_fiber.wsTaskComplete;
 
-const milliTimestamp = event_loop.milliTimestamp;
+const DeferredNode = hook_system.DeferredNode;
+const deferredRespond = hook_system.deferredRespond;
 
 fn readResolvConfNameserver() !u32 {
     const path = "/etc/resolv.conf\x00";
@@ -105,9 +81,6 @@ fn readResolvConfNameserver() !u32 {
     }
     return error.NoNameserverFound;
 }
-
-const DeferredNode = hook_system.DeferredNode;
-const deferredRespond = hook_system.deferredRespond;
 
 pub const AsyncServer = struct {
     allocator: Allocator,
