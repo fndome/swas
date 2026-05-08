@@ -1,18 +1,72 @@
 # =============================================================================
-# IM-WS 服务部署 —— 基于 sws 的 WebSocket 服务
+# IM-WS 完整部署 —— 基于 sws 的 WebSocket IM 服务
 # =============================================================================
-# IO 线程绑核: 在应用配置中设置 io_cpu=3（CPU 3，第 4 个 CPU）
-# Worker 线程不绑核，host 上几十个 worker 由内核调度器自动分配空闲核
+# 架构:
+#   Client → im-router (hash redirect) → NodePort → im-ws Pod → NATS
+#
+# 负载均衡:
+#   不依赖 K8s Service 的随机分发 (iptables/IPVS)。
+#   用 im-router 做 hash(uid) % N 精确路由，确保同一用户始终落在同一 Pod。
+#   Pod 间通过 StatefulSet headless DNS 直连 (im-ws-{N}.im-ws-headless)。
+#
+# 为什么不用 K8s Service LB:
+#   随机分发会把同一个用户的消息打到不同 Pod，
+#   每个 Pod 都要维护一份 NATS consumer，消息量 ×N。
+#   hash-based redirect 避免了这个放大效应。
 # =============================================================================
+
+---
+# =============================================================================
+# 1. Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gw
+
+---
+# =============================================================================
+# 2. im-ws StatefulSet —— WebSocket 网关 (sws/Zig)
+# =============================================================================
+# 每个 Pod 是独立的 WebSocket 服务器:
+#   - 单 IO 线程 + 1 worker thread
+#   - StackPool 预分配 1M 槽位 (~400MB)
+#   - io_uring provided buffer 64MB
+#   - 通过 POD_NAME 环境变量获知自己是第几个 Pod (ordinal)
+#   - 启动时初始化一致性哈希环
+#
+# Pod 间通信:
+#   im-ws-0 通过 HTTP POST http://im-ws-1.im-ws-headless:9090/internal/msg
+#   直接向目标 Pod 推送消息。零中间代理，零广播。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-ws-headless
+  namespace: gw
+spec:
+  clusterIP: None
+  selector:
+    app: im-ws
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: ws
+  - port: 9091
+    targetPort: 9091
+    name: internal
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: im-ws
   namespace: gw
   labels:
     app: im-ws
 spec:
-  replicas: 2
+  serviceName: im-ws-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       app: im-ws
@@ -21,53 +75,315 @@ spec:
       labels:
         app: im-ws
     spec:
+      terminationGracePeriodSeconds: 30
       securityContext:
         seccompProfile:
           type: Localhost
           localhostProfile: seccomp/io_uring-allowed.json
       containers:
-        - name: im-ws
-          image: im-ws:latest
-          imagePullPolicy: IfNotPresent
-          # IO 线程绑核由应用配置 io_cpu=3 控制
-          # Worker 线程由内核调度，不绑核
-          ports:
-            - containerPort: 9091
-              name: ws
-              protocol: TCP
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 1000
-            runAsGroup: 1000
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 9091
-            initialDelaySeconds: 2
-            periodSeconds: 5
-          resources:
-            requests:
-              cpu: 1
-              memory: 64Mi
-            limits:
-              cpu: 1
-              memory: 128Mi
+      - name: im-ws
+        image: registry.example.com/im-ws:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9090
+          name: ws
+          protocol: TCP
+        - containerPort: 9091
+          name: internal
+          protocol: TCP
+        env:
+        # POD_NAME = im-ws-0, im-ws-1, ... → 解析 ordinal
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NATS_URL
+          value: "nats://nats-svc.gw:4222"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: im-secrets
+              key: jwt-secret
+        - name: NODE_COUNT
+          value: "3"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+---
+# =============================================================================
+# 3. NodePort Services —— 每个 Pod 独立暴露
+# =============================================================================
+# im-router 做完 hash redirect 后，客户端直连对应 NodePort。
+# Cilium eBPF socket LB 处理 DNAT: NodeIP:30001 → im-ws-0 PodIP:9090。
+# NodePort 规则在所有 Node 上都生效，客户端连任意外网 Node IP 均可。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-ws-0-np
+  namespace: gw
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: im-ws-0
+  ports:
+  - port: 9090
+    targetPort: 9090
+    nodePort: 30001
+    name: ws
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: im-ws-svc
+  name: im-ws-1-np
+  namespace: gw
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: im-ws-1
+  ports:
+  - port: 9090
+    targetPort: 9090
+    nodePort: 30002
+    name: ws
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-ws-2-np
+  namespace: gw
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: im-ws-2
+  ports:
+  - port: 9090
+    targetPort: 9090
+    nodePort: 30003
+    name: ws
+
+---
+# =============================================================================
+# 4. im-router Deployment —— 建连时路由 (Go, ~80行)
+# =============================================================================
+# 不代理 WebSocket 帧流。仅处理建连时的 redirect 请求:
+#   GET /ws?uid=123456&token=xxx
+#   → hash(123456) % NODE_COUNT → port
+#   → {"url":"ws://ws.example.com:30001/ws","node":0}
+#
+# 为什么用独立的 redirect 服务:
+#   1. 纯 HTTP 请求，不需要 io_uring
+#   2. 2 副本, 10m CPU, 8Mi RAM → 扛 10K req/s
+#   3. 建连峰值时不影响 im-ws 的数据面
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-router
+  namespace: gw
+  labels:
+    app: im-router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: im-router
+  template:
+    metadata:
+      labels:
+        app: im-router
+    spec:
+      containers:
+      - name: router
+        image: registry.example.com/im-router:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: NODE_COUNT
+          value: "3"
+        - name: BASE_PORT
+          value: "30001"
+        - name: DOMAIN
+          value: "ws.example.com"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 1
+          periodSeconds: 3
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 10m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-router-svc
   namespace: gw
 spec:
   selector:
-    app: im-ws
+    app: im-router
   ports:
-    - name: ws
-      protocol: TCP
-      port: 80
-      targetPort: 9091
+  - port: 80
+    targetPort: 8080
+    name: http
   type: ClusterIP
+
+---
+# =============================================================================
+# 5. NATS —— 离线消息持久化
+# =============================================================================
+# 仅用于离线消息存储，不用于路由/广播/在线消息投递。
+# im.msg.save → JetStream 持久化
+# 用户上线时从 NATS pull 离线消息，pull 后 delete。
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: gw
+data:
+  nats.conf: |
+    port: 4222
+    http_port: 8222
+    jetstream {
+      store_dir: /data/jetstream
+      max_memory_store: 256MB
+      max_file_store: 1GB
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: gw
+  labels:
+    app: nats
+spec:
+  serviceName: nats-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+      - name: nats
+        image: nats:2.10-alpine
+        args:
+        - "-c"
+        - "/etc/nats/nats.conf"
+        - "-js"
+        ports:
+        - containerPort: 4222
+          name: client
+        - containerPort: 8222
+          name: monitor
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nats
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+      volumes:
+      - name: config
+        configMap:
+          name: nats-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-svc
+  namespace: gw
+spec:
+  selector:
+    app: nats
+  ports:
+  - port: 4222
+    targetPort: 4222
+    name: client
+  - port: 8222
+    targetPort: 8222
+    name: monitor
+  type: ClusterIP
+
+---
+# =============================================================================
+# 6. Secrets —— JWT 密钥
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: im-secrets
+  namespace: gw
+type: Opaque
+stringData:
+  jwt-secret: "change-me-in-production-use-256-bit-key"
+
+---
+# =============================================================================
+# 7. DNS 配置说明 (手动操作)
+# =============================================================================
+# 为 ws.example.com 配置 DNS A 记录 (多值, Round-Robin):
+#   ws.example.com → Node1-IP
+#   ws.example.com → Node2-IP
+#   ws.example.com → Node3-IP
+#
+# 端口区分 Pod:
+#   ws://ws.example.com:30001/ws → im-ws-0
+#   ws://ws.example.com:30002/ws → im-ws-1
+#   ws://ws.example.com:30003/ws → im-ws-2
+#
+# 不需要子域名 (ws0.example.com, ws1.example.com)。
+# 不需要负载均衡器 (ALB/NLB/Cilium eBPF socket LB 直接处理 NodePort)。
