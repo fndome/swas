@@ -182,6 +182,9 @@ const CacheLine4_6 = extern struct {
 const CacheLine5 = extern struct {
     /// 哨兵魔数 0x53574153，debug 时检测内存越界
     sentinel: u32 = 0x53574153,
+    /// 协议类型标签: 0=未知, 1=JSON, 2=PB, 3=CUSTOM
+    proto_tag: u8 = 0,
+    _pad: [3]u8 = [_]u8{0} ** 3,
     /// 二级计算区：协议解析 / Worker Pool 移交 / Fiber 虚拟寄存器
     ws: SlotWorkspace = .{ .raw = [_]u8{0} ** 56 },
 };
