@@ -13,7 +13,11 @@ const sws = @import("sws");
 ///      判断目标在本地还是远程。
 ///   3. 扩容减震: 虚节点环迁移率 ~25%，vs 取模 75%。
 
-pub const local_id: u8 = parseLocalId();
+pub var local_id: u8 = 0;
+
+pub fn loadLocalId() void {
+    local_id = parseLocalId();
+}
 
 fn parseLocalId() u8 {
     const pod_name = std.os.getenv("POD_NAME") orelse "im-ws-0";

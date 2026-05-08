@@ -99,7 +99,7 @@ Pod 启动时从 `POD_NAME` 环境变量解析 ordinal (`im-ws-2` → `2`)，初
 
 ```
 1. Pod-0 查本地 sessions → user_2 不在
-2. hash(user_2) % 3 = 1 → 目标 Pod = im-ws-1
+2. HashRing.route(user_2) → 目标 Pod = im-ws-1
 3. HTTP POST http://im-ws-1.im-ws-headless:9090/internal/msg
    → Worker 线程执行, fire-and-forget
 4. Pod-1 收到 → sessions.getByUser(user_2)

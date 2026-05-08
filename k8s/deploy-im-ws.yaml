@@ -67,6 +67,10 @@ spec:
   serviceName: im-ws-headless
   replicas: 3
   podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
   selector:
     matchLabels:
       app: im-ws
@@ -272,6 +276,20 @@ spec:
 # 用户上线时从 NATS pull 离线消息，pull 后 delete。
 # =============================================================================
 apiVersion: v1
+kind: Service
+metadata:
+  name: nats-headless
+  namespace: gw
+spec:
+  clusterIP: None
+  selector:
+    app: nats
+  ports:
+  - port: 4222
+    targetPort: 4222
+    name: client
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nats-config
@@ -294,7 +312,7 @@ metadata:
   labels:
     app: nats
 spec:
-  serviceName: nats-svc
+  serviceName: nats-headless
   replicas: 1
   selector:
     matchLabels:
