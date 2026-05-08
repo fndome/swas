@@ -59,6 +59,9 @@ const sticker = @import("../stack_pool_sticker.zig");
 const StreamHandle = @import("../next/chunk_stream.zig").StreamHandle;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const LargeBufferPool = @import("../shared/large_buffer_pool.zig").LargeBufferPool;
+const ws_fiber = @import("ws_fiber.zig");
+const http_fiber = @import("http_fiber.zig");
+const http_body = @import("http_body.zig");
 
 fn milliTimestamp(io: std.Io) i64 {
     const ts = std.Io.Timestamp.now(io, .real);
@@ -610,7 +613,7 @@ pub const AsyncServer = struct {
         self.accept_stalled = false;
     }
 
-    fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
+    pub fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
         _ = conn_id;
         const user_data = packUserData(conn.gen_id, conn.pool_idx);
         const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
@@ -620,7 +623,7 @@ pub const AsyncServer = struct {
         if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
     }
 
-    fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
+    pub fn submitWrite(self: *Self, conn_id: u64, conn: *Connection) !void {
         _ = conn_id;
         if (conn.write_offset == 0) {
             conn.write_start_ms = milliTimestamp(self.io);
@@ -687,124 +690,18 @@ pub const AsyncServer = struct {
     }
 
     fn submitBodyRead(self: *Self, conn: *Connection, large_buf: []u8, slot: *StackSlot) !void {
-        const remaining = slot.line3.large_buf_len - slot.line3.large_buf_offset;
-        if (remaining == 0) return;
-        const user_data = packUserData(conn.gen_id, conn.pool_idx);
-        const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
-        const dest = large_buf[slot.line3.large_buf_offset..][0..@min(remaining, large_buf.len - slot.line3.large_buf_offset)];
-        const sqe = try self.ring.read(user_data, fd, .{ .buffer = dest }, 0);
-        if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+        return http_body.submitBodyRead(self, conn, large_buf, slot);
     }
 
     fn onBodyChunk(self: *Self, conn_id: u64, res: i32) void {
-        const conn = self.getConn(conn_id) orelse return;
-        const slot = if (conn.pool_idx != 0xFFFFFFFF) &self.pool.slots[conn.pool_idx] else {
-            if (res <= 0) self.closeConn(conn_id, conn.fd);
-            return;
-        };
-
-        // ── ChunkStream 搬运路径 ─────────────────────────
-        if (sticker.getStream(slot)) |stream_ptr| {
-            const stream: *StreamHandle = @ptrCast(@alignCast(stream_ptr));
-            if (res <= 0) {
-                _ = stream.finish();
-                sticker.clearStream(slot);
-                if (slot.line3.large_buf_ptr != 0) {
-                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-                    self.large_pool.release(buf);
-                    slot.line3.large_buf_ptr = 0;
-                }
-                self.closeConn(conn_id, conn.fd);
-                return;
-            }
-            const n: u32 = @intCast(res);
-            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-            const data = buf[slot.line3.large_buf_offset..][0..@as(usize, @intCast(n))];
-            _ = stream.feed(data);
-            slot.line3.large_buf_offset += n;
-            self.submitBodyRead(conn, buf, slot) catch {
-                self.large_pool.release(buf);
-                slot.line3.large_buf_ptr = 0;
-                sticker.clearStream(slot);
-                self.closeConn(conn_id, conn.fd);
-            };
-            return;
-        }
-
-        // ── 原有 body 累积逻辑 ─────────────────────────
-        if (res <= 0) {
-            if (conn.pool_idx != 0xFFFFFFFF) {
-                if (slot.line3.large_buf_ptr != 0) {
-                    const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-                    self.large_pool.release(buf);
-                    slot.line3.large_buf_ptr = 0;
-                }
-            }
-            self.closeConn(conn_id, conn.fd);
-            return;
-        }
-        slot.line3.large_buf_offset += @intCast(res);
-        if (slot.line3.large_buf_offset >= slot.line3.large_buf_len) {
-            // Body 收齐 → 运行 handler
-            conn.state = .processing;
-            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-            self.processBodyRequest(conn_id, conn, buf);
-        } else {
-            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-            self.submitBodyRead(conn, buf, slot) catch {
-                self.large_pool.release(buf);
-                slot.line3.large_buf_ptr = 0;
-                self.closeConn(conn_id, conn.fd);
-            };
-        }
+        http_body.onBodyChunk(self, conn_id, res);
     }
 
-    /// ── ChunkStream 通用读回调 (方案 D: Sticker 搬运, 零 Fiber) ──
-    /// 适用: HTTP body 流式上传、WebSocket 帧流、任意 io_uring 读写源。
-    /// 数据到达 → feed stream → 攒够 → Worker 解析。
     fn onStreamRead(self: *Self, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {
-        _ = user_data;
-        const conn = self.getConn(conn_id) orelse return;
-        const slot = if (conn.pool_idx != 0xFFFFFFFF) &self.pool.slots[conn.pool_idx] else {
-            self.closeConn(conn_id, conn.fd);
-            return;
-        };
-        const stream_ptr = sticker.getStream(slot) orelse {
-            self.closeConn(conn_id, conn.fd);
-            return;
-        };
-        const stream: *StreamHandle = @ptrCast(@alignCast(stream_ptr));
-
-        if (res <= 0) {
-            _ = stream.finish();
-            sticker.clearStream(slot);
-            self.closeConn(conn_id, conn.fd);
-            return;
-        }
-
-        // 从 io_uring provided buffer 提取数据
-        if (cqe_flags & linux.IORING_CQE_F_BUFFER != 0) {
-            const bid = @as(u16, @truncate(cqe_flags >> 16));
-            const read_buf = self.buffer_pool.getReadBuf(bid);
-            const n = @as(usize, @intCast(res));
-            _ = stream.feed(read_buf[0..n]);
-            self.buffer_pool.markReplenish(bid);
-        } else {
-            // 显式 buffer 路径 (等同于 body 搬运)
-            const n = @as(u32, @intCast(res));
-            const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
-            const data = buf[slot.line3.large_buf_offset..][0..@as(usize, @intCast(n))];
-            _ = stream.feed(data);
-            slot.line3.large_buf_offset += n;
-        }
-
-        // 提交下一读
-        self.submitRead(conn_id, conn) catch {
-            self.closeConn(conn_id, conn.fd);
-        };
+        http_body.onStreamRead(self, conn_id, res, user_data, cqe_flags);
     }
 
-    fn processBodyRequest(self: *Self, conn_id: u64, conn: *Connection, body_buf: []u8) void {
+    pub fn processBodyRequest(self: *Self, conn_id: u64, conn: *Connection, body_buf: []u8) void {
         const bid = conn.read_bid;
         const header_buf = self.buffer_pool.getReadBuf(bid);
         const effective_buf = header_buf;
@@ -989,7 +886,7 @@ pub const AsyncServer = struct {
         return null;
     }
 
-    fn closeConn(self: *Self, conn_id: u64, fd: i32) void {
+    pub fn closeConn(self: *Self, conn_id: u64, fd: i32) void {
         self.ws_server.removeActive(conn_id);
 
         if (self.getConn(conn_id)) |conn| {
@@ -1854,7 +1751,7 @@ fn executeNext(self: *Self, req: *const Item) void {
         }
     }
 
-    fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
+    pub fn ensureWriteBuf(self: *Self, conn: *Connection, min_size: usize) bool {
         if (conn.response_buf) |existing| {
             if (existing.len >= min_size) return true;
             // Guard: if writev is in-flight, do NOT free the buffer the kernel is reading.
@@ -2275,9 +2172,9 @@ fn executeNext(self: *Self, req: *const Item) void {
                         handler(conn_id, &frame, self.ws_server.ctx);
                     }
                 } else {
-                    var ws_fiber = Fiber.init(self.shared_fiber_stack);
+                    var fiber = Fiber.init(self.shared_fiber_stack);
                     self.shared_fiber_active = true;
-                    ws_fiber.exec(.{
+                    fiber.exec(.{
                         .userCtx = t,
                         .complete = wsTaskComplete,
                         .execFn = wsTaskExec,
@@ -2435,207 +2332,17 @@ fn executeNext(self: *Self, req: *const Item) void {
     }
 };
 
-/// ── WS 帧 fiber 处理 ─────────────────────────────────────
-const WsTaskCtx = struct {
-    tag: u32,
-    server: *AsyncServer,
-    conn_id: u64,
-    read_bid: u16 = 0,
-    payload_tier: u8 = 0,
-    handler: WsHandler,
-    frame: ws_frame.Frame,
-    payload_buf: []u8,
-};
+const WsTaskCtx = ws_fiber.WsTaskCtx;
+const wsTaskExec = ws_fiber.wsTaskExec;
+const wsTaskExecWrapperWithOwnership = ws_fiber.wsTaskExecWrapperWithOwnership;
+const wsTaskCleanup = ws_fiber.wsTaskCleanup;
+const wsTaskComplete = ws_fiber.wsTaskComplete;
 
-fn wsTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
-    const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
-    std.debug.assert(t.tag == 0x57530001);
-    t.handler(t.conn_id, &t.frame, t.server.ws_server.ctx);
-    complete(t, "");
-}
-
-fn wsTaskExecWrapperWithOwnership(t: *WsTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
-    wsTaskExec(t, complete);
-    wsTaskCleanup(t);
-}
-
-fn wsTaskCleanup(t: *WsTaskCtx) void {
-    std.debug.assert(t.tag == 0x57530001);
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-    }
-    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
-    t.server.ws_ctx_pool.destroy(t);
-}
-
-fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
-    const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
-    std.debug.assert(t.tag == 0x57530001);
-    t.server.shared_fiber_active = false;
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-    }
-    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
-    t.server.ws_ctx_pool.destroy(t);
-}
-
-/// ── HTTP 请求 Next 处理 ──────────────────────────────────
-const HttpTaskCtx = struct {
-    tag: u32,
-    server: *AsyncServer,
-    conn_id: u64,
-    read_bid: u16 = 0,
-    method_buf: [16]u8 = [_]u8{0} ** 16,
-    method_len: u4 = 0,
-    path_buf: [256]u8 = [_]u8{0} ** 256,
-    path_len: u8 = 0,
-    request_data: []u8,
-    body_data: ?[]u8 = null,
-};
-
-fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
-    const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
-    std.debug.assert(t.tag == 0x48540001);
-    const server = t.server;
-
-    const method = t.method_buf[0..t.method_len];
-    const path = t.path_buf[0..t.path_len];
-    const req_data = t.request_data;
-
-    // If body came from LargeBufferPool (processBodyRequest path), dupe it to
-    // GPA memory and release the pool buffer immediately. This prevents
-    // ctx.deinit() / ctx.text() / ctx.json() from freeing pool memory via GPA.
-    var req_body: ?[]u8 = null;
-    if (t.body_data) |bd| {
-        req_body = server.allocator.dupe(u8, bd) catch null;
-        server.large_pool.release(bd);
-    }
-
-    var ctx = Context{
-        .request_data = req_data,
-        .path = path,
-        .app_ctx = server.app_ctx,
-        .allocator = server.allocator,
-        .status = 200,
-        .content_type = .plain,
-        .body = req_body,
-        .headers = null,
-        .conn_id = t.conn_id,
-        .server = @ptrCast(server),
-    };
-    defer ctx.deinit();
-
-    var handled = false;
-
-    if (server.middlewares.has_global) {
-        for (server.middlewares.global.items) |mw| {
-            const stop = mw(server.allocator, &ctx) catch |err| {
-                logErr("global middleware error: {s}", .{@errorName(err)});
-                if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                handled = true;
-                break;
-            };
-            if (stop or ctx.body != null) {
-                handled = true;
-                break;
-            }
-        }
-    }
-
-    if (!handled) {
-        if (server.middlewares.precise.get(path)) |list| {
-            for (list.items) |mw| {
-                const stop = mw(server.allocator, &ctx) catch |err| {
-                    logErr("precise middleware error: {s}", .{@errorName(err)});
-                    if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                    handled = true;
-                    break;
-                };
-                if (stop or ctx.body != null) {
-                    handled = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!handled) {
-        for (server.middlewares.wildcard.items) |entry| {
-            if (entry.rule.match(path)) {
-                for (entry.list.items) |mw| {
-                    const stop = mw(server.allocator, &ctx) catch |err| {
-                        logErr("wildcard middleware error: {s}", .{@errorName(err)});
-                        if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                        handled = true;
-                        break;
-                    };
-                    if (stop or ctx.body != null) {
-                        handled = true;
-                        break;
-                    }
-                }
-                if (handled) break;
-            }
-        }
-    }
-
-    if (!handled) {
-        var key_buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ method, path }) catch null;
-        if (key) |k| {
-            if (server.handlers.get(k)) |handler| {
-                handler(server.allocator, &ctx) catch |err| {
-                    logErr("handler error: {s}", .{@errorName(err)});
-                    ctx.text(500, @errorName(err)) catch {};
-                };
-            } else {
-                ctx.text(404, "Not Found") catch {};
-            }
-        } else {
-            ctx.text(404, "Not Found") catch {};
-        }
-    }
-
-    if (ctx.deferred) {
-        complete(t, "");
-        return;
-    }
-
-    var headers_str: []u8 = "";
-    if (ctx.headers) |list| {
-        headers_str = server.allocator.dupe(u8, list.items) catch "";
-    }
-    defer if (headers_str.len > 0) server.allocator.free(headers_str);
-
-    const response_body = ctx.body orelse {
-        logErr("no response body set for conn_id={d}", .{t.conn_id});
-        if (server.connections.getPtr(t.conn_id)) |conn| {
-            const body = server.allocator.dupe(u8, "no response body set for conn") catch {
-                complete(t, "");
-                return;
-            };
-            server.respondZeroCopy(conn, 500, .plain, body, headers_str);
-        }
-        complete(t, "");
-        return;
-    };
-
-    if (server.connections.getPtr(t.conn_id)) |conn| {
-        server.respondZeroCopy(conn, ctx.status, ctx.content_type, response_body, headers_str);
-    } else {
-        server.allocator.free(response_body);
-    }
-    ctx.body = null;
-    complete(t, "");
-}
+const HttpTaskCtx = http_fiber.HttpTaskCtx;
+const httpTaskExec = http_fiber.httpTaskExec;
+const httpTaskExecWrapperWithOwnership = http_fiber.httpTaskExecWrapperWithOwnership;
+const httpTaskCleanup = http_fiber.httpTaskCleanup;
+const httpTaskComplete = http_fiber.httpTaskComplete;
 
 fn statusText(code: u16) []const u8 {
     return switch (code) {
@@ -2671,55 +2378,6 @@ fn maxWriteRetries(total: usize) u8 {
     return @intCast(retries);
 }
 
-/// Wrapper for Next.push dispatching: takes ownership of HttpTaskCtx,
-/// runs httpTaskExec and cleans up resources when done.
-/// NOTE: does NOT clear shared_fiber_active — the original fiber
-/// that yielded still holds the shared stack.
-fn httpTaskExecWrapperWithOwnership(t: *HttpTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
-    httpTaskExec(t, complete);
-    httpTaskCleanup(t);
-}
-
-/// Resource cleanup for per-task-stack HTTP handlers. Does NOT touch
-/// shared_fiber_active — only the shared-stack completion path may clear it.
-fn httpTaskCleanup(t: *HttpTaskCtx) void {
-    std.debug.assert(t.tag == 0x48540001);
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-        const has_stream = conn.pool_idx != 0xFFFFFFFF and
-            sticker.getStream(&t.server.pool.slots[conn.pool_idx]) != null;
-        if (conn.state == .streaming or has_stream) {
-            if (has_stream) conn.state = .streaming;
-            t.server.submitRead(t.conn_id, conn) catch {
-                t.server.closeConn(t.conn_id, conn.fd);
-            };
-        }
-    }
-    t.server.http_ctx_pool.destroy(t);
-}
-
-fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
-    const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
-    std.debug.assert(t.tag == 0x48540001);
-    t.server.shared_fiber_active = false;
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-        const has_stream = conn.pool_idx != 0xFFFFFFFF and
-            sticker.getStream(&t.server.pool.slots[conn.pool_idx]) != null;
-        if (conn.state == .streaming or has_stream) {
-            if (has_stream) conn.state = .streaming;
-            t.server.submitRead(t.conn_id, conn) catch {
-                t.server.closeConn(t.conn_id, conn.fd);
-            };
-        }
-    }
-    t.server.http_ctx_pool.destroy(t);
-}
+pub const submitBodyRead = http_body.submitBodyRead;
+pub const onBodyChunk = http_body.onBodyChunk;
+pub const onStreamRead = http_body.onStreamRead;
