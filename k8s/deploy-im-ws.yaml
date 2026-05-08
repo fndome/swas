@@ -6,7 +6,7 @@
 #
 # 负载均衡:
 #   不依赖 K8s Service 的随机分发 (iptables/IPVS)。
-#   用 im-router 做 hash(uid) % N 精确路由，确保同一用户始终落在同一 Pod。
+#   用 im-router 做一致性哈希精确路由，确保同一用户始终落在同一 Pod。
 #   Pod 间通过 StatefulSet headless DNS 直连 (im-ws-{N}.im-ws-headless)。
 #
 # 为什么不用 K8s Service LB:
@@ -201,13 +201,11 @@ spec:
 # =============================================================================
 # 不代理 WebSocket 帧流。仅处理建连时的 redirect 请求:
 #   GET /ws?uid=123456&token=xxx
-#   → hash(123456) % NODE_COUNT → port
+#   → HashRing.route(uid) → node → port
 #   → {"url":"ws://ws.example.com:30001/ws","node":0}
 #
-# 为什么用独立的 redirect 服务:
-#   1. 纯 HTTP 请求，不需要 io_uring
-#   2. 2 副本, 10m CPU, 8Mi RAM → 扛 10K req/s
-#   3. 建连峰值时不影响 im-ws 的数据面
+# 与 im-ws 使用完全一致的虚节点一致性哈希算法 (FNV-1a + 150 vnodes + 二分查找)。
+# 扩容时两层同步变化，不会出现路由漂移。
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -233,12 +231,12 @@ spec:
         - containerPort: 8080
           name: http
         env:
-        - name: NODE_COUNT
-          value: "3"
         - name: BASE_PORT
           value: "30001"
         - name: DOMAIN
           value: "ws.example.com"
+        - name: NODE_COUNT
+          value: "3"
         readinessProbe:
           httpGet:
             path: /healthz

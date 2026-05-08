@@ -7,8 +7,8 @@ const sws = @import("sws");
 /// local_id 从 POD_NAME 环境变量解析: "im-ws-2" → 2。
 ///
 /// 环用于:
-///   1. 建连校验: im-router 做了 hash%N 第一次路由，
-///      Pod 内用环做二次校验，防 ring 漂移。
+///   1. 建连校验: im-router 用同一套虚节点环做首次路由，
+///      Pod 内用同算法做二次校验——两层完全对齐，零漂移。
 ///   2. 消息路由: hash(to_uid) → 目标 Pod ordinal，
 ///      判断目标在本地还是远程。
 ///   3. 扩容减震: 虚节点环迁移率 ~25%，vs 取模 75%。
