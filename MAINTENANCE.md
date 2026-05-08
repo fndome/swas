@@ -80,6 +80,25 @@ Worker 线程只拥有自己的栈。
 
 ---
 
+## 修改代码后：加英语注释
+
+每条修改都必须在改动点加上**简要英语注释**，说明为什么这么写。注释只写"为什么"，不写"是什么"（代码本身说了"是什么"）。
+
+反例（无注释）：
+```zig
+self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+```
+
+正确：
+```zig
+// CQE means kernel is done — clear flag for closeConn & retry
+self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+```
+
+理由：sws 的修改涉及四层约束，未来维护者（包括 3 个月后的自己）如果不看 commit message 就无法理解意图。注释是跨时间的沟通。
+
+---
+
 ## 常见错误
 
 | 错误 | 为什么 |
