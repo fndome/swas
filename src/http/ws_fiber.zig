@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const AsyncServer = @import("../http/async_server.zig").AsyncServer;
-const WsHandler = @import("server.zig").WsHandler;
-const ws_frame = @import("frame.zig");
+const AsyncServer = @import("async_server.zig").AsyncServer;
+const WsHandler = @import("../ws/server.zig").WsHandler;
+const ws_frame = @import("../ws/frame.zig");
 
 pub const WsTaskCtx = struct {
     tag: u32,

@@ -1,18 +1,18 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const AsyncServer = @import("../http/async_server.zig").AsyncServer;
-const Connection = @import("../http/connection.zig").Connection;
-const Context = @import("../http/context.zig").Context;
+const AsyncServer = @import("async_server.zig").AsyncServer;
+const Connection = @import("connection.zig").Connection;
+const Context = @import("context.zig").Context;
 const packUserData = @import("../stack_pool.zig").packUserData;
 const sticker = @import("../stack_pool_sticker.zig");
-const helpers = @import("../http/http_helpers.zig");
+const helpers = @import("http_helpers.zig");
 const getPathFromRequest = helpers.getPathFromRequest;
 const getMethodFromRequest = helpers.getMethodFromRequest;
 const isKeepAliveConnection = helpers.isKeepAliveConnection;
 const logErr = helpers.logErr;
 const ws_upgrade = @import("../ws/upgrade.zig");
-const http_fiber = @import("../http/http_fiber.zig");
+const http_fiber = @import("http_fiber.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
@@ -397,4 +397,4 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     self.respond(conn, 404, "Not Found");
 }
 
-const statusText = @import("../http/http_response.zig").statusText;
+const statusText = @import("http_response.zig").statusText;
