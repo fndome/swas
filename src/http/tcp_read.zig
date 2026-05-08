@@ -84,6 +84,13 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     conn.read_bid = bid;
     conn.read_len = effective_nread;
 
+    if (conn.pool_idx != 0xFFFFFFFF) {
+        const slot = &self.pool.slots[conn.pool_idx];
+        if (slot.line5.proto_tag == 0) {
+            _ = sticker.sniffProto(slot, effective_buf);
+        }
+    }
+
     const has_header_end = std.mem.indexOf(u8, effective_buf, "\r\n\r\n") != null or
         std.mem.indexOf(u8, effective_buf, "\n\n") != null;
     if (!has_header_end) {
