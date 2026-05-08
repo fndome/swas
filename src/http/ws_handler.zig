@@ -275,6 +275,9 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
     _ = user_data;
     if (res <= 0) {
         const conn = self.getConn(conn_id) orelse return;
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+        }
         self.closeConn(conn_id, conn.fd);
         return;
     }
@@ -282,6 +285,9 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
     conn.write_offset += @as(usize, @intCast(res));
     if (conn.write_offset >= conn.write_headers_len) {
         conn.write_retries = 0;
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+        }
         if (conn.response_buf) |buf| {
             self.buffer_pool.freeTieredWriteBuf(buf, conn.response_buf_tier);
             conn.response_buf = null;
@@ -297,8 +303,14 @@ pub fn onWsWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: 
         conn.write_retries += 1;
         if (conn.write_retries > maxWriteRetries(conn.write_headers_len)) {
             logErr("ws write retries exceeded for fd {} ({} attempts)", .{ conn.fd, conn.write_retries });
+            if (conn.pool_idx != 0xFFFFFFFF) {
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
+            }
             self.closeConn(conn_id, conn.fd);
             return;
+        }
+        if (conn.pool_idx != 0xFFFFFFFF) {
+            self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
         }
         self.submitWrite(conn_id, conn) catch {
             self.closeConn(conn_id, conn.fd);
