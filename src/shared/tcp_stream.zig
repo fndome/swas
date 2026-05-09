@@ -19,13 +19,14 @@ pub const RingSharedClient = struct {
     fd: i32,
     state: State,
 
-    on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
-    on_close: *const fn (ctx: ?*anyopaque) void,
+    on_data: *const fn (stream: *RingSharedClient, ctx: ?*anyopaque, data: []u8) void,
+    on_close: *const fn (stream: *RingSharedClient, ctx: ?*anyopaque) void,
     callback_ctx: ?*anyopaque,
 
     read_buf: []u8,
     conn_errno: i32 = 0, // connect CQE 错误码 (0=成功, -ETIMEDOUT=超时)
     connect_addr: linux.sockaddr = undefined,
+    connect_timeout_ts: linux.timespec = .{ .sec = 0, .nsec = 0 },
     _connect_addrlen: u32 = 0,
 
     write_buf: std.ArrayList(u8),
@@ -46,8 +47,8 @@ pub const RingSharedClient = struct {
     pub fn init(
         allocator: Allocator,
         rs: RingShared,
-        on_data: *const fn (ctx: ?*anyopaque, data: []u8) void,
-        on_close: *const fn (ctx: ?*anyopaque) void,
+        on_data: *const fn (stream: *RingSharedClient, ctx: ?*anyopaque, data: []u8) void,
+        on_close: *const fn (stream: *RingSharedClient, ctx: ?*anyopaque) void,
         callback_ctx: ?*anyopaque,
         dns: ?*DnsResolver,
     ) !*RingSharedClient {
@@ -139,11 +140,12 @@ pub const RingSharedClient = struct {
             sqe.flags |= linux.IOSQE_IO_LINK; // link LINK_TIMEOUT next
             const tsqe = self.rs.ringPtr().nop(0) catch return;
             tsqe.opcode = @enumFromInt(15); // IORING_OP_LINK_TIMEOUT
-            var ts = linux.timespec{
+            // 修改原因：LINK_TIMEOUT 的 timespec 会被内核异步读取，不能指向本函数的栈变量。
+            self.connect_timeout_ts = .{
                 .sec = @intCast(timeout_ms / 1000),
                 .nsec = @intCast((timeout_ms % 1000) * 1_000_000),
             };
-            tsqe.addr = @intFromPtr(&ts);
+            tsqe.addr = @intFromPtr(&self.connect_timeout_ts);
             tsqe.len = 1;
             // CONNECT + LINK_TIMEOUT submitted together — no orphan window
         }
@@ -235,7 +237,7 @@ pub const RingSharedClient = struct {
                         self.onClose();
                         return;
                     }
-                    self.on_data(self.callback_ctx, self.read_buf[0..@intCast(res)]);
+                    self.on_data(self, self.callback_ctx, self.read_buf[0..@intCast(res)]);
                     if (self.state != .connected) return;
                     if (!self.writing) {
                         self.submitRead() catch {
@@ -261,7 +263,7 @@ pub const RingSharedClient = struct {
         if (self.id != 0) {
             self.rs.remove(self.id);
         }
-        self.on_close(self.callback_ctx);
+        self.on_close(self, self.callback_ctx);
     }
 };
 

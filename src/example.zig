@@ -146,6 +146,12 @@ const Example = struct {
         }
     }
 
+    fn readPortEnv(default_port: u16) u16 {
+        const raw = std.c.getenv("SWS_EXAMPLE_PORT") orelse return default_port;
+        // 修改原因：自测脚本需要可切换端口，避免旧测试进程占用固定 9090 导致无法验证。
+        return std.fmt.parseInt(u16, std.mem.span(raw), 10) catch default_port;
+    }
+
     pub fn main() !void {
         var gpa = std.heap.DebugAllocator(.{}){};
         defer _ = gpa.deinit();
@@ -155,7 +161,11 @@ const Example = struct {
         defer io_backend.deinit();
         const io = io_backend.io();
 
-        var server = try AsyncServer.init(alloc, io, "0.0.0.0:9090", null, 64);
+        const port = readPortEnv(9090);
+        const bind_addr = try std.fmt.allocPrint(alloc, "0.0.0.0:{d}", .{port});
+        defer alloc.free(bind_addr);
+
+        var server = try AsyncServer.init(alloc, io, bind_addr, null, 64);
         defer server.deinit();
 
         server.config(.idle_timeout_ms, 30000);
@@ -166,7 +176,7 @@ const Example = struct {
         try server.GET("/admin/dashboard", helloHandler);
         try server.ws("/echo", wsEchoHandler);
 
-        std.debug.print("Server listening on http://0.0.0.0:9090\n", .{});
+        std.debug.print("Server listening on http://0.0.0.0:{d}\n", .{port});
         try server.run();
     }
 };

@@ -43,8 +43,8 @@ pub const RingB = struct {
 
         var ring = brk: {
             var params = std.mem.zeroes(linux.io_uring_params);
-            params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
-                linux.IORING_SETUP_DEFER_TASKRUN |
+            // 修改原因：RingB 可能由主流程创建后交给 IO tick 驱动，SINGLE_ISSUER 会要求创建/提交同线程。
+            params.flags = linux.IORING_SETUP_DEFER_TASKRUN |
                 linux.IORING_SETUP_ATTACH_WQ;
             params.wq_fd = @intCast(attach_ring_fd);
             break :brk try linux.IoUring.init_params(256, &params);

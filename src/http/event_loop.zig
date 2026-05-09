@@ -21,7 +21,8 @@ pub fn milliTimestamp(io: std.Io) i64 {
 }
 
 pub fn stop(self: *AsyncServer) void {
-    self.should_stop = true;
+    // 修改原因：stop 可能由管理/压测线程触发，事件循环跨线程读取时需要原子同步。
+    @atomicStore(bool, &self.should_stop, true, .release);
 }
 
 var sigterm_server: ?*AsyncServer = null;
@@ -35,7 +36,8 @@ pub fn installSigterm(self: *AsyncServer) void {
 }
 
 fn sigtermHandler(_: linux.SIG) callconv(.c) void {
-    if (sigterm_server) |s| s.should_stop = true;
+    // 修改原因：信号回调和事件循环不在同一执行点，普通 bool 写入会和主循环读取形成数据竞争。
+    if (sigterm_server) |s| @atomicStore(bool, &s.should_stop, true, .release);
 }
 
 pub fn drainPendingResumes(self: *AsyncServer) void {
@@ -62,7 +64,7 @@ pub fn run(self: *AsyncServer) !void {
 
     var cqes: [MAX_CQES_BATCH]linux.io_uring_cqe = undefined;
     var user_tasks_buf: [USER_TASK_BATCH]Item = undefined;
-    while (!self.should_stop) {
+    while (!@atomicLoad(bool, &self.should_stop, .acquire)) {
         try self.buffer_pool.flushReplenish(&self.ring);
 
         if (self.accept_stalled) {

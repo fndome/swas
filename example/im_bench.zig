@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const sws = @import("sws");
 const AsyncServer = sws.AsyncServer;
 
-const PORT = 19090;
+const DEFAULT_PORT = 19090;
 const CONNS = 50;
 const REQS_PER_CONN = 100;
 const DRAIN_IDLE_ROUNDS = 20;
@@ -29,6 +29,12 @@ fn countResponses(data: []const u8) usize {
         pos += idx + RESPONSE_MARKER.len;
     }
     return count;
+}
+
+fn readPortEnv(default_port: u16) u16 {
+    const raw = std.c.getenv("SWS_BENCH_PORT") orelse return default_port;
+    // 修改原因：benchmark 跟随自测脚本端口配置，避免旧进程占用固定 19090 阻塞验证。
+    return std.fmt.parseInt(u16, std.mem.span(raw), 10) catch default_port;
 }
 
 fn drainAvailable(fd: i32, buf: []u8) usize {
@@ -66,7 +72,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const addr = try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{PORT});
+    const port = readPortEnv(DEFAULT_PORT);
+    const addr = try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port});
     defer alloc.free(addr);
 
     var io_backend = std.Io.Threaded.init(alloc, .{});
@@ -97,7 +104,7 @@ pub fn main() !void {
         const fd_val: i32 = @intCast(raw);
         const sa = linux.sockaddr.in{
             .family = linux.AF.INET,
-            .port = @byteSwap(@as(u16, PORT)),
+            .port = @byteSwap(@as(u16, port)),
             .addr = 0x0100007F,
             .zero = [_]u8{0} ** 8,
         };
