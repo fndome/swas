@@ -80,6 +80,8 @@ pub const Pipe = struct {
         pipe: *Pipe,
 
         pub fn read(self: Reader, dest: []u8) !usize {
+            // 修改原因：零长度读取按 Reader 语义应立即返回 0，不能进入 yield 后在无数据时误报 Closed。
+            if (dest.len == 0) return 0;
             if (self.pipe.read_buf.items.len > 0) {
                 const n = @min(dest.len, self.pipe.read_buf.items.len);
                 @memcpy(dest[0..n], self.pipe.read_buf.items[0..n]);
@@ -124,3 +126,17 @@ pub const Pipe = struct {
         }
     };
 };
+
+test "Pipe.Reader.read returns zero for empty destination" {
+    var pipe = Pipe{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .read_buf = std.ArrayList(u8).empty,
+        .write_buf = std.ArrayList(u8).empty,
+        .max_read = 1,
+    };
+    defer pipe.deinit();
+
+    var empty: [0]u8 = .{};
+    try std.testing.expectEqual(@as(usize, 0), try pipe.reader().read(empty[0..]));
+}
