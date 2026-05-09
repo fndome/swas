@@ -124,18 +124,17 @@ pub fn run(self: *AsyncServer) !void {
 }
 
 pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) void {
-    for (cqes[0..n], 0..) |cqe, i| {
+    // 修改原因：Zig 0.16 的 copy_cqes 已经推进 CQ head，额外 cqe_seen 会跳过后续完成事件。
+    for (cqes[0..n]) |cqe| {
         const user_data = cqe.user_data;
         const res = cqe.res;
 
         if (self.timeout_user_data != 0 and user_data == self.timeout_user_data) {
             self.timeout_user_data = 0;
-            self.ring.cqe_seen(&cqes[i]);
             continue;
         }
 
         if (user_data == ACCEPT_USER_DATA) {
-            self.ring.cqe_seen(&cqes[i]);
             self.onAcceptComplete(res, user_data);
         } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
             const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
@@ -144,9 +143,7 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
             else
                 raw_ud;
             self.closeConn(close_conn_id, 0);
-            self.ring.cqe_seen(&cqes[i]);
         } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
-            defer self.ring.cqe_seen(&cqes[i]);
             self.io_registry.dispatch(user_data, res);
         } else {
             const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
@@ -154,11 +151,9 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                 if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
                     self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
                 }
-                self.ring.cqe_seen(&cqes[i]);
                 continue;
             };
             const conn_id = conn_ptr.id;
-            defer self.ring.cqe_seen(&cqes[i]);
 
             if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
                 self.onReadComplete(conn_id, res, user_data, cqe.flags);

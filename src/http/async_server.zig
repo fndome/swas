@@ -247,9 +247,8 @@ pub const AsyncServer = struct {
         if (rc_listen != 0) return error.ListenFailed;
 
         var params = std.mem.zeroes(linux.io_uring_params);
-        params.flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN;
-        params.sq_entries = 512;
-        params.cq_entries = 256;
+        // 修改原因：示例会把 server 交给专用 IO 线程 run，SINGLE_ISSUER 会让 Linux 返回 InvalidThread。
+        // 同时 Zig 0.16 的 IoUring.init_params 要求 sq_entries/cq_entries 由 entries 参数推导，不能手动预填。
         var ring = linux.IoUring.init_params(RING_ENTRIES, &params) catch blk: {
             break :blk try linux.IoUring.init(RING_ENTRIES, 0);
         };
@@ -640,7 +639,6 @@ pub const AsyncServer = struct {
     fn maxWriteRetries(total: usize) u8 {
         return http_response.maxWriteRetries(total);
     }
-
 };
 
 const statusText = http_response.statusText;

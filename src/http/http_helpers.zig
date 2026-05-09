@@ -87,10 +87,12 @@ pub fn parseIpv4(ip_str: []const u8) !u32 {
         octets[i] = try std.fmt.parseInt(u8, part, 10);
     }
     if (i != 4) return error.InvalidIp;
-    return (@as(u32, octets[0]) << 24) |
+    const ip = (@as(u32, octets[0]) << 24) |
         (@as(u32, octets[1]) << 16) |
         (@as(u32, octets[2]) << 8) |
         (@as(u32, octets[3]));
+    // 修改原因：linux.sockaddr.in.addr 需要内存中为网络字节序，直接返回文本序数值会把 127.0.0.1 绑定成 1.0.0.127。
+    return std.mem.nativeToBig(u32, ip);
 }
 
 pub fn logErr(comptime format: []const u8, args: anytype) void {

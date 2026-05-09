@@ -141,7 +141,8 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
                     (@as(u32, packet[off + 1]) << 16) |
                     (@as(u32, packet[off + 2]) << 8) |
                     @as(u32, packet[off + 3]);
-                resp.addrs.addrs[resp.addrs.len] = ip;
+                // 修改原因：A 记录会被后续 TCP connect 直接写入 sockaddr，需保存为网络字节序布局。
+                resp.addrs.addrs[resp.addrs.len] = std.mem.nativeToBig(u32, ip);
                 resp.addrs.len += 1;
             }
             if (ttl < min_ttl) min_ttl = ttl;

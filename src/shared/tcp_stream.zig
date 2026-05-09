@@ -274,8 +274,10 @@ fn parseIpv4(ip_str: []const u8) !u32 {
         octets[i] = try std.fmt.parseInt(u8, part, 10);
     }
     if (i != 4) return error.InvalidHost;
-    return (@as(u32, octets[0]) << 24) |
+    const ip = (@as(u32, octets[0]) << 24) |
         (@as(u32, octets[1]) << 16) |
         (@as(u32, octets[2]) << 8) |
         (@as(u32, octets[3]));
+    // 修改原因：connectRaw 会直接把 ip 写进 sockaddr.in.addr，返回值必须是网络字节序布局。
+    return std.mem.nativeToBig(u32, ip);
 }
