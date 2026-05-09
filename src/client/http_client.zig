@@ -430,6 +430,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             stream.deinit();
             switch (err) {
                 error.PoolFull => ctx.response = makeErrorResponse(ctx.allocator, 503, "connection pool full"),
+                error.CacheDisabled => ctx.response = makeErrorResponse(ctx.allocator, 502, "connection cache disabled"),
                 else => ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM"),
             }
             ctx.notify();
