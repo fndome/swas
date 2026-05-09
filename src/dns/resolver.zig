@@ -192,7 +192,12 @@ pub const DnsResolver = struct {
         if (parsed.rcode == .NOERROR and parsed.addrs.len > 0) {
             @memcpy(result.addrs[0..parsed.addrs.len], parsed.addrs.addrs[0..parsed.addrs.len]);
         }
-        self.results.put(txid, result) catch {};
+        self.results.put(txid, result) catch {
+            // Failed to store the result (OOM). The fiber will see
+            // error.DnsTimeout and retry. Log so the operator knows
+            // DNS is working but memory is tight.
+            std.log.warn("DnsResolver: failed to store result for txid={d}, will retry", .{txid});
+        };
 
         Fiber.dnsResume(&pending.value.slot);
 
