@@ -182,19 +182,18 @@ pub const TcpConn = struct {
 
     pub const State = enum(u8) { connecting, idle, reading, writing, closing };
 
+    // Queue an SQE via the ring; actual submission is batched in tick().
+    // Calling ring.submit() per I/O would trigger io_uring_enter on every
+    // read/write, wasting syscalls when multiple connections share the ring.
     fn submitRead(self: *TcpConn, ring: *linux.IoUring) !void {
         self.state = .reading;
-        const sqe = try ring.read(self.token, self.fd, .{ .buffer = self.read_buf }, 0);
-        _ = sqe;
-        _ = try ring.submit();
+        _ = try ring.read(self.token, self.fd, .{ .buffer = self.read_buf }, 0);
     }
 
     fn submitWrite(self: *TcpConn, ring: *linux.IoUring) !void {
         self.state = .writing;
         const pending = self.wbuf[self.written..self.wbuf_len];
-        const sqe = try ring.write(self.token, self.fd, pending, 0);
-        _ = sqe;
-        _ = try ring.submit();
+        _ = try ring.write(self.token, self.fd, pending, 0);
     }
 
     fn deinit(self: *TcpConn, allocator: Allocator) void {
