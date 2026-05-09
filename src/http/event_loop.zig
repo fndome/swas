@@ -65,7 +65,12 @@ pub fn run(self: *AsyncServer) !void {
     var cqes: [MAX_CQES_BATCH]linux.io_uring_cqe = undefined;
     var user_tasks_buf: [USER_TASK_BATCH]Item = undefined;
     while (!@atomicLoad(bool, &self.should_stop, .acquire)) {
-        try self.buffer_pool.flushReplenish(&self.ring);
+        // flushReplenish may fail when the SQ ring is full (scale > buffer
+        // churn rate). This is non-fatal: remaining bids stay in the queue
+        // and are retried next iteration. Do NOT propagate the error.
+        self.buffer_pool.flushReplenish(&self.ring) catch |err| {
+            logErr("flushReplenish deferred: {s}", .{@errorName(err)});
+        };
 
         if (self.accept_stalled) {
             self.submitAccept() catch |err| {

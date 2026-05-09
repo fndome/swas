@@ -14,6 +14,7 @@ const logErr = helpers.logErr;
 const ws_upgrade = @import("../ws/upgrade.zig");
 const http_fiber = @import("http_fiber.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
+const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
 const READ_BUF_GROUP_ID = @import("../constants.zig").READ_BUF_GROUP_ID;
@@ -118,6 +119,13 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     conn.keep_alive = isKeepAliveConnection(effective_buf);
 
     if (conn.pool_idx != 0xFFFFFFFF) {
+        // Refresh activity timestamp for TTL scanner. slot.line2.last_active_ms
+        // was only set at slot allocation; without this update, every connection
+        // times out after idle_timeout_ms regardless of actual request activity.
+        const now_ms = milliTimestamp(self.io);
+        self.pool.slots[conn.pool_idx].line2.last_active_ms = now_ms;
+        conn.last_active_ms = now_ms;
+
         const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
         hw.header_len = @intCast(@min(effective_nread, 65535));
         hw.method = if (effective_nread > 0) effective_buf[0] else 'G';

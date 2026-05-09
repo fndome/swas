@@ -107,7 +107,12 @@ pub fn ttlScan(
 
     for (live[start..end]) |idx| {
         const slot = &pool.slots[idx];
-        if (slot.line1.state == .processing) continue; // Worker 在飞, 不杀
+        // Guard: connections stuck in processing for >2x idle_timeout are
+        // considered hung and killed. Without this, a fiber that yields
+        // or deadlocks would leak the slot permanently.
+        const hung = slot.line1.state == .processing and
+            now_ms - slot.line2.last_active_ms >= timeout_ms * 2;
+        if (slot.line1.state == .processing and !hung) continue;
         if (now_ms - slot.line2.last_active_ms >= timeout_ms) {
             out.append(allocator, idx) catch {};
         }

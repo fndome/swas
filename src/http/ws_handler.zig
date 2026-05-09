@@ -14,6 +14,7 @@ const sticker = @import("../stack_pool_sticker.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
 const ws_fiber = @import("ws_fiber.zig");
 const logErr = helpers.logErr;
+const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
     const full_uri = helpers.getFullUri(data);
@@ -104,6 +105,14 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
     if (conn.read_len > 0) self.buffer_pool.markReplenish(conn.read_bid);
     conn.read_bid = bid;
     conn.read_len = nread;
+
+    // Refresh TTL activity timestamp for WebSocket connections.
+    // slot.line2.last_active_ms is only set at accept time; without this,
+    // WebSocket connections time out after idle_timeout_ms despite being active.
+    if (conn.pool_idx != 0xFFFFFFFF) {
+        const now_ws = milliTimestamp(self.io);
+        self.pool.slots[conn.pool_idx].line2.last_active_ms = now_ws;
+    }
 
     const frame = ws_frame.parseFrame(read_buf[0..nread]) catch {
         self.buffer_pool.markReplenish(bid);
