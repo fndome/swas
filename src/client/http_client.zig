@@ -467,7 +467,16 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     ctx.cleanup();
 
-    var resp_buf: [65536]u8 = undefined;
+    // Allocate from ring allocator instead of the fiber stack: the fiber
+    // stack is only 64KB and a 64KB local array here + other locals + the
+    // fiber frame itself exceeds it, causing deterministic stack overflow.
+    const resp_buf = ctx.client.ring_b.allocator.alloc(u8, 65536) catch {
+        cache.evictPipe(pipe);
+        ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
+        ctx.notify();
+        return;
+    };
+    defer ctx.client.ring_b.allocator.free(resp_buf);
     var total: usize = 0;
     var complete_len: usize = 0;
     var invalid_response = false;
