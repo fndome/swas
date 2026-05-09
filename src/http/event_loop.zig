@@ -85,7 +85,13 @@ pub fn run(self: *AsyncServer) !void {
             logErr("submit failed: {s}", .{@errorName(err)});
         };
 
-        const n = try self.ring.copy_cqes(&cqes, 0);
+        const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
+            if (err == error.SignalInterrupt) {
+                // SIGTERM arrived during copy_cqes — loop back to check should_stop.
+                continue;
+            }
+            return err;
+        };
         if (n > 0) {
             dispatchCqes(self, &cqes, n);
             drainPendingResumes(self);
@@ -121,8 +127,18 @@ pub fn run(self: *AsyncServer) !void {
         if (self.fiber_shared) |fs| fs.tick();
         ttlScanTick(self);
 
-        _ = try self.ring.submit_and_wait(1);
-        const n2 = try self.ring.copy_cqes(&cqes, 0);
+        _ = self.ring.submit_and_wait(1) catch |err| {
+            if (err == error.SignalInterrupt) {
+                continue;
+            }
+            return err;
+        };
+        const n2 = self.ring.copy_cqes(&cqes, 0) catch |err| {
+            if (err == error.SignalInterrupt) {
+                continue;
+            }
+            return err;
+        };
         dispatchCqes(self, &cqes, n2);
         drainPendingResumes(self);
         if (self.fiber_shared) |fs| fs.tick();
