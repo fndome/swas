@@ -8,11 +8,10 @@ pub const ProcessFn = *const fn (ctx: ?*anyopaque, chunk: []const u8, resp: *Def
 pub const StreamHandle = struct {
     const Self = @This();
 
-    large_buf: []u8,            // IO 写目标: LargeBufferPool 1MB
-    worker_buf: []u8,           // Worker 读目标: init 一次分配, dispatch 复用
-    offset: usize,              // 已攒字节数
-    threshold: usize,           // 触发 dispatch 的字节阈值
-    eof: bool,                  // 流已结束
+    large_buf: []u8,            // IO write target: LargeBufferPool 1MB
+    offset: usize,              // bytes accumulated in large_buf
+    threshold: usize,           // dispatch trigger byte count
+    eof: bool,                  // stream finished
     job_id: u64,
     slot_idx: u32,
     resp: *DeferredResponse,
@@ -23,10 +22,8 @@ pub const StreamHandle = struct {
 
     pub fn init(large_buf: []u8, threshold: usize, slot_idx: u32, resp: *DeferredResponse, process_fn: ProcessFn, process_ctx: ?*anyopaque) Self {
         const thresh = if (threshold == 0) CHUNK_DEFAULT else threshold;
-        const wbuf = resp.allocator.alloc(u8, thresh) catch @panic("StreamHandle: OOM");
         return .{
             .large_buf = large_buf,
-            .worker_buf = wbuf,
             .offset = 0,
             .threshold = thresh,
             .eof = false,
@@ -36,11 +33,6 @@ pub const StreamHandle = struct {
             .process_fn = process_fn,
             .process_ctx = process_ctx,
         };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.resp.allocator.free(self.worker_buf);
-        self.worker_buf = &.{};
     }
 
     pub fn feed(self: *Self, data: []const u8) bool {
@@ -81,14 +73,24 @@ pub const StreamHandle = struct {
 
     fn dispatch(self: *Self) void {
         if (self.offset == 0) return;
-        std.debug.assert(self.offset <= self.worker_buf.len);
-        @memcpy(self.worker_buf[0..self.offset], self.large_buf[0..self.offset]);
+        std.debug.assert(self.offset <= self.large_buf.len);
+        // Allocate a dedicated buffer for the worker so the next dispatch
+        // does not overwrite data the worker is still reading. The worker
+        // pool runs asynchronously; reusing worker_buf is a data race.
+        const chunk_copy = self.resp.allocator.alloc(u8, self.offset) catch {
+            // OOM during streaming: the worker cannot process this chunk.
+            // The stream is degraded but the connection remains alive.
+            self.offset = 0;
+            return;
+        };
+        @memcpy(chunk_copy[0..self.offset], self.large_buf[0..self.offset]);
         const chunk_len = self.offset;
         self.offset = 0;
 
         const ctx = ChunkDispatchCtx{
-            .chunk = self.worker_buf.ptr,
+            .chunk = chunk_copy.ptr,
             .chunk_len = chunk_len,
+            .chunk_alloc = chunk_copy,
             .process_fn = self.process_fn,
             .process_ctx = self.process_ctx,
             .resp = self.resp,
@@ -103,11 +105,16 @@ fn runChunkWorker(c: *ChunkDispatchCtx, complete: *const fn (?*anyopaque, []cons
     _ = complete;
     const chunk = c.chunk[0..c.chunk_len];
     c.process_fn(c.process_ctx, chunk, c.resp);
+    // Free the per-chunk buffer allocated by dispatch() to prevent
+    // overwrite races when the next chunk arrives before this worker
+    // finishes processing.
+    c.resp.allocator.free(c.chunk_alloc);
 }
 
 const ChunkDispatchCtx = struct {
     chunk: [*]u8,
     chunk_len: usize,
+    chunk_alloc: []u8,
     process_fn: ProcessFn,
     process_ctx: ?*anyopaque,
     resp: *DeferredResponse,
