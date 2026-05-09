@@ -175,13 +175,17 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                     const bid = @as(u16, @truncate(cqe.flags >> 16));
                     self.buffer_pool.markReplenish(bid);
                 }
-                // write just completed — clear flag so closeConn can
-                // enter its normal buffer-freeing path (see closeConn
-                // writev_in_flight guard).
                 if (conn_ptr.pool_idx != 0xFFFFFFFF) {
                     self.pool.slots[conn_ptr.pool_idx].line4.writev_in_flight = 0;
                 }
                 self.closeConn(conn_id, conn_ptr.fd);
+            } else if (conn_ptr.state == .waiting_computation) {
+                // Worker pool still computing; no new I/O is submitted in this state.
+                // A residual CQE (e.g. a late read completion) must only replenish
+                // its buffer — do NOT close the connection.
+                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                    self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
+                }
             } else {
                 self.closeConn(conn_id, conn_ptr.fd);
             }
