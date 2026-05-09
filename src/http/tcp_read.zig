@@ -19,6 +19,7 @@ const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
 const READ_BUF_GROUP_ID = @import("../constants.zig").READ_BUF_GROUP_ID;
 const MAX_BUFFERED_BODY_SIZE: u64 = 1024 * 1024;
+const MAX_REASSEMBLED_HEADER_SIZE: usize = BUFFER_SIZE * 2;
 
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const httpTaskExec = http_fiber.httpTaskExec;
@@ -64,7 +65,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
         if (hw.pending_len > 0 and hw.pending_bid != 0) {
             const prev_buf = self.buffer_pool.getReadBuf(hw.pending_bid);
-            var combo: [8192]u8 = undefined;
+            var combo: [MAX_REASSEMBLED_HEADER_SIZE]u8 = undefined;
             const prev_len = @min(hw.pending_len, combo.len);
             const cur_len = @min(nread, combo.len - prev_len);
             @memcpy(combo[0..prev_len], prev_buf[0..prev_len]);
@@ -89,9 +90,13 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     const has_header_end = std.mem.indexOf(u8, effective_buf, "\r\n\r\n") != null or
         std.mem.indexOf(u8, effective_buf, "\n\n") != null;
     if (!has_header_end) {
-        if (effective_nread > self.cfg.max_header_buffer_size) {
+        const header_limit = reassembledHeaderLimit(self.cfg.max_header_buffer_size);
+        if (headerBufferFullWithoutTerminator(effective_nread, header_limit)) {
+            // 修改原因：重组缓冲到达上限且仍无 header 结束符时，下一次读取已无法继续追加字节；
+            // 继续 submitRead 会让连接卡在 8192 字节重组循环里，应立即返回 431。
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
+            conn.keep_alive = false;
             self.respond(conn, 431, "Request Header Fields Too Large");
             return;
         }
@@ -445,7 +450,21 @@ fn fitsLargeBodyBuffer(content_length: u64) bool {
     return content_length <= MAX_BUFFERED_BODY_SIZE;
 }
 
+fn reassembledHeaderLimit(configured_limit: u32) usize {
+    return @min(@as(usize, configured_limit), MAX_REASSEMBLED_HEADER_SIZE);
+}
+
+fn headerBufferFullWithoutTerminator(effective_nread: usize, header_limit: usize) bool {
+    return effective_nread >= header_limit;
+}
+
 test "large body buffer limit rejects truncation" {
     try std.testing.expect(fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE));
     try std.testing.expect(!fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE + 1));
+}
+
+test "header reassembly rejects at full buffer without terminator" {
+    try std.testing.expect(headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE, reassembledHeaderLimit(8192)));
+    try std.testing.expect(!headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE - 1, reassembledHeaderLimit(8192)));
+    try std.testing.expectEqual(@as(usize, MAX_REASSEMBLED_HEADER_SIZE), reassembledHeaderLimit(16 * 1024));
 }
