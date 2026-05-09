@@ -13,10 +13,10 @@ pub fn submitBodyRead(self: *AsyncServer, conn: *Connection, large_buf: []u8, sl
     const remaining = slot.line3.large_buf_len - slot.line3.large_buf_offset;
     if (remaining == 0) return;
     const user_data = packUserData(conn.gen_id, conn.pool_idx);
-    const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
+    const fd = if (conn.fixed_index != 0xFFFF) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
     const dest = large_buf[slot.line3.large_buf_offset..][0..@min(remaining, large_buf.len - slot.line3.large_buf_offset)];
     const sqe = try self.ring.read(user_data, fd, .{ .buffer = dest }, 0);
-    if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+    if (conn.fixed_index != 0xFFFF) sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
 pub fn onBodyChunk(self: *AsyncServer, conn_id: u64, res: i32) void {

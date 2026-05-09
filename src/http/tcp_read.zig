@@ -29,11 +29,11 @@ const httpTaskComplete = http_fiber.httpTaskComplete;
 pub fn submitRead(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
     _ = conn_id;
     const user_data = packUserData(conn.gen_id, conn.pool_idx);
-    const fd = if (self.use_fixed_files) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
+    const fd = if (conn.fixed_index != 0xFFFF) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
     const sqe = self.ring.read(user_data, fd, .{
         .buffer_selection = .{ .group_id = READ_BUF_GROUP_ID, .len = BUFFER_SIZE },
     }, 0) catch return error.RingFull;
-    if (self.use_fixed_files) sqe.flags |= linux.IOSQE_FIXED_FILE;
+    if (conn.fixed_index != 0xFFFF) sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
 pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe_flags: u32) void {

@@ -103,9 +103,13 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
 
     if (self.use_fixed_files) {
         if (getConn(self, conn_id)) |conn| {
-            const idx = conn.fixed_index;
-            _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
-            self.freeFixedIndex(idx);
+            if (conn.fixed_index == 0xFFFF) {
+                // no fixed file registered; skip deregister
+            } else {
+                const idx = conn.fixed_index;
+                _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
+                self.freeFixedIndex(idx);
+            }
         }
     }
 

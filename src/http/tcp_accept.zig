@@ -69,30 +69,27 @@ pub fn onAcceptComplete(self: *AsyncServer, res: i32, user_data: u64) void {
     };
 
     if (self.use_fixed_files) {
-        const idx = allocFixedIndex(self) catch {
-            const rc = linux.close(conn_fd);
-            if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-            sticker.slotFree(&self.pool, pool_idx);
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-            return;
-        };
-        if (self.ring.register_files_update(idx, &[_]linux.fd_t{conn_fd})) {
+        if (allocFixedIndex(self)) |idx| {
             conn.fixed_index = idx;
         } else |_| {
-            freeFixedIndex(self, idx);
-            const rc = linux.close(conn_fd);
-            if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
-            sticker.slotFree(&self.pool, pool_idx);
-            self.accept_stalled = true;
-            self.submitAccept() catch |err| logErr("failed to resubmit accept: {s}", .{@errorName(err)});
-            return;
+            // Fixed-file table is full. Fall back to plain-fd I/O for
+            // this connection rather than silently dropping it. At 1M
+            // connections only the first MAX_FIXED_FILES use the fast path;
+            // the rest operate correctly with regular fd-based I/O.
+        }
+        if (conn.fixed_index != 0xFFFF) {
+            if (self.ring.register_files_update(conn.fixed_index, &[_]linux.fd_t{conn_fd})) {
+                // OK — fixed_index was set above
+            } else |_| {
+                freeFixedIndex(self, conn.fixed_index);
+                conn.fixed_index = 0xFFFF;
+            }
         }
     }
 
     self.connections.put(conn_id, conn) catch {
         sticker.slotFree(&self.pool, pool_idx);
-        if (self.use_fixed_files) {
+        if (conn.fixed_index != 0xFFFF) {
             const idx = conn.fixed_index;
             _ = self.ring.register_files_update(idx, &[_]linux.fd_t{-1}) catch {};
             freeFixedIndex(self, idx);

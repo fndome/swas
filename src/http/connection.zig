@@ -18,7 +18,8 @@ pub const ConnState = enum(u8) {
 pub const Connection = struct {
     id: u64,
     fd: i32,
-    fixed_index: u16 = 0,
+    /// 0xFFFF = no fixed file registered; fall back to plain fd for I/O.
+    fixed_index: u16 = 0xFFFF,
     state: ConnState = .reading,
     read_bid: u16 = 0,
     read_len: usize = 0,
