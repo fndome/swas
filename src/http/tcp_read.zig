@@ -165,9 +165,6 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         const hw4 = sticker.httpWork(slot);
         const headers_end = if (hw4.headers_end > 0) hw4.headers_end else effective_nread;
         if (headers_end >= effective_nread) {
-            slot.line5.ws.compute.job_id = conn_id;
-            slot.line5.ws.compute.buffer_ptr = hw4.content_length;
-
             const large_buf = self.large_pool.acquire() orelse {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
@@ -187,9 +184,6 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             };
             return;
         } else {
-            slot.line5.ws.compute.job_id = conn_id;
-            slot.line5.ws.compute.buffer_ptr = hw4.content_length;
-
             const body_fragment = effective_buf[headers_end..effective_nread];
             const large_buf = self.large_pool.acquire() orelse {
                 self.buffer_pool.markReplenish(bid);
