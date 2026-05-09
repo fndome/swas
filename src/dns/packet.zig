@@ -117,14 +117,22 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     var q: u16 = 0;
     while (q < qdcount) : (q += 1) {
         off = skipName(packet, off);
+        if (off + 4 > packet.len) {
+            resp.rcode = .SERVFAIL;
+            return resp;
+        }
         off += 4;
     }
 
     var min_ttl: u32 = std.math.maxInt(u32);
     var i: u16 = 0;
     while (i < total) : (i += 1) {
-        if (off + 10 > packet.len) break;
         off = skipName(packet, off);
+        if (off + 10 > packet.len) {
+            // 修改原因：畸形 DNS name 可能让 skipName 直接返回 packet.len；
+            // 必须在跳过 name 后再检查 RR 头长度，避免后续 readInt 越界 panic。
+            break;
+        }
         const rtype = std.mem.readInt(u16, packet[off..][0..2], .big);
         off += 2;
         _ = std.mem.readInt(u16, packet[off..][0..2], .big);
@@ -169,4 +177,24 @@ fn skipName(packet: []const u8, start: usize) usize {
 pub fn parseTxid(packet: []const u8) u16 {
     if (packet.len < 2) return 0;
     return std.mem.readInt(u16, packet[0..2], .big);
+}
+
+test "parseResponse tolerates malformed answer name" {
+    var pkt = [_]u8{0} ** 24;
+    pkt[2] = 0x80; // QR response
+    pkt[7] = 1; // ANCOUNT = 1
+    pkt[12] = 20; // label claims more bytes than the packet contains
+
+    const parsed = parseResponse(&pkt);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
+}
+
+test "parseResponse rejects truncated question" {
+    var pkt = [_]u8{0} ** 16;
+    pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
+    pkt[12] = 20; // malformed question name
+
+    const parsed = parseResponse(&pkt);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
 }
