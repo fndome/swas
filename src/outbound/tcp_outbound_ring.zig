@@ -72,9 +72,7 @@ pub const TcpOutboundRing = struct {
                     return;
                 }
                 conn.state = .idle;
-                if (conn.stream != null or conn.on_read != null) {
-                    conn.submitRead(&self.ring) catch self.removeConn(conn);
-                }
+                self.submitReadyIo(conn);
             },
             .reading => {
                 if (res <= 0) {
@@ -88,7 +86,7 @@ pub const TcpOutboundRing = struct {
                 } else if (conn.on_read) |cb| {
                     cb(conn.on_read_ctx, conn.read_buf[0..n]);
                 }
-                conn.submitRead(&self.ring) catch self.removeConn(conn);
+                self.submitReadyIo(conn);
             },
             .writing => {
                 if (res <= 0) {
@@ -100,14 +98,24 @@ pub const TcpOutboundRing = struct {
                     conn.wbuf_len = 0;
                     conn.written = 0;
                     conn.state = .idle;
-                    if (conn.stream != null or conn.on_read != null) {
-                        conn.submitRead(&self.ring) catch self.removeConn(conn);
-                    }
+                    self.submitReadyIo(conn);
                 } else {
                     conn.submitWrite(&self.ring) catch self.removeConn(conn);
                 }
             },
             .idle, .closing => {},
+        }
+    }
+
+    fn submitReadyIo(self: *Self, conn: *TcpConn) void {
+        switch (conn.nextReadyIo()) {
+            .write => {
+                // 修改原因：write() 允许在 connecting/reading 状态先缓存数据；恢复可调度后必须先冲刷写缓冲，
+                // 否则 NATS SUB 这类 connect 后立即写入的请求会被后续 read 抢占并长期卡住。
+                conn.submitWrite(&self.ring) catch self.removeConn(conn);
+            },
+            .read => conn.submitRead(&self.ring) catch self.removeConn(conn),
+            .idle => {},
         }
     }
 
@@ -181,6 +189,13 @@ pub const TcpConn = struct {
     written: usize,
 
     pub const State = enum(u8) { connecting, idle, reading, writing, closing };
+    const ReadyIo = enum { write, read, idle };
+
+    fn nextReadyIo(self: *const TcpConn) ReadyIo {
+        if (self.written < self.wbuf_len) return .write;
+        if (self.stream != null or self.on_read != null) return .read;
+        return .idle;
+    }
 
     // Queue an SQE via the ring; actual submission is batched in tick().
     // Calling ring.submit() per I/O would trigger io_uring_enter on every
@@ -207,3 +222,27 @@ pub const TcpConn = struct {
         allocator.destroy(self);
     }
 };
+
+fn dummyRead(_: ?*anyopaque, _: []const u8) void {}
+
+test "TcpConn prefers pending writes before re-arming reads" {
+    var read_buf: [0]u8 = .{};
+    var conn = TcpConn{
+        .fd = -1,
+        .token = 1,
+        .state = .idle,
+        .stream = null,
+        .on_read = dummyRead,
+        .on_read_ctx = null,
+        .read_buf = read_buf[0..],
+        .wbuf = .{},
+        .wbuf_len = 4,
+        .written = 0,
+    };
+
+    try std.testing.expectEqual(TcpConn.ReadyIo.write, conn.nextReadyIo());
+    conn.written = conn.wbuf_len;
+    try std.testing.expectEqual(TcpConn.ReadyIo.read, conn.nextReadyIo());
+    conn.on_read = null;
+    try std.testing.expectEqual(TcpConn.ReadyIo.idle, conn.nextReadyIo());
+}
