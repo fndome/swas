@@ -7,6 +7,7 @@ const sticker = @import("../stack_pool_sticker.zig");
 const packUserData = @import("../stack_pool.zig").packUserData;
 const CLOSE_USER_DATA_FLAG = @import("../stack_pool.zig").CLOSE_USER_DATA_FLAG;
 const ACCEPT_USER_DATA = @import("../constants.zig").ACCEPT_USER_DATA;
+const logErr = @import("http_helpers.zig").logErr;
 
 pub fn getConn(self: *AsyncServer, conn_id: u64) ?*Connection {
     if (sticker.lookupByConnId(&self.pool, &self.connections, conn_id)) |r| {
@@ -76,6 +77,14 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
 
         if (conn.state == .closing or fd == 0) {
             sticker.connFree(&self.pool, &self.connections, conn_id);
+            // A slot was just freed. If accept was stalled due to pool full,
+            // resume the accept chain now. This avoids the tight accept-fail-
+            // close loop that would otherwise spin CPU when at capacity.
+            if (self.accept_stalled) {
+                self.submitAccept() catch |err| {
+                    logErr("accept recovery failed: {s}", .{@errorName(err)});
+                };
+            }
             return;
         }
 
