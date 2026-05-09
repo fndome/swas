@@ -24,28 +24,38 @@ pub const Context = struct {
     pub fn json(self: *Context, status: u16, value: anytype) !void {
         self.status = status;
         self.content_type = .json;
-        if (self.body) |old| self.allocator.free(old);
+        // Save old, null field, then free — if dupe fails, body is null
+        // rather than a dangling pointer to freed memory.
+        const old = self.body;
+        self.body = null;
+        if (old) |b| self.allocator.free(b);
         self.body = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
     }
 
     pub fn rawJson(self: *Context, status: u16, data: []const u8) !void {
         self.status = status;
         self.content_type = .json;
-        if (self.body) |old| self.allocator.free(old);
+        const old = self.body;
+        self.body = null;
+        if (old) |b| self.allocator.free(b);
         self.body = try self.allocator.dupe(u8, data);
     }
 
     pub fn text(self: *Context, status: u16, data: []const u8) !void {
         self.status = status;
         self.content_type = .plain;
-        if (self.body) |old| self.allocator.free(old);
+        const old = self.body;
+        self.body = null;
+        if (old) |b| self.allocator.free(b);
         self.body = try self.allocator.dupe(u8, data);
     }
 
     pub fn html(self: *Context, status: u16, data: []const u8) !void {
         self.status = status;
         self.content_type = .html;
-        if (self.body) |old| self.allocator.free(old);
+        const old = self.body;
+        self.body = null;
+        if (old) |b| self.allocator.free(b);
         self.body = try self.allocator.dupe(u8, data);
     }
 
