@@ -6,6 +6,7 @@ pub fn isUpgradeRequest(data: []const u8) bool {
     if (std.mem.indexOf(u8, data, "\r\n\r\n") == null) return false;
 
     var has_upgrade = false;
+    var has_connection_upgrade = false;
     var has_ws_key = false;
     var has_ws_version = false;
     var lines = std.mem.splitSequence(u8, data, "\r\n");
@@ -15,6 +16,13 @@ pub fn isUpgradeRequest(data: []const u8) bool {
             const value = std.mem.trim(u8, line["Upgrade:".len..], " \t");
             if (std.ascii.eqlIgnoreCase(value, "websocket")) {
                 has_upgrade = true;
+            }
+        }
+        if (std.ascii.startsWithIgnoreCase(line, "Connection:")) {
+            const value = std.mem.trim(u8, line["Connection:".len..], " \t\r\n");
+            // 修改原因：RFC 6455 握手必须带 Connection: Upgrade；只看 Upgrade 头会把普通请求误升级。
+            if (headerValueHasToken(value, "upgrade")) {
+                has_connection_upgrade = true;
             }
         }
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Key:")) {
@@ -27,7 +35,16 @@ pub fn isUpgradeRequest(data: []const u8) bool {
             }
         }
     }
-    return has_upgrade and has_ws_key and has_ws_version;
+    return has_upgrade and has_connection_upgrade and has_ws_key and has_ws_version;
+}
+
+fn headerValueHasToken(value: []const u8, token: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
+    }
+    return false;
 }
 
 pub fn extractWsKey(data: []const u8) ?[]const u8 {
@@ -69,4 +86,23 @@ pub fn buildUpgradeResponse(buf: []u8, accept_key: []const u8) !usize {
         .{accept_key},
     );
     return written.len;
+}
+
+test "isUpgradeRequest requires Connection upgrade token" {
+    const missing_connection =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(missing_connection));
+
+    const comma_separated_connection =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: keep-alive, Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(isUpgradeRequest(comma_separated_connection));
 }
