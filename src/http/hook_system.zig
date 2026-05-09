@@ -42,6 +42,9 @@ pub fn sendDeferredResponse(self: *AsyncServer, conn_id: u64, status: u16, ct: C
         .body = body,
     };
     invokeOnIoThread(self, DeferredNode, node, deferredRespond) catch {
+        // InvokeQueue full: the deferred response cannot be delivered.
+        // Free the body to avoid leaking and log the drop.
+        std.log.err("sendDeferredResponse: invoke queue full, dropping response for conn_id={d}", .{conn_id});
         self.allocator.free(body);
     };
 }
