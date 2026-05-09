@@ -130,6 +130,8 @@ pub fn ensureNext(self: *AsyncServer) void {
 pub fn register(self: *AsyncServer, method: []const u8, path: []const u8, handler: Handler) !void {
     ensureNext(self);
     const key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ method, path });
+    // If fetchPut fails (hashmap grow OOM), key is not stored — free it.
+    errdefer self.allocator.free(key);
     const old = try self.handlers.fetchPut(key, handler);
     if (old) |kv| {
         self.allocator.free(kv.key);
