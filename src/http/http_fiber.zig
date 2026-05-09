@@ -54,53 +54,40 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
 
     var handled = false;
 
-    if (server.middlewares.has_global) {
-        for (server.middlewares.global.items) |mw| {
-            const stop = mw(server.allocator, &ctx) catch |err| {
-                logErr("global middleware error: {s}", .{@errorName(err)});
-                if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                handled = true;
-                break;
-            };
-            if (stop or ctx.body != null) {
-                handled = true;
-                break;
+    // Extract the common iteration pattern: for each middleware in a list,
+    // call it, handle errors, and stop on true return or body set.
+    // Previously duplicated 3x (global/precise/wildcard) with identical logic.
+    const runMiddlewareList = struct {
+        fn run(server2: *AsyncServer, ctx2: *Context, handled2: *bool, list: []const @import("types.zig").Middleware) void {
+            for (list) |mw| {
+                const stop = mw(server2.allocator, ctx2) catch |err| {
+                    logErr("middleware error: {s}", .{@errorName(err)});
+                    if (ctx2.body == null) ctx2.text(500, @errorName(err)) catch {};
+                    handled2.* = true;
+                    break;
+                };
+                if (stop or ctx2.body != null) {
+                    handled2.* = true;
+                    break;
+                }
             }
         }
+    }.run;
+
+    if (server.middlewares.has_global) {
+        runMiddlewareList(server, &ctx, &handled, server.middlewares.global.items);
     }
 
     if (!handled) {
         if (server.middlewares.precise.get(path)) |list| {
-            for (list.items) |mw| {
-                const stop = mw(server.allocator, &ctx) catch |err| {
-                    logErr("precise middleware error: {s}", .{@errorName(err)});
-                    if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                    handled = true;
-                    break;
-                };
-                if (stop or ctx.body != null) {
-                    handled = true;
-                    break;
-                }
-            }
+            runMiddlewareList(server, &ctx, &handled, list.items);
         }
     }
 
     if (!handled) {
         for (server.middlewares.wildcard.items) |entry| {
             if (entry.rule.match(path)) {
-                for (entry.list.items) |mw| {
-                    const stop = mw(server.allocator, &ctx) catch |err| {
-                        logErr("wildcard middleware error: {s}", .{@errorName(err)});
-                        if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                        handled = true;
-                        break;
-                    };
-                    if (stop or ctx.body != null) {
-                        handled = true;
-                        break;
-                    }
-                }
+                runMiddlewareList(server, &ctx, &handled, entry.list.items);
                 if (handled) break;
             }
         }
