@@ -13,7 +13,9 @@ pub const Response = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *Response) void {
-        self.allocator.free(self.body);
+        // Guard: a zero-length body may be a compile-time constant from the
+        // makeErrorResponse triple-fallback path. Only free heap-allocated bodies.
+        if (self.body.len > 0) self.allocator.free(self.body);
     }
 };
 
@@ -98,6 +100,8 @@ fn responseCompleteLen(data: []const u8) !?usize {
 }
 
 fn makeErrorResponse(allocator: Allocator, status: u16, msg: []const u8) Response {
+    // Triple-fallback: dupe -> alloc(0) -> zero-length compile-time literal.
+    // The final literal is safe because Response.deinit guards on body.len > 0.
     const body = allocator.dupe(u8, msg) catch allocator.alloc(u8, 0) catch &.{};
     return .{ .status = status, .body = body, .allocator = allocator };
 }
