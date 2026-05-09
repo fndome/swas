@@ -18,6 +18,7 @@ const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
 const READ_BUF_GROUP_ID = @import("../constants.zig").READ_BUF_GROUP_ID;
+const MAX_BUFFERED_BODY_SIZE: u64 = 1024 * 1024;
 
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
 const httpTaskExec = http_fiber.httpTaskExec;
@@ -172,15 +173,25 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         const slot = &self.pool.slots[conn.pool_idx];
         const hw4 = sticker.httpWork(slot);
         const headers_end = if (hw4.headers_end > 0) hw4.headers_end else effective_nread;
+        if (!fitsLargeBodyBuffer(hw4.content_length)) {
+            // 修改原因：LargeBufferPool 每块只有 1MB；继续用 min(content_length, large_buf.len)
+            // 会把超大请求体截断后交给业务层，并把剩余字节留在连接里污染后续请求。
+            self.buffer_pool.markReplenish(bid);
+            conn.read_len = 0;
+            conn.keep_alive = false;
+            self.respond(conn, 413, "Content Too Large");
+            return;
+        }
         if (headers_end >= effective_nread) {
             const large_buf = self.large_pool.acquire() orelse {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
+                conn.keep_alive = false;
                 self.respond(conn, 413, "Content Too Large");
                 return;
             };
             slot.line3.large_buf_ptr = @intFromPtr(large_buf.ptr);
-            slot.line3.large_buf_len = @intCast(@min(hw4.content_length, large_buf.len));
+            slot.line3.large_buf_len = @intCast(hw4.content_length);
             slot.line3.large_buf_offset = 0;
 
             conn.read_len = 0;
@@ -196,11 +207,12 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             const large_buf = self.large_pool.acquire() orelse {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
+                conn.keep_alive = false;
                 self.respond(conn, 413, "Content Too Large");
                 return;
             };
             slot.line3.large_buf_ptr = @intFromPtr(large_buf.ptr);
-            slot.line3.large_buf_len = @intCast(@min(hw4.content_length, large_buf.len));
+            slot.line3.large_buf_len = @intCast(hw4.content_length);
             slot.line3.large_buf_offset = 0;
 
             @memcpy(large_buf[0..body_fragment.len], body_fragment);
@@ -428,3 +440,12 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
 }
 
 const statusText = @import("http_response.zig").statusText;
+
+fn fitsLargeBodyBuffer(content_length: u64) bool {
+    return content_length <= MAX_BUFFERED_BODY_SIZE;
+}
+
+test "large body buffer limit rejects truncation" {
+    try std.testing.expect(fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE));
+    try std.testing.expect(!fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE + 1));
+}
