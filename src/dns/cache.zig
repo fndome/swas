@@ -58,8 +58,11 @@ pub const DnsCache = struct {
 
         for (self.entries.items) |*entry| {
             if (entry.key_hash == hash and std.mem.eql(u8, entry.name, name)) {
+                const name_dup = try self.allocator.dupe(u8, name);
+                // 修改原因：更新已有缓存项时必须先分配新 name，成功后再释放旧 name；
+                // 旧逻辑先 free 再 dupe，OOM 会把 entry.name 留成悬空指针。
                 self.allocator.free(entry.name);
-                entry.name = try self.allocator.dupe(u8, name);
+                entry.name = name_dup;
                 entry.expires_at_ms = expires;
                 entry.negative = negative;
                 entry.addr_count = @intCast(@min(addrs.len, MAX_IP));
@@ -132,4 +135,19 @@ fn hashName(name: []const u8) u64 {
         h *%= 0x100000001b3;
     }
     return h;
+}
+
+test "DnsCache replaces existing entry after allocating replacement name" {
+    var cache = DnsCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const first = [_]u32{0x01020304};
+    const second = [_]u32{0x05060708};
+
+    try cache.put("example.com", first[0..], 30, 0, false);
+    try cache.put("example.com", second[0..], 30, 1000, false);
+
+    const cached = cache.get("example.com", 1000).?;
+    try std.testing.expectEqual(@as(usize, 1), cached.addrs.len);
+    try std.testing.expectEqual(second[0], cached.addrs[0]);
 }
