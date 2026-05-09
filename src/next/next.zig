@@ -216,8 +216,15 @@ fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask
             .poll_ctx = poll_ctx,
             .stack = stack,
         }) catch {
+            // OOM: resume the fiber to completion. If it yields again after
+            // the resume, the task and stack are leaked (cannot re-append
+            // under memory pressure). Release them to bound the damage.
             @import("fiber.zig").saved_call = call;
             Fiber.resumeContext(ctx);
+            if (Fiber.isYielded()) {
+                pool.releaseStack(stack);
+                pool.allocator.destroy(task);
+            }
         };
         @import("fiber.zig").parked_ctx = null;
         @import("fiber.zig").parked_poll = null;
@@ -254,7 +261,12 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
             .stack = pt.stack,  // 栈随任务跨 yield 存活
-        }) catch {};
+        }) catch {
+            // OOM: cannot re-park the fiber. Release stack and task
+            // to avoid leaking resources since the poll may never trigger.
+            pool.releaseStack(pt.stack);
+            pool.allocator.destroy(pt.task);
+        };
         @import("fiber.zig").parked_ctx = null;
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;
