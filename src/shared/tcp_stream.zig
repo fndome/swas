@@ -6,10 +6,11 @@ const RingShared = @import("ring_shared.zig").RingShared;
 const DnsResolver = @import("../dns/resolver.zig").DnsResolver;
 
 pub const CLIENT_READ_BUF = 16384;
+const CLIENT_WRITE_USER_DATA_FLAG: u64 = 1 << 61;
 
-fn clientDispatch(ptr: *anyopaque, res: i32) void {
+fn clientDispatch(ptr: *anyopaque, user_data: u64, res: i32) void {
     const self: *RingSharedClient = @ptrCast(@alignCast(ptr));
-    self.dispatchCqeRes(res);
+    self.dispatchCqeRes(user_data, res);
 }
 
 pub const RingSharedClient = struct {
@@ -171,7 +172,9 @@ pub const RingSharedClient = struct {
         const to_send = self.write_buf.items[self.write_offset..];
         const use_fixed = self.fixed_index != 0xFFFF;
         const fd_or_idx = if (use_fixed) @as(i32, @intCast(self.fixed_index)) else self.fd;
-        const sqe = try self.rs.ringPtr().write(self.id, fd_or_idx, to_send, 0);
+        // 修改原因：同一连接上可能同时存在 keep-alive 读 CQE 和新请求写 CQE；
+        // 给写操作打标记，完成时才能按真实操作类型分发，而不是靠 self.writing 猜。
+        const sqe = try self.rs.ringPtr().write(self.id | CLIENT_WRITE_USER_DATA_FLAG, fd_or_idx, to_send, 0);
         if (use_fixed) sqe.flags |= linux.IOSQE_FIXED_FILE;
         self.writing = true;
     }
@@ -189,10 +192,10 @@ pub const RingSharedClient = struct {
     }
 
     pub fn dispatchCqe(self: *RingSharedClient, cqe: *const linux.io_uring_cqe) void {
-        self.dispatchCqeRes(cqe.res);
+        self.dispatchCqeRes(cqe.user_data, cqe.res);
     }
 
-    fn dispatchCqeRes(self: *RingSharedClient, res: i32) void {
+    fn dispatchCqeRes(self: *RingSharedClient, user_data: u64, res: i32) void {
         switch (self.state) {
             .connecting => {
                 if (res < 0) {
@@ -234,7 +237,9 @@ pub const RingSharedClient = struct {
                     self.onClose();
                     return;
                 }
-                if (self.writing) {
+                if (isWriteCqe(user_data)) {
+                    // 修改原因：keep-alive 复用时旧 read CQE 可能在新 write 之后返回；
+                    // 只有带写标记的 CQE 才能推进 write_offset，避免把 read 完成误当写完成。
                     self.write_offset += @intCast(res);
                     self.flushWrite() catch {
                         self.onClose();
@@ -289,4 +294,14 @@ fn parseIpv4(ip_str: []const u8) !u32 {
         (@as(u32, octets[3]));
     // 修改原因：connectRaw 会直接把 ip 写进 sockaddr.in.addr，返回值必须是网络字节序布局。
     return std.mem.nativeToBig(u32, ip);
+}
+
+fn isWriteCqe(user_data: u64) bool {
+    return (user_data & CLIENT_WRITE_USER_DATA_FLAG) != 0;
+}
+
+test "RingSharedClient distinguishes write CQE user data" {
+    const base = @as(u64, 1) << 62;
+    try std.testing.expect(!isWriteCqe(base));
+    try std.testing.expect(isWriteCqe(base | CLIENT_WRITE_USER_DATA_FLAG));
 }

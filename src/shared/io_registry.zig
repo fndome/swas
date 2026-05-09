@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const CLIENT_USER_DATA_FLAG: u64 = 1 << 62;
 
-pub const CqeDispatchFn = *const fn (*anyopaque, i32) void;
+pub const CqeDispatchFn = *const fn (*anyopaque, u64, i32) void;
 
 const RegisteredEntry = struct {
     ptr: *anyopaque,
@@ -56,7 +56,7 @@ pub const IORegistry = struct {
         const idx = @as(u32, @truncate(ud));
         if (self.streams.getPtr(idx)) |entry| {
             if (entry.gen_id != gen) return;
-            entry.dispatch(entry.ptr, res);
+            entry.dispatch(entry.ptr, ud, res);
         }
     }
 };
