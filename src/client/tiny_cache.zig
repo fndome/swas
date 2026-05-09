@@ -78,18 +78,17 @@ pub const TinyCache = struct {
     /// 存入新连接到池。池满时返回 error.PoolFull。
     pub fn store(self: *TinyCache, stream: *RingSharedClient, p: Pipe, host: []const u8, port: u16, now_ms: i64) !void {
         if (!self.enabled()) {
-            stream.deinit();
-            return;
+            // 修改原因：store 失败时调用方仍负责释放 stream/pipe；这里提前 deinit 会和调用方 catch 路径 double-free。
+            return error.CacheDisabled;
         }
         self.evictExpired(now_ms);
         if (self.entries.items.len >= MAX_CONNS_PER_HOST) {
-            stream.deinit();
             return error.PoolFull;
         }
         const host_dup = self.allocator.dupe(u8, host) catch {
-            stream.deinit();
             return error.OutOfMemory;
         };
+        errdefer self.allocator.free(host_dup);
         try self.entries.append(.{
             .host = host_dup,
             .port = port,
@@ -163,3 +162,38 @@ pub const TinyCache = struct {
         return n;
     }
 };
+
+fn testPipe(stream: *RingSharedClient) Pipe {
+    return .{
+        .allocator = std.testing.allocator,
+        .stream = stream,
+        .read_buf = std.ArrayList(u8).empty,
+        .write_buf = std.ArrayList(u8).empty,
+        .max_read = 1,
+    };
+}
+
+test "TinyCache.store keeps stream ownership with caller on PoolFull" {
+    var cache = TinyCache.init(std.testing.allocator, 1000);
+    defer {
+        for (cache.entries.items) |*e| {
+            std.testing.allocator.free(e.host);
+        }
+        cache.entries.deinit(std.testing.allocator);
+    }
+
+    const fake_stream: *RingSharedClient = @ptrFromInt(0x1000);
+    for (0..MAX_CONNS_PER_HOST) |i| {
+        const host = try std.fmt.allocPrint(std.testing.allocator, "h{d}", .{i});
+        try cache.entries.append(.{
+            .host = host,
+            .port = 80,
+            .stream = fake_stream,
+            .pipe = testPipe(fake_stream),
+            .last_used_ms = 0,
+            .borrowed = false,
+        });
+    }
+
+    try std.testing.expectError(error.PoolFull, cache.store(fake_stream, testPipe(fake_stream), "overflow", 80, 0));
+}
