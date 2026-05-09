@@ -523,13 +523,14 @@ sws 内置极简 fiber（x86_64 + ARM64 Linux）。所有 handler fiber **共享
 |------|------|------|
 | StackSlot（每连接） | 384 字节 | 5 条独立缓存行子结构 |
 | StackPool（1M 槽位） | ~384 MB | 连续数组，warmup 预热 |
-| Freelist（1M u32） | 4 MB | O(1) 获取/释放 |
+| Connection hashmap（1M 条目） | ~160 MB | AutoHashMap(u64, Connection) |
+| Freelist + live 列表 | ~8 MB | 2 × [1M]u32，O(1) 获取/释放 |
 | 读缓冲区（空闲时） | 0 字节 | io_uring 提供缓冲区，空闲时归还 |
 | io_uring 读缓冲 slab | 64 MB | 16384 × 4KB 块，内核回收 |
 | 分层写缓冲池 | 动态 | 8 个尺寸类别（512B–64KB），freelist 循环复用 |
 | 共享 fiber 栈 | 256 KB | 所有 fiber 共用一块预分配栈 |
 | LargeBufferPool | 64 MB | 64 × 1MB 超大报文缓冲 |
-| **100 万空闲连接** | **~520 MB** | 无线程栈开销 |
+| **100 万空闲连接** | **~680 MB** | 无线程栈开销 |
 
 和 [greatws](https://github.com/antlabs/greatws) 一样，空闲连接消耗零缓冲内存。
 
@@ -569,6 +570,7 @@ WS handler 可将帧数据异步卸出，因此帧负载在 handler 返回后仍
 | `write_timeout_ms` | 5000 | 写超时关闭连接 |
 | `buffer_size` | 4096 | io_uring 缓冲区块大小 |
 | `buffer_pool_size` | 16384 | 缓冲区块数量 |
+| `max_fixed_files` | 65535 | 注册固定文件槽位数（超出后回退到普通 fd I/O） |
 
 ## invokeOnIoThread
 

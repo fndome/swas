@@ -740,13 +740,14 @@ See `example/` and `src/example.zig`.
 |-----------|------|-------|
 | StackSlot (per connection) | 384 bytes | 5 cache-line-aligned sub-structures |
 | StackPool (1M slots) | ~384 MB | contiguous, warmup-touched |
-| Freelist (1M u32) | 4 MB | O(1) acquire/release |
+| Connection hashmap (1M entries) | ~160 MB | AutoHashMap(u64, Connection) |
+| Freelist + live list | ~8 MB | 2 × [1M]u32, O(1) acquire/release |
 | Read buffer (idle) | 0 bytes | io_uring provided buffers, returned on idle |
 | Slab for io_uring reads | 64 MB | 16384 × 4KB blocks, kernel-recycled |
 | Tiered write pool | dynamic | 8 size classes (512B–64KB), freelist-recycled |
 | Shared fiber stack | 256 KB | All fibers share one pre-allocated stack |
 | LargeBufferPool | 64 MB | 64 × 1MB blocks for oversized requests |
-| **1M idle connections** | **~520 MB** | No per-thread stack overhead |
+| **1M idle connections** | **~680 MB** | No per-thread stack overhead |
 
 Like [greatws](https://github.com/antlabs/greatws), idle connections consume zero buffer memory.
 
@@ -786,6 +787,7 @@ WS handlers may offload frame data asynchronously, so frame payloads must remain
 | `write_timeout_ms` | 5000 | close stuck-write connections |
 | `buffer_size` | 4096 | io_uring buffer block size |
 | `buffer_pool_size` | 16384 | number of buffer blocks |
+| `max_fixed_files` | 65535 | registered fixed-file slots (beyond this uses plain-fd I/O) |
 
 ## invokeOnIoThread
 

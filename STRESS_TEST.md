@@ -29,7 +29,7 @@ scripts/self_test_local.sh
 
 **正常:**
 - IO 线程单线程顺序处理 CQE，无锁。
-- StackPool 320MB 预分配，freelist O(1)。
+- StackPool 384MB 预分配，freelist O(1)。
 
 **极端条件:**
 
@@ -37,9 +37,9 @@ scripts/self_test_local.sh
 |------|---------|------|------|
 | 共享栈溢出 | handler 递归/大局部变量 > 256KB | 栈帧破坏, 未定义行为 | fiber_stack_size_kb 可配; 禁止 handler 做大变量 |
 | shared_fiber_active 卡死 | 前一个 fiber yield 后未 resume | 后续所有请求走 per-task stack (Next.push) | ringbuffer 4096 容量, 满则丢任务 |
-| LargeBufferPool 枯竭 | 65 连接同时需要 >32KB body | acquire()=null, 413 Content Too Large | 当前上限 64, 可调大 |
-| CQE ring 溢出 | cqe_seen 比内核生产慢 | 内核丢事件 → 连接静默失败 | ring_entries=2048, 需保持 dispatchCqes < 50µs/CQE |
-| buffer_pool 枯竭 | 连接数超 pool_size(1024) | read 无 buffer → 连接关闭 | 当前上限 1024, 连接数超 1024 时退化 |
+| LargeBufferPool 枯竭 | 65 连接同时需要 >32KB body | acquire()=null, 413 Content Too Large | 当前上限 64 块, 可调大 |
+| CQE ring 溢出 | cqe_seen 比内核生产慢 | 内核丢事件 → 连接静默失败 | ring_entries=4096, 需保持 dispatchCqes < 50µs/CQE |
+| buffer_pool 枯竭 | 并发读超过 BUFFER_POOL_SIZE(16384) | io_uring 无空闲 provided buffer → read SQE stalled | 4× RING_ENTRIES 余量, 仅限并发读 CQE, 不限制连接数 |
 | Middleware/hook panic | 用户代码异常 | 连接直接关闭, 不波及其他连接 | handler 内部 try/catch |
 
 **最脆弱点: 共享栈 256KB 限制。** 所有 handler fiber 共用 256KB 栈。fiber_stack_size_kb 可调大。
@@ -72,7 +72,7 @@ scripts/self_test_local.sh
 
 | 场景 | 触发条件 | 表现 | 缓解 |
 |------|---------|------|------|
-| 池满攻击 | 瞬间 > 10K msg/s | acquire()=null → 新建连接 → store()=PoolFull → 返回 503 | 已修: MAX=10, 超出 503 |
+| 池满攻击 | 瞬间 > 10K msg/s | acquire()=null → 新建连接 → store()=PoolFull → 返回 503 | 已修: MAX_CONNS_PER_HOST=12, 超出 503 |
 | borrowed 串线 | Fiber A yield 时 Fiber B 借同一条 | 数据送错 fiber | 已修: borrowed 标志 + acquire 原子 |
 | RingB CQE 溢出 | DNS/NATS/HTTP 共享 RingB | CQE 环满 → 事件丢失 | 独立 ring (TcpOutboundRing) 缓解, RingB 仅 HTTP |
 | Fiber stack leak | Fiber 内 alloc 后异常退出 | 内存泄漏 | Fiber 不使用 general allocator, 栈上变量自动回收 |
@@ -107,7 +107,8 @@ scripts/self_test_local.sh
 |------|---------|------|-----------|
 | Ring A | 共享栈 256KB | 🔶 中 | fiber_stack_size_kb 可调大 |
 | StackPool | 1M 前 CPU 先到瓶颈 | 🟢 低 | 不修 |
+| Fixed Files | MAX_FIXED_FILES=65535, 超额回退普通 fd | 🟢 已修 | 连接不再因固定文件表满被丢弃 (b648cb2) |
 | HTTP Client | Pipe 无背压 | 🔶 中 | Pipe buffer 加上限 |
 | TinyCache | acquire-evict race | 🟢 低 | 减小 TTL 或加锁 |
 | TinyCache | Pipe 无背压 → OOM | 🔶 中 | Pipe buffer 加上限 |
-| TcpOutboundRing | wbuf 4KB → 大 write 丢数据 | 🔶 中 | wbuf → 64KB 或分段写 |
+| TcpOutboundRing | wbuf 64KB → 大 write 丢数据 | 🔶 中 | wbuf 已 64KB, 超限需分段写 |
