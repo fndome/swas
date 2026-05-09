@@ -25,7 +25,8 @@ const QueryResult = struct {
     ttl: u32,
 };
 
-fn dnsDispatch(ptr: *anyopaque, res: i32) void {
+fn dnsDispatch(ptr: *anyopaque, user_data: u64, res: i32) void {
+    _ = user_data;
     const self: *DnsResolver = @ptrCast(@alignCast(ptr));
     self.handleCqe(res);
 }
