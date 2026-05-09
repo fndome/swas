@@ -10,12 +10,23 @@ pub const DeferredResponse = struct {
     allocator: Allocator,
 
     pub fn json(self: *const DeferredResponse, status: u16, body: []const u8) void {
-        const duped = self.allocator.dupe(u8, body) catch return;
+        const duped = self.allocator.dupe(u8, body) catch {
+            // OOM: send a best-effort error response so the client does not
+            // hang indefinitely waiting for a deferred response that will
+            // never arrive.
+            const fallback = self.allocator.dupe(u8, "{\"error\":\"OOM\"}") catch return;
+            self.server.sendDeferredResponse(self.conn_id, 500, .json, fallback);
+            return;
+        };
         self.server.sendDeferredResponse(self.conn_id, status, .json, duped);
     }
 
     pub fn text(self: *const DeferredResponse, status: u16, body: []const u8) void {
-        const duped = self.allocator.dupe(u8, body) catch return;
+        const duped = self.allocator.dupe(u8, body) catch {
+            const fallback = self.allocator.dupe(u8, "OOM") catch return;
+            self.server.sendDeferredResponse(self.conn_id, 500, .plain, fallback);
+            return;
+        };
         self.server.sendDeferredResponse(self.conn_id, status, .plain, duped);
     }
 };
