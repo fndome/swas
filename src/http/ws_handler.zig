@@ -277,6 +277,11 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                     .complete = ws_fiber.wsTaskComplete,
                     .execFn = ws_fiber.wsTaskExec,
                 });
+                // If the handler yielded (e.g. DB / DNS wait), do NOT
+                // re-arm the read here. The complete callback fires
+                // after resume and handles read submission, preserving
+                // frame ordering.
+                if (Fiber.isYielded()) return;
             }
 
             if (conn.state != .ws_writing) {

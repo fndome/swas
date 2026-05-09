@@ -4,6 +4,8 @@ const AsyncServer = @import("async_server.zig").AsyncServer;
 const WsHandler = @import("../ws/server.zig").WsHandler;
 const ws_frame = @import("../ws/frame.zig");
 
+const Fiber = @import("../next/fiber.zig").Fiber;
+
 pub const WsTaskCtx = struct {
     tag: u32,
     server: *AsyncServer,
@@ -48,7 +50,20 @@ pub fn wsTaskCleanup(t: *WsTaskCtx) void {
 pub fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x57530001);
+    // isYielded is true only when the handler yielded and was later
+    // resumed. In that case onWsFrame skipped the read re-arm; do it now.
+    const deferred_read = Fiber.isYielded();
     t.server.shared_fiber_active = false;
     wsTaskRecycle(t);
+    if (deferred_read) {
+        if (t.server.connections.getPtr(t.conn_id)) |conn| {
+            if (conn.state != .ws_writing) {
+                conn.state = .ws_reading;
+                t.server.submitRead(t.conn_id, conn) catch {
+                    t.server.closeConn(t.conn_id, conn.fd);
+                };
+            }
+        }
+    }
     t.server.ws_ctx_pool.destroy(t);
 }
