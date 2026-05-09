@@ -76,6 +76,16 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
         }
 
         if (conn.state == .closing or fd == 0) {
+            // If a writev is still in-flight in the kernel, defer connFree.
+            // The write CQE handler (.closing dispatch) clears the flag and
+            // re-invokes closeConn. Freeing the slot now would orphan
+            // write_body/response_buf — the next CQE sees gen_id=0 and drops
+            // them silently, leaking heap + tiered-pool buffers.
+            if (conn.pool_idx != 0xFFFFFFFF and
+                self.pool.slots[conn.pool_idx].line4.writev_in_flight != 0)
+            {
+                return;
+            }
             sticker.connFree(&self.pool, &self.connections, conn_id);
             // A slot was just freed. If accept was stalled due to pool full,
             // resume the accept chain now. This avoids the tight accept-fail-
