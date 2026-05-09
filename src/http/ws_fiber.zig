@@ -24,10 +24,10 @@ pub fn wsTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
 
 pub fn wsTaskExecWrapperWithOwnership(t: *WsTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
     wsTaskExec(t, complete);
-    wsTaskCleanup(t);
+    wsTaskRecycle(t);
 }
 
-pub fn wsTaskCleanup(t: *WsTaskCtx) void {
+fn wsTaskRecycle(t: *WsTaskCtx) void {
     std.debug.assert(t.tag == 0x57530001);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
         if (!conn.read_buf_recycled) {
@@ -36,7 +36,12 @@ pub fn wsTaskCleanup(t: *WsTaskCtx) void {
         }
         conn.read_len = 0;
     }
+    // 修改原因：Next.push 会复制任务并自行释放任务内存，这里只释放任务持有的 payload。
     t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
+}
+
+pub fn wsTaskCleanup(t: *WsTaskCtx) void {
+    wsTaskRecycle(t);
     t.server.ws_ctx_pool.destroy(t);
 }
 
@@ -44,13 +49,6 @@ pub fn wsTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *WsTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x57530001);
     t.server.shared_fiber_active = false;
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-    }
-    t.server.buffer_pool.freeTieredWriteBuf(t.payload_buf, t.payload_tier);
+    wsTaskRecycle(t);
     t.server.ws_ctx_pool.destroy(t);
 }

@@ -178,6 +178,7 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
     {
         var temp_ctx = Context{
             .request_data = effective_buf,
+            .request_body = body_buf,
             .path = path,
             .app_ctx = self.app_ctx,
             .allocator = self.allocator,
@@ -189,8 +190,10 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
             .server = @ptrCast(self),
         };
         defer temp_ctx.deinit();
+        var matched_respond_middleware = false;
 
         if (self.respond_middlewares.has_global) {
+            matched_respond_middleware = true;
             for (self.respond_middlewares.global.items) |mw| {
                 _ = mw(self.allocator, &temp_ctx) catch |err| {
                     logErr("respond middleware error: {s}", .{@errorName(err)});
@@ -202,6 +205,7 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
 
         if (temp_ctx.body == null) {
             if (self.respond_middlewares.precise.get(path)) |list| {
+                matched_respond_middleware = true;
                 for (list.items) |mw| {
                     _ = mw(self.allocator, &temp_ctx) catch |err| {
                         logErr("respond middleware error: {s}", .{@errorName(err)});
@@ -215,6 +219,7 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
         if (temp_ctx.body == null) {
             for (self.respond_middlewares.wildcard.items) |entry| {
                 if (entry.rule.match(path)) {
+                    matched_respond_middleware = true;
                     for (entry.list.items) |mw| {
                         _ = mw(self.allocator, &temp_ctx) catch |err| {
                             logErr("respond middleware error: {s}", .{@errorName(err)});
@@ -227,59 +232,62 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
             }
         }
 
-        self.large_pool.release(body_buf);
-        self.buffer_pool.markReplenish(bid);
-        conn.read_len = 0;
+        // 修改原因：当前 path 未命中快速中间件时要继续走普通 handler，不能提前返回空 200。
+        if (matched_respond_middleware) {
+            self.large_pool.release(body_buf);
+            self.buffer_pool.markReplenish(bid);
+            conn.read_len = 0;
 
-        const extra_headers = if (temp_ctx.headers) |h| h.items else "";
+            const extra_headers = if (temp_ctx.headers) |h| h.items else "";
 
-        if (temp_ctx.body) |body| {
-            if (!self.ensureWriteBuf(conn, 512 + body.len + extra_headers.len)) {
-                self.allocator.free(body);
-                temp_ctx.body = null;
-                self.closeConn(conn_id, conn.fd);
-                return;
+            if (temp_ctx.body) |body| {
+                if (!self.ensureWriteBuf(conn, 512 + body.len + extra_headers.len)) {
+                    self.allocator.free(body);
+                    temp_ctx.body = null;
+                    self.closeConn(conn_id, conn.fd);
+                    return;
+                }
+                const buf = conn.response_buf.?;
+                const mime = switch (temp_ctx.content_type) {
+                    .plain => "text/plain",
+                    .json => "application/json",
+                    .html => "text/html",
+                };
+                const reason = statusText(temp_ctx.status);
+                const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
+                const len = std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n{s}", .{ temp_ctx.status, reason, mime, extra_headers, body.len, conn_hdr, body }) catch {
+                    self.respondError(conn);
+                    return;
+                };
+                conn.write_headers_len = len.len;
+                conn.write_offset = 0;
+                conn.write_body = null;
+                conn.state = .writing;
+                self.submitWrite(conn_id, conn) catch {
+                    self.closeConn(conn_id, conn.fd);
+                };
+            } else if (extra_headers.len > 0) {
+                if (!self.ensureWriteBuf(conn, 256 + extra_headers.len)) {
+                    self.closeConn(conn_id, conn.fd);
+                    return;
+                }
+                const buf = conn.response_buf.?;
+                const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
+                const len = std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n{s}Content-Length: 0\r\nConnection: {s}\r\n\r\n", .{ extra_headers, conn_hdr }) catch {
+                    self.respondError(conn);
+                    return;
+                };
+                conn.write_headers_len = len.len;
+                conn.write_offset = 0;
+                conn.state = .writing;
+                self.submitWrite(conn_id, conn) catch {
+                    self.closeConn(conn_id, conn.fd);
+                };
+            } else {
+                self.respond(conn, 200, "OK");
             }
-            const buf = conn.response_buf.?;
-            const mime = switch (temp_ctx.content_type) {
-                .plain => "text/plain",
-                .json => "application/json",
-                .html => "text/html",
-            };
-            const reason = statusText(temp_ctx.status);
-            const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
-            const len = std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n{s}", .{ temp_ctx.status, reason, mime, extra_headers, body.len, conn_hdr, body }) catch {
-                self.respondError(conn);
-                return;
-            };
-            conn.write_headers_len = len.len;
-            conn.write_offset = 0;
-            conn.write_body = null;
-            conn.state = .writing;
-            self.submitWrite(conn_id, conn) catch {
-                self.closeConn(conn_id, conn.fd);
-            };
-        } else if (extra_headers.len > 0) {
-            if (!self.ensureWriteBuf(conn, 256 + extra_headers.len)) {
-                self.closeConn(conn_id, conn.fd);
-                return;
-            }
-            const buf = conn.response_buf.?;
-            const conn_hdr = if (conn.keep_alive) "keep-alive" else "close";
-            const len = std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n{s}Content-Length: 0\r\nConnection: {s}\r\n\r\n", .{ extra_headers, conn_hdr }) catch {
-                self.respondError(conn);
-                return;
-            };
-            conn.write_headers_len = len.len;
-            conn.write_offset = 0;
-            conn.state = .writing;
-            self.submitWrite(conn_id, conn) catch {
-                self.closeConn(conn_id, conn.fd);
-            };
-        } else {
-            self.respond(conn, 200, "OK");
+            return;
         }
-        return;
     }
 
     const has_async = self.middlewares.has_global or
@@ -311,11 +319,15 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
 
         if (self.shared_fiber_active) {
             if (self.next) |*n| {
-                n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                if (n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024)) {
+                    self.http_ctx_pool.destroy(t);
+                } else {
+                    // 修改原因：入队失败时必须释放 body_buf/read buffer，避免大块池泄漏。
+                    http_fiber.httpTaskCleanup(t);
+                    self.respond(conn, 503, "Service Unavailable");
+                }
             } else {
-                self.http_ctx_pool.destroy(t);
-                self.buffer_pool.markReplenish(bid);
-                self.large_pool.release(body_buf);
+                http_fiber.httpTaskCleanup(t);
                 self.respond(conn, 503, "Service Unavailable");
             }
         } else {

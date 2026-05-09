@@ -11,7 +11,6 @@ const Pipe = @import("../next/pipe.zig").Pipe;
 /// releasePipe() 归还到池。TTL 过期自动淘汰空闲连接。
 ///
 /// 上限: MAX_CONNS_PER_HOST = 8
-
 const MAX_CONNS_PER_HOST: usize = 12;
 
 const PoolEntry = struct {
@@ -105,6 +104,27 @@ pub const TinyCache = struct {
     pub fn evictPipe(self: *TinyCache, p: *const Pipe) void {
         for (self.entries.items, 0..) |*e, i| {
             if (&e.pipe == p) {
+                self.allocator.free(e.host);
+                e.stream.deinit();
+                e.pipe.deinit();
+                _ = self.entries.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    pub fn pipeForStream(self: *TinyCache, stream: *RingSharedClient) ?*Pipe {
+        // 修改原因：HTTP client 的回包必须按连接查找 Pipe，不能依赖 threadlocal active_pipe。
+        for (self.entries.items) |*e| {
+            if (e.stream == stream) return &e.pipe;
+        }
+        return null;
+    }
+
+    pub fn evictStream(self: *TinyCache, stream: *RingSharedClient) void {
+        // 修改原因：连接关闭回调只知道 stream，需能稳定淘汰对应缓存项并释放 Pipe。
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.stream == stream) {
                 self.allocator.free(e.host);
                 e.stream.deinit();
                 e.pipe.deinit();

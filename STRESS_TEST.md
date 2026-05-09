@@ -1,5 +1,30 @@
 # 稳定性推演
 
+## 本机自测脚本
+
+没有独立压测机时，可以先在服务器本机跑：
+
+```bash
+scripts/self_test_local.sh
+```
+
+它会依次输出服务器资源限制、运行 `zig build`、`zig build test`、启动示例服务做 `/hello` 冒烟测试，再跑 `run-im-bench`。
+
+这个脚本适合证明：
+
+- Linux + io_uring 路径能正常启动。
+- HTTP handler 能返回正确响应。
+- 小规模 keep-alive benchmark 能收齐响应。
+- 当前服务器的 `ulimit -n`、端口范围、CPU/内存是否适合继续放大测试。
+
+它不能证明：
+
+- 百万连接能力。
+- 与 Rust/Go 框架的严肃性能对比。
+- 跨机器真实网络吞吐。
+
+修改原因：单机自测时压测客户端和服务端会争抢同一台机器资源，必须把结果限定为功能和小规模稳定性验证。
+
 ## 1. Server Ring A
 
 **正常:**

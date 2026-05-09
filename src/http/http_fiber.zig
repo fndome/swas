@@ -16,6 +16,7 @@ pub const HttpTaskCtx = struct {
     path_buf: [256]u8 = [_]u8{0} ** 256,
     path_len: u8 = 0,
     request_data: []u8,
+    request_data_owned: bool = false,
     body_data: ?[]u8 = null,
 };
 
@@ -28,20 +29,23 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
     const path = t.path_buf[0..t.path_len];
     const req_data = t.request_data;
 
-    var req_body: ?[]u8 = null;
+    var request_body: []const u8 = "";
     if (t.body_data) |bd| {
-        req_body = server.allocator.dupe(u8, bd) catch null;
-        server.large_pool.release(bd);
+        // 修改原因：请求体不能占用 ctx.body；ctx.body 是响应体，混用会让中间件误判已响应。
+        request_body = bd;
+        t.body_data = null;
+        defer server.large_pool.release(bd);
     }
 
     var ctx = Context{
         .request_data = req_data,
+        .request_body = request_body,
         .path = path,
         .app_ctx = server.app_ctx,
         .allocator = server.allocator,
         .status = 200,
         .content_type = .plain,
-        .body = req_body,
+        .body = null,
         .headers = null,
         .conn_id = t.conn_id,
         .server = @ptrCast(server),
@@ -154,10 +158,10 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
 
 pub fn httpTaskExecWrapperWithOwnership(t: *HttpTaskCtx, complete: *const fn (?*anyopaque, []const u8) void) void {
     httpTaskExec(t, complete);
-    httpTaskCleanup(t);
+    httpTaskRecycle(t);
 }
 
-pub fn httpTaskCleanup(t: *HttpTaskCtx) void {
+fn httpTaskRecycle(t: *HttpTaskCtx) void {
     std.debug.assert(t.tag == 0x48540001);
     if (t.server.connections.getPtr(t.conn_id)) |conn| {
         if (!conn.read_buf_recycled) {
@@ -174,6 +178,19 @@ pub fn httpTaskCleanup(t: *HttpTaskCtx) void {
             };
         }
     }
+    if (t.request_data_owned) {
+        // 修改原因：跨 TCP 分片重组出来的 request_data 是堆副本，任务结束必须释放。
+        t.server.allocator.free(t.request_data);
+        t.request_data_owned = false;
+    }
+    if (t.body_data) |bd| {
+        t.server.large_pool.release(bd);
+        t.body_data = null;
+    }
+}
+
+pub fn httpTaskCleanup(t: *HttpTaskCtx) void {
+    httpTaskRecycle(t);
     t.server.http_ctx_pool.destroy(t);
 }
 
@@ -181,20 +198,6 @@ pub fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x48540001);
     t.server.shared_fiber_active = false;
-    if (t.server.connections.getPtr(t.conn_id)) |conn| {
-        if (!conn.read_buf_recycled) {
-            conn.read_buf_recycled = true;
-            t.server.buffer_pool.markReplenish(t.read_bid);
-        }
-        conn.read_len = 0;
-        const has_stream = conn.pool_idx != 0xFFFFFFFF and
-            sticker.getStream(&t.server.pool.slots[conn.pool_idx]) != null;
-        if (conn.state == .streaming or has_stream) {
-            if (has_stream) conn.state = .streaming;
-            t.server.submitRead(t.conn_id, conn) catch {
-                t.server.closeConn(t.conn_id, conn.fd);
-            };
-        }
-    }
+    httpTaskRecycle(t);
     t.server.http_ctx_pool.destroy(t);
 }

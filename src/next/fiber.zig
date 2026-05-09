@@ -46,7 +46,8 @@ pub const Fiber = struct {
 
     pub fn init(stack: []u8) Fiber {
         const sp = @intFromPtr(stack.ptr + stack.len);
-        const aligned_sp = sp & ~@as(u64, 15);
+        // 修改原因：x86_64 通过 jmp 进入 trampoline，没有 call 压入返回地址，rsp 需模拟 ABI 的 -8 对齐。
+        const aligned_sp = (sp & ~@as(u64, 15)) - 8;
         return .{
             .context = .{
                 .rsp = aligned_sp,
@@ -85,40 +86,40 @@ pub const Fiber = struct {
     }
 
     /// 延迟恢复队列：CQE 处理期间不直接 resume，而是入队后由主循环统一恢复。
-/// 队列存储 slot_idx 用于 resume 前对 workspace 做 prefetch。
-pub const ResumeEntry = struct {
-    slot_idx: u32,
-    gen_id: u32,
-    data: []const u8,
-};
+    /// 队列存储 slot_idx 用于 resume 前对 workspace 做 prefetch。
+    pub const ResumeEntry = struct {
+        slot_idx: u32,
+        gen_id: u32,
+        data: []const u8,
+    };
 
-const RESUME_QUEUE_CAP = 512;
-pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
-pub threadlocal var resume_head: u16 = 0;
-pub threadlocal var resume_tail: u16 = 0;
+    const RESUME_QUEUE_CAP = 512;
+    pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
+    pub threadlocal var resume_head: u16 = 0;
+    pub threadlocal var resume_tail: u16 = 0;
 
-pub fn pushResume(slot_idx: u32, gen_id: u32, data: []const u8) void {
-    const next = resume_tail +% 1;
-    if (next == resume_head) {
-        std.log.err("Fiber.pushResume: resume queue full (cap={d}), entry dropped — slot={d} gen={d}", .{ RESUME_QUEUE_CAP -| 1, slot_idx, gen_id });
-        return;
+    pub fn pushResume(slot_idx: u32, gen_id: u32, data: []const u8) void {
+        const next = resume_tail +% 1;
+        if (next == resume_head) {
+            std.log.err("Fiber.pushResume: resume queue full (cap={d}), entry dropped — slot={d} gen={d}", .{ RESUME_QUEUE_CAP -| 1, slot_idx, gen_id });
+            return;
+        }
+        resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .gen_id = gen_id, .data = data };
+        resume_tail = next;
     }
-    resume_queue[resume_tail] = .{ .slot_idx = slot_idx, .gen_id = gen_id, .data = data };
-    resume_tail = next;
-}
 
-pub fn popResume() ?ResumeEntry {
-    if (resume_head == resume_tail) return null;
-    const entry = resume_queue[resume_head];
-    resume_head +%= 1;
-    return entry;
-}
+    pub fn popResume() ?ResumeEntry {
+        if (resume_head == resume_tail) return null;
+        const entry = resume_queue[resume_head];
+        resume_head +%= 1;
+        return entry;
+    }
 
-pub fn hasPendingResume() bool {
-    return resume_head != resume_tail;
-}
+    pub fn hasPendingResume() bool {
+        return resume_head != resume_tail;
+    }
 
-pub fn resumeYielded(data: []const u8) void {
+    pub fn resumeYielded(data: []const u8) void {
         const target = yielded_fiber orelse return;
         yielded_result = data;
         active_call = saved_call;

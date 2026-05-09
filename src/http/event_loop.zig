@@ -21,7 +21,8 @@ pub fn milliTimestamp(io: std.Io) i64 {
 }
 
 pub fn stop(self: *AsyncServer) void {
-    self.should_stop = true;
+    // 修改原因：stop 可能由管理/压测线程触发，事件循环跨线程读取时需要原子同步。
+    @atomicStore(bool, &self.should_stop, true, .release);
 }
 
 var sigterm_server: ?*AsyncServer = null;
@@ -35,7 +36,8 @@ pub fn installSigterm(self: *AsyncServer) void {
 }
 
 fn sigtermHandler(_: linux.SIG) callconv(.c) void {
-    if (sigterm_server) |s| s.should_stop = true;
+    // 修改原因：信号回调和事件循环不在同一执行点，普通 bool 写入会和主循环读取形成数据竞争。
+    if (sigterm_server) |s| @atomicStore(bool, &s.should_stop, true, .release);
 }
 
 pub fn drainPendingResumes(self: *AsyncServer) void {
@@ -62,7 +64,7 @@ pub fn run(self: *AsyncServer) !void {
 
     var cqes: [MAX_CQES_BATCH]linux.io_uring_cqe = undefined;
     var user_tasks_buf: [USER_TASK_BATCH]Item = undefined;
-    while (!self.should_stop) {
+    while (!@atomicLoad(bool, &self.should_stop, .acquire)) {
         try self.buffer_pool.flushReplenish(&self.ring);
 
         if (self.accept_stalled) {
@@ -124,18 +126,17 @@ pub fn run(self: *AsyncServer) !void {
 }
 
 pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) void {
-    for (cqes[0..n], 0..) |cqe, i| {
+    // 修改原因：Zig 0.16 的 copy_cqes 已经推进 CQ head，额外 cqe_seen 会跳过后续完成事件。
+    for (cqes[0..n]) |cqe| {
         const user_data = cqe.user_data;
         const res = cqe.res;
 
         if (self.timeout_user_data != 0 and user_data == self.timeout_user_data) {
             self.timeout_user_data = 0;
-            self.ring.cqe_seen(&cqes[i]);
             continue;
         }
 
         if (user_data == ACCEPT_USER_DATA) {
-            self.ring.cqe_seen(&cqes[i]);
             self.onAcceptComplete(res, user_data);
         } else if ((user_data & CLOSE_USER_DATA_FLAG) != 0) {
             const raw_ud = user_data & ~CLOSE_USER_DATA_FLAG;
@@ -144,9 +145,7 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
             else
                 raw_ud;
             self.closeConn(close_conn_id, 0);
-            self.ring.cqe_seen(&cqes[i]);
         } else if ((user_data & CLIENT_USER_DATA_FLAG) != 0) {
-            defer self.ring.cqe_seen(&cqes[i]);
             self.io_registry.dispatch(user_data, res);
         } else {
             const disp = sticker.dispatchToken(&self.pool, &self.connections, user_data);
@@ -154,11 +153,9 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                 if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
                     self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
                 }
-                self.ring.cqe_seen(&cqes[i]);
                 continue;
             };
             const conn_id = conn_ptr.id;
-            defer self.ring.cqe_seen(&cqes[i]);
 
             if (conn_ptr.state == .reading or conn_ptr.state == .processing) {
                 self.onReadComplete(conn_id, res, user_data, cqe.flags);

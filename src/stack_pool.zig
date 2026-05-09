@@ -35,6 +35,11 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
         /// 消除运行时冷启动 Page Fault 抖动。
         pub fn warmup(self: *Self) void {
             for (self.slots) |*slot| {
+                // 修改原因：allocator.alloc 返回未初始化内存，必须写入默认值以初始化 line5.sentinel 等调试/运行元数据。
+                slot.* = std.mem.zeroes(T);
+                if (@hasField(T, "line5")) {
+                    slot.line5.sentinel = 0x53574153;
+                }
                 @atomicStore(u32, &slot.line1.gen_id, 0, .monotonic);
             }
         }
@@ -94,7 +99,6 @@ pub inline fn unpackIdx(ud: u64) u32 {
 }
 
 /// ── 缓存行子结构 ───────────────────────────────────────
-
 const CacheLine1 = extern struct {
     gen_id: u32 = 0,
     state: ConnState = .reading,
@@ -201,6 +205,7 @@ pub const HttpWork = extern struct {
     content_length: u64 = 0,
     path_offset: u16 = 0,
     path_len: u16 = 0,
+    /// 修改原因：这里缓存 body 起点，而不是裸 header 结束下标，以兼容 "\r\n\r\n" 与 "\n\n"。
     headers_end: u16 = 0,
     /// 上次短读的 buffer ID（用于跨 TCP 分片的 header 拼包）
     pending_bid: u16 = 0,

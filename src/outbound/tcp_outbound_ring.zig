@@ -54,8 +54,8 @@ pub const TcpOutboundRing = struct {
         _ = self.ring.submit() catch {};
 
         const n = self.ring.copy_cqes(self.cqes, 0) catch 0;
-        for (self.cqes[0..n], 0..) |*cqe, i| {
-            defer self.ring.cqe_seen(&self.cqes[i]);
+        // 修改原因：Zig 0.16 的 copy_cqes 已经消费 CQE，重复 cqe_seen 会漏处理出站事件。
+        for (self.cqes[0..n]) |*cqe| {
             self.processCqe(cqe);
         }
     }
@@ -198,7 +198,10 @@ pub const TcpConn = struct {
     }
 
     fn deinit(self: *TcpConn, allocator: Allocator) void {
-        if (self.fd >= 0) { _ = linux.close(self.fd); self.fd = -1; }
+        if (self.fd >= 0) {
+            _ = linux.close(self.fd);
+            self.fd = -1;
+        }
         allocator.free(self.read_buf);
         allocator.destroy(self);
     }

@@ -37,10 +37,8 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
 }
 
 fn parseResponse(allocator: Allocator, data: []const u8) !Response {
-    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse
-        std.mem.indexOf(u8, data, "\n\n") orelse
-        return error.InvalidResponse;
-    const sep_len: usize = if (data[header_end] == '\r') @as(usize, 4) else @as(usize, 2);
+    const total_len = (try responseCompleteLen(data)) orelse return error.IncompleteResponse;
+    const bounds = findHeaderEnd(data[0..total_len]) orelse return error.InvalidResponse;
     const first_line_end = std.mem.indexOfScalar(u8, data, '\r') orelse
         std.mem.indexOfScalar(u8, data, '\n') orelse
         return error.InvalidResponse;
@@ -48,8 +46,55 @@ fn parseResponse(allocator: Allocator, data: []const u8) !Response {
     var parts = std.mem.splitScalar(u8, data[0..first_line_end], ' ');
     _ = parts.next();
     if (parts.next()) |code| status = std.fmt.parseInt(u16, code, 10) catch 500;
-    const body = try allocator.dupe(u8, data[header_end + sep_len ..]);
+    const body_start = bounds.header_end + bounds.sep_len;
+    const body = try allocator.dupe(u8, data[body_start..total_len]);
     return .{ .status = status, .body = body, .allocator = allocator };
+}
+
+const HeaderBounds = struct {
+    header_end: usize,
+    sep_len: usize,
+};
+
+fn findHeaderEnd(data: []const u8) ?HeaderBounds {
+    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |pos| {
+        return .{ .header_end = pos, .sep_len = 4 };
+    }
+    if (std.mem.indexOf(u8, data, "\n\n")) |pos| {
+        return .{ .header_end = pos, .sep_len = 2 };
+    }
+    return null;
+}
+
+fn getHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, name)) {
+            const after = line[name.len..];
+            if (after.len > 0 and after[0] == ':') {
+                return std.mem.trim(u8, after[1..], " \t\r\n");
+            }
+        }
+    }
+    return null;
+}
+
+fn responseCompleteLen(data: []const u8) !?usize {
+    const bounds = findHeaderEnd(data) orelse return null;
+    const headers = data[0..bounds.header_end];
+    if (getHeaderValue(headers, "Transfer-Encoding")) |te| {
+        if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) return error.ChunkedUnsupported;
+    }
+    const content_len = if (getHeaderValue(headers, "Content-Length")) |value|
+        try std.fmt.parseInt(usize, value, 10)
+    else
+        0;
+    // 修改原因：上游 keep-alive 时连接不会 EOF，必须按 Content-Length 判断响应边界。
+    const total = bounds.header_end + bounds.sep_len + content_len;
+    if (data.len < total) return null;
+    return total;
 }
 
 fn makeErrorResponse(allocator: Allocator, status: u16, msg: []const u8) Response {
@@ -63,17 +108,18 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
-threadlocal var active_pipe: ?*Pipe = null;
-
-fn onData(ctx: ?*anyopaque, data: []u8) void {
-    _ = ctx;
-    if (active_pipe) |p| p.feed(data) catch {};
-}
-
-fn onClose(ctx: ?*anyopaque) void {
+fn onData(stream: *RingSharedClient, ctx: ?*anyopaque, data: []u8) void {
     if (ctx) |ptr| {
         const cache: *TinyCache = @ptrCast(@alignCast(ptr));
-        cache.evict();
+        // 修改原因：多个 fiber 可交错等待回包，必须按 stream 查 Pipe，不能使用全局 active_pipe。
+        if (cache.pipeForStream(stream)) |p| p.feed(data) catch {};
+    }
+}
+
+fn onClose(stream: *RingSharedClient, ctx: ?*anyopaque) void {
+    if (ctx) |ptr| {
+        const cache: *TinyCache = @ptrCast(@alignCast(ptr));
+        cache.evictStream(stream);
     }
     if (Fiber.isYielded()) Fiber.resumeYielded("");
 }
@@ -150,6 +196,7 @@ pub const HttpClient = struct {
             .pool_id = idx,
             .from_pool = true,
             .gen = self.req_gen[idx],
+            .cancelled = false,
         };
         return ctx;
     }
@@ -194,7 +241,8 @@ pub const HttpClient = struct {
         const ctx = self.acquireReq() orelse {
             if (headers_dup) |h| self.allocator.free(h);
             if (body_dup) |b| self.allocator.free(b);
-            headers_dup = null; body_dup = null;
+            headers_dup = null;
+            body_dup = null;
             return error.PoolFull;
         };
         errdefer self.releaseReq(ctx);
@@ -255,8 +303,15 @@ const RequestContext = struct {
     }
 
     fn cleanup(self: *RequestContext) void {
-        if (self.headers) |h| self.allocator.free(h);
-        if (self.body) |b| self.allocator.free(b);
+        // 修改原因：fiber 可能先释放请求体，主线程 releaseReq 还会再次 cleanup，释放后必须清空指针。
+        if (self.headers) |h| {
+            self.allocator.free(h);
+            self.headers = null;
+        }
+        if (self.body) |b| {
+            self.allocator.free(b);
+            self.body = null;
+        }
     }
 };
 
@@ -288,23 +343,27 @@ fn handleRequest(allocator: Allocator, ctx_ptr: **RequestContext) void {
 fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
     if (body) |b| {
         if (headers) |h| {
-            return std.fmt.bufPrint(buf,
+            return std.fmt.bufPrint(
+                buf,
                 "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
                 .{ method, path, host, h, b.len, b },
             );
         }
-        return std.fmt.bufPrint(buf,
+        return std.fmt.bufPrint(
+            buf,
             "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
             .{ method, path, host, b.len, b },
         );
     }
     if (headers) |h| {
-        return std.fmt.bufPrint(buf,
+        return std.fmt.bufPrint(
+            buf,
             "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Connection: keep-alive\r\n\r\n",
             .{ method, path, host, h },
         );
     }
-    return std.fmt.bufPrint(buf,
+    return std.fmt.bufPrint(
+        buf,
         "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
         .{ method, path, host },
     );
@@ -331,10 +390,11 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
 
     const now = nowMs();
     var stream: *RingSharedClient = undefined;
+    var pipe: *Pipe = undefined;
 
     if (cache.acquire(parsed.host, parsed.port, now)) |borrowed| {
-        active_pipe = borrowed.pipe;
         stream = borrowed.stream;
+        pipe = borrowed.pipe;
     } else {
         stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch {
             ctx.response = makeErrorResponse(ctx.allocator, 502, "client init failed");
@@ -362,14 +422,14 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             ctx.notify();
             return;
         }
-        var pipe = Pipe.init(ctx.allocator, stream) catch {
+        var new_pipe = Pipe.init(ctx.allocator, stream) catch {
             stream.deinit();
             ctx.response = makeErrorResponse(ctx.allocator, 502, "pipe init failed");
             ctx.notify();
             return;
         };
-        cache.store(stream, pipe, parsed.host, parsed.port, now) catch |err| {
-            pipe.deinit();
+        cache.store(stream, new_pipe, parsed.host, parsed.port, now) catch |err| {
+            new_pipe.deinit();
             stream.deinit();
             switch (err) {
                 error.PoolFull => ctx.response = makeErrorResponse(ctx.allocator, 503, "connection pool full"),
@@ -378,11 +438,16 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             ctx.notify();
             return;
         };
-        active_pipe = (cache.acquire(parsed.host, parsed.port, now) orelse unreachable).pipe;
+        const borrowed = cache.acquire(parsed.host, parsed.port, now) orelse {
+            ctx.response = makeErrorResponse(ctx.allocator, 502, "connection cache failed");
+            ctx.notify();
+            return;
+        };
+        stream = borrowed.stream;
+        pipe = borrowed.pipe;
     }
-    defer active_pipe = null;
 
-    const reader = active_pipe.?.reader();
+    const reader = pipe.reader();
 
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
@@ -393,7 +458,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     stream.write(req) catch {
         ctx.cleanup();
-        cache.evictPipe(active_pipe.?);
+        cache.evictPipe(pipe);
         // Timeout → target 关服, 不重试
         if (stream.conn_errno == -125 or stream.conn_errno == -110) {
             ctx.response = makeErrorResponse(ctx.allocator, 504, "upstream timeout");
@@ -407,29 +472,54 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
 
     var resp_buf: [65536]u8 = undefined;
     var total: usize = 0;
+    var complete_len: usize = 0;
+    var invalid_response = false;
     const read_ok = blk: {
         while (true) {
+            // 修改原因：HTTP/1.1 keep-alive 不会主动关闭连接，读到完整响应就应停止等待。
+            const maybe_complete = responseCompleteLen(resp_buf[0..total]) catch {
+                invalid_response = true;
+                break :blk false;
+            };
+            if (maybe_complete) |n_complete| {
+                complete_len = n_complete;
+                break :blk true;
+            }
+            if (total >= resp_buf.len) break :blk false;
             const n = reader.read(resp_buf[total..]) catch break :blk false;
-            if (n == 0) break;
+            if (n == 0) break :blk false;
             total += n;
-            if (total >= resp_buf.len) break;
         }
-        break :blk true;
     };
     if (!read_ok) {
-        cache.evictPipe(active_pipe.?);
-        ctx.response = makeErrorResponse(ctx.allocator, 502, "read failed");
+        cache.evictPipe(pipe);
+        const msg = if (invalid_response) "invalid response" else "read failed";
+        ctx.response = makeErrorResponse(ctx.allocator, 502, msg);
         ctx.notify();
         return;
     }
 
-    if (parseResponse(ctx.allocator, resp_buf[0..total])) |resp| {
+    if (parseResponse(ctx.allocator, resp_buf[0..complete_len])) |resp| {
         ctx.response = resp;
         ctx.notify();
-        cache.release(active_pipe.?, nowMs());
+        cache.release(pipe, nowMs());
     } else |_| {
-        cache.evictPipe(active_pipe.?);
+        cache.evictPipe(pipe);
         ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
         ctx.notify();
     }
+}
+
+test "HttpClient responseCompleteLen waits for Content-Length body" {
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello";
+    try std.testing.expect(try responseCompleteLen(partial) == null);
+
+    const full = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello worldEXTRA";
+    const expected = (std.mem.indexOf(u8, full, "\r\n\r\n") orelse unreachable) + 4 + 11;
+    try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLen(full));
+
+    var resp = try parseResponse(std.testing.allocator, full);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("hello world", resp.body);
 }

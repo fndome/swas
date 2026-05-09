@@ -43,8 +43,8 @@ pub const RingB = struct {
 
         var ring = brk: {
             var params = std.mem.zeroes(linux.io_uring_params);
-            params.flags = linux.IORING_SETUP_SINGLE_ISSUER |
-                linux.IORING_SETUP_DEFER_TASKRUN |
+            // 修改原因：RingB 可能由主流程创建后交给 IO tick 驱动，SINGLE_ISSUER 会要求创建/提交同线程。
+            params.flags = linux.IORING_SETUP_DEFER_TASKRUN |
                 linux.IORING_SETUP_ATTACH_WQ;
             params.wq_fd = @intCast(attach_ring_fd);
             break :brk try linux.IoUring.init_params(256, &params);
@@ -101,8 +101,8 @@ pub const RingB = struct {
 
         var cqes: [MAX_CQES_TICK]linux.io_uring_cqe = undefined;
         const n = self.ring.copy_cqes(&cqes, 0) catch return;
+        // 修改原因：copy_cqes 会自动推进 CQ head，不能再对复制出来的 CQE 调 cqe_seen。
         for (cqes[0..n]) |*cqe| {
-            defer self.ring.cqe_seen(cqe);
             const ud = cqe.user_data;
             if (ud & CLIENT_USER_DATA_FLAG != 0) {
                 self.registry.dispatch(ud, cqe.res);
@@ -154,8 +154,10 @@ fn parseIpv4(ip_str: []const u8) !u32 {
         octets[i] = try std.fmt.parseInt(u8, part, 10);
     }
     if (i != 4) return error.InvalidIp;
-    return (@as(u32, octets[0]) << 24) |
+    const ip = (@as(u32, octets[0]) << 24) |
         (@as(u32, octets[1]) << 16) |
         (@as(u32, octets[2]) << 8) |
         (@as(u32, octets[3]));
+    // 修改原因：DNS nameserver 地址最终会写入 sockaddr，需保持网络字节序内存布局。
+    return std.mem.nativeToBig(u32, ip);
 }
