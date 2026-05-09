@@ -326,6 +326,13 @@ pub const AsyncServer = struct {
 
         self.rs.invoke.drain(self.allocator);
 
+        // Send WebSocket close frames before tearing down the ring,
+        // connections, and pool. closeAllActive calls sendWsFrame which
+        // requires self.ring (io_uring), self.connections (hashmap lookup),
+        // and self.pool (slot access) to still be alive.
+        self.ws_server.closeAllActive();
+        self.ws_server.deinit();
+
         // Clean up all connections: free resources + release pool slots
         {
             var it = self.connections.iterator();
@@ -362,8 +369,6 @@ pub const AsyncServer = struct {
         self.buffer_pool.deinit();
         self.large_pool.deinit(self.allocator);
         self.fixed_file_freelist.deinit(self.allocator);
-        self.ws_server.closeAllActive();
-        self.ws_server.deinit();
         self.middlewares.deinit(self.allocator);
         self.respond_middlewares.deinit(self.allocator);
         {
