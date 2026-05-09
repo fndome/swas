@@ -129,17 +129,15 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
 
     switch (frame.opcode) {
         .close => {
-            const close_len = ws_frame.frameSize(frame.payload.len);
-            // 修改原因：合法 close 控制帧 payload 最多可达 125 字节，固定 32 字节栈缓冲会误关连接；
-            // 先按实际帧大小申请连接写缓冲，确保可完整回写 close 帧。
-            if (!self.ensureWriteBuf(conn, close_len)) {
+            const total = ws_frame.frameSize(frame.payload.len);
+            if (!self.ensureWriteBuf(conn, total)) {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
                 self.closeConn(conn_id, conn.fd);
                 return;
             }
             const wbuf = conn.response_buf.?;
-            const written_len = ws_frame.writeFrame(wbuf, .{
+            _ = ws_frame.writeFrame(wbuf, .{
                 .opcode = .close,
                 .fin = true,
                 .payload = frame.payload,
@@ -151,7 +149,7 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             };
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
-            conn.write_headers_len = written_len;
+            conn.write_headers_len = total;
             conn.write_offset = 0;
             conn.state = .ws_writing;
             conn.keep_alive = false;
@@ -160,10 +158,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             };
         },
         .ping => {
-            const pong_len = ws_frame.frameSize(frame.payload.len);
-            // 修改原因：ping 控制帧允许携带最多 125 字节 payload，固定 16 字节栈缓冲
-            // 会让合法心跳被丢弃；按实际长度写入连接缓冲后再归还 read buffer。
-            if (!self.ensureWriteBuf(conn, pong_len)) {
+            const pong_total = ws_frame.frameSize(frame.payload.len);
+            if (!self.ensureWriteBuf(conn, pong_total)) {
                 self.buffer_pool.markReplenish(bid);
                 conn.read_len = 0;
                 conn.state = .ws_reading;
@@ -173,7 +169,7 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                 return;
             }
             const wbuf = conn.response_buf.?;
-            const written_len = ws_frame.writeFrame(wbuf, .{
+            _ = ws_frame.writeFrame(wbuf, .{
                 .opcode = .pong,
                 .fin = true,
                 .payload = frame.payload,
@@ -188,7 +184,7 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             };
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
-            conn.write_headers_len = written_len;
+            conn.write_headers_len = pong_total;
             conn.write_offset = 0;
             conn.state = .ws_writing;
             self.submitWrite(conn_id, conn) catch {
