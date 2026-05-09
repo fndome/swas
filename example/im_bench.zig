@@ -1,11 +1,47 @@
 // im_bench.zig — sws AsyncServer HTTP throughput benchmark
-/// io_wq_acct.lock remove
-/// sysctl -w net.ipv4.tcp_tw_reuse=1
-/// IORING_SETUP_SINGLE_ISSUER
-/// IORING_SETUP_COOP_TASKRUN
-/// echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-/// taskset -c 0,1
-/// SWS_BENCH_PORT=19090 ./im_bench
+//
+// Target: 1 core, 600MB, 1M concurrent connections (C31K).
+//
+// ── Kernel tuning (required before 1M connection test) ──────────────
+//
+//   # File descriptor limits
+//   sysctl -w fs.nr_open=2097152
+//   sysctl -w fs.file-max=2097152
+//   ulimit -n 1048576
+//
+//   # If systemd, also set in /etc/systemd/system.conf:
+//   #   DefaultLimitNOFILE=1048576:1048576
+//
+//   # Network stack
+//   sysctl -w net.core.somaxconn=65535
+//   sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+//   sysctl -w net.ipv4.tcp_tw_reuse=1
+//
+//   # CPU governor (prevent frequency scaling jitter)
+//   echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+//
+//   # io_uring (kernel 5.1+ required)
+//   # IORING_SETUP_SINGLE_ISSUER + IORING_SETUP_COOP_TASKRUN
+//   # (removed by default; SINGLE_ISSUER breaks cross-thread run)
+//
+// ── Known scale blockers (fixed in third audit round) ────────────────
+//
+//   1. flushReplenish crash: ring full → try → server exit
+//      Fix: catch error, retry next iteration
+//   2. TTL scanner killed active connections after 30s
+//      Fix: refresh slot.line2.last_active_ms on every request
+//   3. Pool-full accept spin: tight accept-fail-close loop
+//      Fix: stall accept, resume from closeConn when slot freed
+//
+// ── Bench run ────────────────────────────────────────────────────────
+//
+//   # Small smoke test (50 conns, 5k reqs, keep-alive)
+//   SWS_BENCH_PORT=19090 zig build run-im-bench
+//
+//   # Scale test (↑ CONNS, REQS_PER_CONN in this file)
+//   # Monitor: htop, ss -s, free -h, cat /proc/sys/fs/file-nr
+//
+//   SWS_BENCH_PORT=19090 ./zig-out/bin/im-bench
 const std = @import("std");
 const linux = std.os.linux;
 const sws = @import("sws");
