@@ -216,8 +216,15 @@ pub const RingSharedClient = struct {
                 if (self.rs.ringPtr().register_files_sparse(1)) {
                     if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
                         self.fixed_index = 0;
-                    } else |_| {}
-                } else |_| {}
+                    } else |err| {
+                        // Non-fatal: the connection operates correctly with
+                        // non-fixed files; logging helps diagnose performance
+                        // degradation when many connections fail this path.
+                        std.log.warn("RingSharedClient: register_files_update failed: {s}", .{@errorName(err)});
+                    }
+                } else |err| {
+                    std.log.warn("RingSharedClient: register_files_sparse failed: {s}", .{@errorName(err)});
+                }
                 self.submitRead() catch {
                     self.onClose();
                 };
