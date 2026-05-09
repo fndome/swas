@@ -26,7 +26,9 @@ pub fn isUpgradeRequest(data: []const u8) bool {
             }
         }
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Key:")) {
-            has_ws_key = true;
+            const value = std.mem.trim(u8, line["Sec-WebSocket-Key:".len..], " \t\r\n");
+            // 修改原因：Sec-WebSocket-Key 必须是 base64 后的 16 字节 nonce；只检查存在会接受非法握手。
+            has_ws_key = isValidWsKey(value);
         }
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Version:")) {
             const value = std.mem.trim(u8, line[22..], " \t\r\n");
@@ -45,6 +47,14 @@ fn headerValueHasToken(value: []const u8, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
     }
     return false;
+}
+
+fn isValidWsKey(key: []const u8) bool {
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (decoded_len != 16) return false;
+    var decoded: [16]u8 = undefined;
+    std.base64.standard.Decoder.decode(&decoded, key) catch return false;
+    return true;
 }
 
 pub fn extractWsKey(data: []const u8) ?[]const u8 {
@@ -105,4 +115,24 @@ test "isUpgradeRequest requires Connection upgrade token" {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     try std.testing.expect(isUpgradeRequest(comma_separated_connection));
+}
+
+test "isUpgradeRequest validates Sec-WebSocket-Key nonce" {
+    const invalid_key =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: not-a-valid-websocket-key\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(invalid_key));
+
+    const wrong_decoded_len =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: YWJj\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(wrong_decoded_len));
 }
