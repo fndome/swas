@@ -1,4 +1,11 @@
 // im_bench.zig — sws AsyncServer HTTP throughput benchmark
+/// io_wq_acct.lock remove
+/// sysctl -w net.ipv4.tcp_tw_reuse=1
+/// IORING_SETUP_SINGLE_ISSUER
+/// IORING_SETUP_COOP_TASKRUN
+/// echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+/// taskset -c 0,1
+/// SWS_BENCH_PORT=19090 ./im_bench
 const std = @import("std");
 const linux = std.os.linux;
 const sws = @import("sws");
