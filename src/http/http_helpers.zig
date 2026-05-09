@@ -95,6 +95,32 @@ pub fn parseIpv4(ip_str: []const u8) !u32 {
     return std.mem.nativeToBig(u32, ip);
 }
 
+pub fn readResolvConfNameserver() !u32 {
+    // 修复：与 client/ring.zig 原重复定义，集中到这里供 server/client 共用。
+    const path = "/etc/resolv.conf\x00";
+    const flags: std.os.linux.O = @bitCast(@as(u32, 0));
+    const raw_fd = std.os.linux.open(@ptrCast(path), flags, 0);
+    if (raw_fd < 0) return error.FileNotFound;
+    const fd: i32 = @intCast(raw_fd);
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    const raw = std.os.linux.read(fd, &buf, buf.len);
+    const n_signed: isize = @bitCast(raw);
+    if (n_signed <= 0) return error.FileNotFound;
+    const content = buf[0..@as(usize, @intCast(n_signed))];
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "nameserver ")) {
+            const ip_str = std.mem.trim(u8, trimmed["nameserver ".len..], " \t\r");
+            if (parseIpv4(ip_str)) |ip| return ip else |_| continue;
+        }
+    }
+    return error.NoNameserverFound;
+}
+
 pub fn logErr(comptime format: []const u8, args: anytype) void {
     std.debug.print("[ERROR] " ++ format ++ "\n", args);
 }

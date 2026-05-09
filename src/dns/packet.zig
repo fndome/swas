@@ -51,7 +51,7 @@ pub fn buildQuery(hostname: []const u8, txid: u16) ![MAX_PACKET_SIZE]u8 {
     std.mem.writeInt(u16, buf[off..][0..2], 0, .big);
     off += 2;
 
-    off += encodeName(hostname, buf[off..]);
+    off += try encodeName(hostname, buf[off..]);
 
     std.mem.writeInt(u16, buf[off..][0..2], 1, .big);
     off += 2;
@@ -61,7 +61,7 @@ pub fn buildQuery(hostname: []const u8, txid: u16) ![MAX_PACKET_SIZE]u8 {
     return buf;
 }
 
-fn encodeName(name: []const u8, out: []u8) usize {
+fn encodeName(name: []const u8, out: []u8) !usize {
     if (name.len == 0) {
         out[0] = 0;
         return 1;
@@ -69,7 +69,9 @@ fn encodeName(name: []const u8, out: []u8) usize {
     var off: usize = 0;
     var it = std.mem.splitScalar(u8, name, '.');
     while (it.next()) |label| {
-        if (label.len > 63 or label.len == 0) continue;
+        if (label.len > 63) return error.LabelTooLong;
+        // 修复：空 label (如 "example..com") 应报错而非静默跳过，否则会生成畸形 DNS 查询包。
+        if (label.len == 0) return error.EmptyLabel;
         out[off] = @intCast(label.len);
         off += 1;
         @memcpy(out[off..][0..label.len], label);

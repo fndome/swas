@@ -1,153 +1,69 @@
 # PENDING_REVIEW
 
-> 审计状态：第一波 PR 已合并（2026-05-09），待第二/三波合并后重新审计。
-> 当前基于 commit `949e441` 及之前的第一波改动。
+> 审计状态：第一波 PR 已合并（2026-05-09），第二轮修复已完成。
+> 当前基于 commit `949e441` + 本地修复。GPT 第二/三波尚未推送。
 
 ---
 
-## 高优先级
+## 第一波 PR 已修复项 (✅ done)
 
-### 1. `event_loop.zig:160` — `waiting_computation` 状态未在 CQE 分发中处理
+从 GPT-5.5 聊天记录核对，以下问题已在第一波中修复：
 
-`dispatchCqes` 枚举了所有 `ConnState` 分支（`.reading`, `.processing`, `.receiving_body`, `.streaming`, `.writing`, `.ws_reading`, `.ws_writing`, `.closing`），但 `ConnState.waiting_computation`（定义于 `src/http/connection.zig:13`）不在其中。任何该状态下的 CQE 都会落入 `else` 分支直接关闭连接。
-
-- 该状态当前全代码库未使用，属死代码。
-- 若未来启用（如 Worker Pool 计算完成回调），会触发误杀。
-
-### 2. `src/client/http_client.zig:101` — `makeErrorResponse` 极端回退有 UB
-
-```zig
-const body = allocator.dupe(u8, msg) catch allocator.alloc(u8, 0) catch &.{};
-```
-
-三级回退：`dupe` → `alloc(0)` → 编译期常量 `&.{}`。`Response.deinit()` 对其调用 `allocator.free()` 是未定义行为。虽仅在极端 OOM 时触发，但仍需修复。
-
-### 3. `src/client/http_client.zig:260-274` — 手动操作 mutex state，同步机制不健全
-
-```zig
-ctx.mutex.state.store(.unlocked, .release);   // 绕过 mutex.unlock()
-while (!ctx.mutex.tryLock()) ...              // 绕过 mutex.lock()
-```
-
-- 直接读写 `state` 绕过了 `std.Io.Mutex` 内置的 futex 等待/唤醒。
-- `cond: std.Io.Condition` 字段在 `RequestContext` 中声明但从未使用。
-- 当前仅两个线程争用 + spinlock，功能上可工作，但语义错误且未来加线程会暴露问题。
+| # | 问题 | 修复位置 |
+|---|------|----------|
+| 1 | Fiber x86_64 栈对齐错误（rsp 未模拟 ABI -8 对齐） | `src/next/fiber.zig:50` |
+| 2 | HTTP client 多 fiber 共用全局 active_pipe 导致串包 | `src/client/http_client.zig:111-116` → `pipeForStream()` |
+| 3 | keep-alive 响应等 EOF 挂死，未按 Content-Length 判断边界 | `src/client/http_client.zig:94-97` → `responseCompleteLen()` |
+| 4 | io_uring LINK_TIMEOUT 用了栈变量地址 (use-after-return) | `src/shared/tcp_stream.zig:30,144` → 持久字段 `connect_timeout_ts` |
+| 5 | server.stop() 跨线程普通 bool 写入，数据竞争 | `src/http/event_loop.zig:25` → `@atomicStore(.release)` |
+| 6 | io_uring SINGLE_ISSUER 导致跨线程 init/run 报 InvalidThread | `src/http/async_server.zig:250-252` → 去掉了 SINGLE_ISSUER 标志 |
+| 7 | Request body 复用 response body 字段（POST 被误判已响应） | `src/http/context.zig:9` → 新增 `request_body` 字段 |
+| 8 | getHeader("Host") 误匹配 "Hostile" | `src/http/context.zig:68` → 要求 `:` 紧跟 header 名 |
+| 9 | ctx.query() 只取了 method 部分，永远取不到参数 | `src/http/context.zig:82-84` → 从 URI 部分提取 |
+| 10 | 路由 fast path 把 query string 一起参与路径匹配 | `src/http/tcp_read.zig:133-134` → 取 `?` 前部分 |
+| 11 | `\n\n` header 分隔符下 body 起点计算错误 | `src/http/tcp_read.zig:141-143` → 区分 CRLF / LF-only |
+| 12 | Content-Length 小写无法识别 | `src/http/tcp_read.zig:145-148` → 大小写不敏感 |
+| 13 | 跨 TCP 分片拼 header 后栈内存交给 fiber（悬空指针） | `src/http/tcp_read.zig:364-371` → 堆复制 + `request_data_owned` |
+| 14 | Next.push 任务生命周期：入队失败时 pool/大块缓冲泄漏 | `src/http/http_routing.zig:324-327`, `src/http/ws_handler.zig:251-254` |
+| 15 | DNS A 记录 IP 未转网络字节序 | `src/dns/packet.zig:145` → `nativeToBig()` |
+| 16 | parseIpv4 返回值未转网络字节序导致 bind 地址错 | `src/http/http_helpers.zig:95` → `nativeToBig()` |
 
 ---
 
-## 中优先级
+## 第二轮本地修复 (✅ done)
 
-### 4. `src/http/connection_mgr.zig:96-101` — `closeConn` 递归自调用
-
-SQ 满时 `ring.nop` 提交 CLOSE SQE 失败，走回退路径：
-```zig
-_ = linux.close(fd);
-closeConn(self, conn_id, 0);   // 递归，fd=0 触发 connFree
-```
-终止条件（`fd == 0 or state == .closing → connFree`）正确，但递归调用增加了控制流复杂度。内部大量 `getConn` + `orelse return` 在递归层级间不透明。
-
-### 5. `src/dns/packet.zig:72` — `encodeName` 静默跳过非法标签
-
-```zig
-if (label.len > 63 or label.len == 0) continue;
-```
-
-对空标签（如 `"example..com"`）或超长标签跳过而非报错，生成畸形 DNS 查询包。
-
-### 6. `src/http/http_fiber.zig:57-107` — 中间件遍历逻辑 3 处重复
-
-`httpTaskExec` 中 global、precise、wildcard 三套中间件遍历的结构完全一致（各约 15 行），仅数据源不同。三处需同步维护，容易漏改。
-
-### 7. `src/outbound/tcp_outbound_ring.zig:188,197` — 每次 I/O 单独 submit
-
-`submitRead` 和 `submitWrite` 内部各自调用 `ring.submit()`，而非在 `tick()` 中统一提交。高频场景每帧额外触发多次 `io_uring_enter` 系统调用。
-
-### 8. `src/http/ws_handler.zig:271` — WS handler fiber 未完成即重新投递 read
-
-```zig
-// fiber 执行（可能 yield）
-fiber.exec(...);
-// 立刻重新 submit read，不等 handler 完成
-if (conn.state != .ws_writing) {
-    conn.state = .ws_reading;
-    self.submitRead(conn_id, conn) catch { ... };
-}
-```
-
-`shared_fiber_active` 标志保护了共享栈，但 fd 上已允许新帧到达。handler 若未 yield 则无问题；若 yield，新帧通过 `Next.push` 入队。当前正确但耦合度高。
+| # | 问题 | 修复文件 | 改动 |
+|---|------|----------|------|
+| H1 | `waiting_computation` 状态未处理 → 误杀连接 | `src/http/event_loop.zig` | 新增 `.waiting_computation` 分支，仅 replenish buffer |
+| H2 | `makeErrorResponse` 三级回退 `&.{}` 被 free → UB | `src/client/http_client.zig` | `Response.deinit()` 前检查 `body.len > 0` |
+| H3 | manual mutex state 操作 + `cond` 未使用 | `src/client/http_client.zig` | 移除 `mutex`/`cond`，改用 `@atomicLoad`/`@atomicStore` |
+| M1 | `encodeName` 静默跳过非法标签 | `src/dns/packet.zig` | 返回 `error.LabelTooLong` / `error.EmptyLabel` |
+| M2 | middleware 遍历 3 处重复 | `src/http/http_fiber.zig` | 提取 `runMiddlewareList` 公共函数 |
+| M3 | `tcp_outbound_ring` 每次 I/O 单独 submit | `src/outbound/tcp_outbound_ring.zig` | 移除 submitRead/submitWrite 内的 `ring.submit()` |
+| M4 | `readResolvConfNameserver` + `parseIpv4` 重复定义 | `src/client/ring.zig` + `src/http/async_server.zig` | 统一到 `src/http/http_helpers.zig` |
+| L1 | STRESS_TEST.md wbuf 文档错 (4KB→64KB) | `STRESS_TEST.md` | 更新 4 处过时描述 |
+| L2 | typo `Nextuest` → `Request` | `src/example.zig` | 修正 |
+| L3 | SIMD 非对齐路径逐字节 → 4 字节 SWAR | `src/ws/frame.zig` | `readInt(u32)` + XOR 回退 |
+| L4 | `RingBuffer.push()` 仅 retry 1 次 → 8 次 | `src/spsc_ringbuffer.zig` | 循环重试 with yield |
+| L5 | 64KB `resp_buf` 栈变量 → 堆分配 | `src/client/http_client.zig` | `allocator.alloc` + `defer free` |
+| L6 | fixed file 注册失败静默忽略 | `src/shared/tcp_stream.zig` | 添加 `std.log.warn` |
+| L7 | `parked.append` 失败后未清理资源 | `src/next/next.zig` | `releaseStack` + `destroy(task)` 兜底 |
 
 ---
 
-## 低优先级 / 代码质量
+## 仍存在的问题 (未修，设计层面 / 非 bug)
 
-### 9. 代码重复
-
-| 函数 | 位置 1 | 位置 2 |
-|------|--------|--------|
-| `readResolvConfNameserver()` | `src/http/async_server.zig:60` | `src/client/ring.zig:123` |
-| `parseIpv4()` | `src/http/http_helpers.zig:81` | `src/client/ring.zig:148` |
-
-### 10. 文档与实现不一致
-
-`STRESS_TEST.md:96` 标注 TcpOutboundRing.wbuf 为 4KB，实际代码 `src/outbound/tcp_outbound_ring.zig:179` 为 64KB。另有 `STRESS_TEST.md:80` 提到"DNS resolve 可能阻塞 RingB 线程"，但当前 DNS 已走 io_uring UDP，不阻塞。
-
-### 11. `src/example.zig:111` — 注释 typo
-
-`"[Middleware] Nextuest:"` 应为 `"Request"`。
-
-### 12. `src/ws/frame.zig:107-112` — SIMD 非对齐路径无中等优化回退
-
-指针非 16 字节对齐时跳过整个 SIMD 快路径，逐字节处理。应至少有 8 字节/4 字字节的 SWAR 回退。
-
-### 13. `src/spsc_ringbuffer.zig:64-67` — `RingBuffer.push()` 满时仅 retry 1 次
-
-```zig
-pub fn push(...) bool {
-    while (!self.tryPush(item)) {
-        std.Thread.yield() catch {};
-        if (!self.tryPush(item)) return false;  // 一次重试后放弃
-    }
-    return true;
-}
-```
-
-yield + 单次重试，失败后任务静默丢失。
-
-### 14. `src/client/http_client.zig:475` — 64KB 栈变量在 fiber 中
-
-```zig
-var resp_buf: [65536]u8 = undefined;
-```
-
-此变量在 `httpRequestFiber` 的 fiber 栈上分配。配合默认 256KB 共享栈尚可，若 future 使用更小 per-task 栈则有溢出风险。
-
-### 15. `src/shared/tcp_stream.zig:216-220` — 固定文件注册失败被静默忽略
-
-```zig
-if (self.rs.ringPtr().register_files_sparse(1)) {
-    if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
-        self.fixed_index = 0;
-    } else |_| {}
-} else |_| {}
-```
-
-两次 fallible 操作均忽略错误，退化到非 fixed-file 路径无日志记录，问题排查困难。
-
-### 16. `src/next/next.zig:218` — `parked.append` 失败时尝试 resume 但未检查返回值
-
-```zig
-parked.append(pool.allocator, .{...}) catch {
-    @import("fiber.zig").saved_call = call;
-    Fiber.resumeContext(ctx);
-};
-```
-
-`append` 失败时直接 resume fiber 以完成 cleanup，但 `resumeContext` 的完成状态未被检查。如果 resume 后 fiber 再次 yield，会丢失在 parked 列表中。
+| # | 问题 | 说明 |
+|---|------|------|
+| 4 | `connection_mgr.zig` closeConn 递归自调用 | 终止条件正确 (fd==0)，但结构脆弱 |
+| 8 | `ws_handler.zig` handler fiber 未完成即投递 read | `shared_fiber_active` 保护正确，耦合度高 |
+| 9 | HTTP pipelining 不支持 | `tcp_read.zig` 单次 read 只处理一个请求，属功能缺失 |
 
 ---
 
 ## 后续跟踪
 
-- [ ] 等待第二波 PR 合并，重新审计 `src/http/*`, `src/next/*`, `src/shared/*`
-- [ ] 等待第三波 PR 合并，重新审计 `src/client/*`, `src/dns/*`, `src/ws/*`
+- [x] 第一波 PR 已合并，16 项修复已核对确认
+- [x] 第二轮本地修复完成：14 项 (H1-H3, M1-M4, L1-L7)
+- [ ] 等待 GPT 第二/三波 PR 推送 → 重新审计并修复
 - [ ] 所有波次完成后，跑 `zig build test` 验证不引入回归

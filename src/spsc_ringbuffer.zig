@@ -59,11 +59,15 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
             return true;
         }
 
-        /// 强制入队，满时 yield + 重试 (提供背压)
+        /// 强制入队，满时 yield + 重试 (修复：1次→8次，减少静默丢任务)
         pub fn push(self: *Self, value: T) bool {
             if (self.tryPush(value)) return true;
-            std.Thread.yield() catch {};
-            return self.tryPush(value);
+            var attempt: u4 = 0;
+            while (attempt < 8) : (attempt += 1) {
+                std.Thread.yield() catch {};
+                if (self.tryPush(value)) return true;
+            }
+            return false;
         }
 
         /// 尝试出队，空则返回 null

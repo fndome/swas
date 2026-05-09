@@ -213,11 +213,16 @@ pub const RingSharedClient = struct {
                 const one: i32 = 1;
                 _ = linux.setsockopt(self.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(i32));
                 // Register as fixed file to avoid kernel fd lookup per I/O
+                // 修复：fixed file 注册失败静默忽略，加日志便于排查性能退化。
                 if (self.rs.ringPtr().register_files_sparse(1)) {
                     if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
                         self.fixed_index = 0;
-                    } else |_| {}
-                } else |_| {}
+                    } else |err| {
+                        std.log.warn("RingSharedClient: register_files_update failed: {s}", .{@errorName(err)});
+                    }
+                } else |err| {
+                    std.log.warn("RingSharedClient: register_files_sparse failed: {s}", .{@errorName(err)});
+                }
                 self.submitRead() catch {
                     self.onClose();
                 };

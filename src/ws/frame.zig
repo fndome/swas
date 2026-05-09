@@ -103,11 +103,17 @@ fn maskPayload(payload: []u8, mask_key: [4]u8) void {
             chunk.* ^= mask_vec;
             i += 16;
         }
-    } else {
-        // Unaligned slow path: byte-by-byte for safety
-        const end = chunk_count * 16;
-        while (i < end) : (i += 1) {
-            payload[i] ^= mask_key[i & 3];
+    } else if (chunk_count > 0) {
+        // 修复：非对齐路径逐字节太慢，加 4 字节 SWAR 回退（readInt/writeInt 支持非对齐访问）。
+        const mask_u32 = (@as(u32, mask_key[0])) |
+            (@as(u32, mask_key[1]) << 8) |
+            (@as(u32, mask_key[2]) << 16) |
+            (@as(u32, mask_key[3]) << 24);
+        const bulk_end = chunk_count * 16;
+        i = 0;
+        while (i + 4 <= bulk_end) : (i += 4) {
+            const val = std.mem.readInt(u32, payload[i..][0..4], .little);
+            std.mem.writeInt(u32, payload[i..][0..4], val ^ mask_u32, .little);
         }
     }
     // Tail: remaining < 16 bytes

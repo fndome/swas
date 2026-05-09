@@ -216,8 +216,14 @@ fn runTask(pool: *WorkerPool, task: *PoolTask, parked: *std.ArrayList(ParkedTask
             .poll_ctx = poll_ctx,
             .stack = stack,
         }) catch {
+            // 修复：parked.append 失败后 resume fiber 完成 cleanup。
+            // 若 fiber 再次 yield 则无法 re-park → 直接释放栈和任务避免泄漏。
             @import("fiber.zig").saved_call = call;
             Fiber.resumeContext(ctx);
+            if (Fiber.isYielded()) {
+                pool.releaseStack(stack);
+                pool.allocator.destroy(task);
+            }
         };
         @import("fiber.zig").parked_ctx = null;
         @import("fiber.zig").parked_poll = null;
@@ -253,8 +259,12 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
             .task = pt.task,
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
-            .stack = pt.stack,  // 栈随任务跨 yield 存活
-        }) catch {};
+            .stack = pt.stack,
+        }) catch {
+            // 修复：resumeParked 中 append 失败时静默泄漏 → 释放栈和任务兜底。
+            pool.releaseStack(pt.stack);
+            pool.allocator.destroy(pt.task);
+        };
         @import("fiber.zig").parked_ctx = null;
         @import("fiber.zig").parked_poll = null;
         @import("fiber.zig").parked_poll_ctx = null;

@@ -110,7 +110,7 @@ pub const IoUringUserPattern = struct {
 const Example = struct {
     fn jwtMiddleware(allocator: Allocator, ctx: *Context) anyerror!bool {
         _ = allocator;
-        std.debug.print("[Middleware] Nextuest: {s}\n", .{ctx.path});
+        std.debug.print("[Middleware] Request: {s}\n", .{ctx.path});
         ctx.text(401, "Unauthorized") catch {};
         return true;
     }

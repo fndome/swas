@@ -77,9 +77,9 @@ scripts/self_test_local.sh
 | RingB CQE 溢出 | DNS/NATS/HTTP 共享 RingB | CQE 环满 → 事件丢失 | 独立 ring (TcpOutboundRing) 缓解, RingB 仅 HTTP |
 | Fiber stack leak | Fiber 内 alloc 后异常退出 | 内存泄漏 | Fiber 不使用 general allocator, 栈上变量自动回收 |
 | Pipe 无背压 | onData 快于 fiber read | Pipe buffer 无限增长 → OOM | Pipe 无背压机制 → **需加上限** |
-| DNS 阻塞 | dns.resolve() 调用 getaddrinfo | 阻塞 RingB 线程 → 所有请求冻结 | 需改用 c-ares / io_uring DNS |
+| DNS 阻塞 | (已修复: dns.resolve() 使用 io_uring UDP 异步解析) | 无 | 不适用 |
 
-**最脆弱点: DNS resolve 可能阻塞 RingB 线程。** RingB 和 Ring A/C 共享同一个 DNS resolver？需要确认。
+**最脆弱点: Pipe 无背压机制 → OOM。** Pipe buffer 需加上限。
 
 ## 4. TcpOutboundRing
 
@@ -93,13 +93,13 @@ scripts/self_test_local.sh
 | 场景 | 触发条件 | 表现 | 缓解 |
 |------|---------|------|------|
 | tick 饥饿 | 调用频率太低 | CQE 堆积 → ring 溢出 → 数据丢失 | 每次 event loop 必调用 tick() |
-| wbuf 爆库 | 单条 write > 4KB | write()=WriteBufferFull → 数据丢弃 | wbuf 4KB, HTTP 转发 500B 不会触发; MySQL query 可能超 |
+| wbuf 爆库 | 单条 write > 64KB | write()=WriteBufferFull → 数据丢弃 | wbuf 64KB, HTTP 转发 500B 不会触发; MySQL query 可能超 |
 | 连接泄漏 | removeConn 未调用 | hashmap 膨胀 → 内存泄漏 | 错误路径需确保 close |
 | on_read 回调卡 tick | 回调处理 > 100µs | 该 ring 所有连接延迟 | 回调必须 < 50µs; 重活走 WorkerPool |
 | 单 ring 多协议 | MySQL 慢 + Redis 快 | MySQL CQE 处理快 (5µs), 不影响 Redis | tick 是顺序的但每个 CQE < 5µs, 无影响 |
 | ChunkStream worker_buf OOM | StreamHandle.init 分配 64KB 失败 | panic | 预分配, init 时错误可恢复 |
 
-**最脆弱点: wbuf 4KB 限制。** MySQL 大写入 / Redis pipeline 可能超。需提到 64KB 或支持分段 write。
+**最脆弱点: wbuf 64KB 限制。** MySQL 大写入 / Redis pipeline 可能超。需支持分段 write。
 
 ## 总结
 
@@ -107,6 +107,7 @@ scripts/self_test_local.sh
 |------|---------|------|-----------|
 | Ring A | 共享栈 256KB | 🔶 中 | fiber_stack_size_kb 可调大 |
 | StackPool | 1M 前 CPU 先到瓶颈 | 🟢 低 | 不修 |
-| HTTP Client | DNS resolve 阻塞 RingB 线程 | 🔴 高 | 用 c-ares / io_uring DNS |
+| HTTP Client | Pipe 无背压 | 🔶 中 | Pipe buffer 加上限 |
+| TinyCache | acquire-evict race | 🟢 低 | 减小 TTL 或加锁 |
 | TinyCache | Pipe 无背压 → OOM | 🔶 中 | Pipe buffer 加上限 |
 | TcpOutboundRing | wbuf 4KB → 大 write 丢数据 | 🔶 中 | wbuf → 64KB 或分段写 |

@@ -27,6 +27,8 @@ const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 
 const helpers = @import("http_helpers.zig");
 const parseIpv4 = helpers.parseIpv4;
+// 修复：消除与 client/ring.zig 的 readResolvConfNameserver 重复定义，统一使用 http_helpers.zig。
+const readResolvConfNameserver = helpers.readResolvConfNameserver;
 
 const WsServer = @import("../ws/server.zig").WsServer;
 const WsHandler = @import("../ws/server.zig").WsHandler;
@@ -57,30 +59,8 @@ const WsTaskCtx = ws_fiber.WsTaskCtx;
 const DeferredNode = hook_system.DeferredNode;
 const deferredRespond = hook_system.deferredRespond;
 
-fn readResolvConfNameserver() !u32 {
-    const path = "/etc/resolv.conf\x00";
-    const flags: linux.O = @bitCast(@as(u32, 0));
-    const raw_fd = linux.open(@ptrCast(path), flags, 0);
-    if (raw_fd < 0) return error.FileNotFound;
-    const fd: i32 = @intCast(raw_fd);
-    defer _ = linux.close(fd);
-
-    var buf: [4096]u8 = undefined;
-    const raw = linux.read(fd, &buf, buf.len);
-    const n_signed: isize = @bitCast(raw);
-    if (n_signed <= 0) return error.FileNotFound;
-    const content = buf[0..@as(usize, @intCast(n_signed))];
-
-    var it = std.mem.splitScalar(u8, content, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "nameserver ")) {
-            const ip_str = std.mem.trim(u8, trimmed["nameserver ".len..], " \t\r");
-            if (helpers.parseIpv4(ip_str)) |ip| return ip else |_| continue;
-        }
-    }
-    return error.NoNameserverFound;
-}
+const DeferredNode = hook_system.DeferredNode;
+const deferredRespond = hook_system.deferredRespond;
 
 pub const AsyncServer = struct {
     allocator: Allocator,

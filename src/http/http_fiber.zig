@@ -31,7 +31,6 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
 
     var request_body: []const u8 = "";
     if (t.body_data) |bd| {
-        // 修改原因：请求体不能占用 ctx.body；ctx.body 是响应体，混用会让中间件误判已响应。
         request_body = bd;
         t.body_data = null;
         defer server.large_pool.release(bd);
@@ -54,17 +53,46 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
 
     var handled = false;
 
+    // Middleware 上下文 -- 跨 global/precise/wildcard 复用同一遍历逻辑
+    const MiddlewareCtx = struct {
+        server: *AsyncServer,
+        ctx: *Context,
+        handled: *bool,
+    };
+
+    // 修复：global/precise/wildcard 三套中间件遍历逻辑重复 3 次，提取为公共函数。
+    const runMiddlewareList = struct {
+        fn run(server2: *AsyncServer, ctx2: *Context, handled2: *bool, list: []const @import("types.zig").Middleware) void {
+            for (list) |mw| {
+                const stop = mw(server2.allocator, ctx2) catch |err| {
+                    logErr("middleware error: {s}", .{@errorName(err)});
+                    if (ctx2.body == null) ctx2.text(500, @errorName(err)) catch {};
+                    handled2.* = true;
+                    break;
+                };
+                if (stop or ctx2.body != null) {
+                    handled2.* = true;
+                    break;
+                }
+            }
+        }
+    }.run;
+
     if (server.middlewares.has_global) {
-        for (server.middlewares.global.items) |mw| {
-            const stop = mw(server.allocator, &ctx) catch |err| {
-                logErr("global middleware error: {s}", .{@errorName(err)});
-                if (ctx.body == null) ctx.text(500, @errorName(err)) catch {};
-                handled = true;
-                break;
-            };
-            if (stop or ctx.body != null) {
-                handled = true;
-                break;
+        runMiddlewareList(server, &ctx, &handled, server.middlewares.global.items);
+    }
+
+    if (!handled) {
+        if (server.middlewares.precise.get(path)) |list| {
+            runMiddlewareList(server, &ctx, &handled, list.items);
+        }
+    }
+
+    if (!handled) {
+        for (server.middlewares.wildcard.items) |entry| {
+            if (entry.rule.match(path)) {
+                runMiddlewareList(server, &ctx, &handled, entry.list.items);
+                if (handled) break;
             }
         }
     }

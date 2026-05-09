@@ -10,6 +10,8 @@ const CLIENT_USER_DATA_FLAG = @import("../shared/io_registry.zig").CLIENT_USER_D
 const FiberShared = @import("../shared/fiber_shared.zig").FiberShared;
 const RingTrait = @import("../shared/fiber_shared.zig").RingTrait;
 const TinyCache = @import("tiny_cache.zig").TinyCache;
+const helpers = @import("../http/http_helpers.zig");
+// 修复：消除 readResolvConfNameserver/parseIpv4 与本文件 http_helpers.zig 的代码重复。
 
 const MAX_CQES_TICK = 64;
 
@@ -39,7 +41,7 @@ pub const RingB = struct {
     http_cache: TinyCache,
 
     pub fn init(allocator: Allocator, io: std.Io, attach_ring_fd: i32, cache_ttl_ms: i64) !RingB {
-        const ns_ip = readResolvConfNameserver() catch @as(u32, 0x08080808);
+        const ns_ip = helpers.readResolvConfNameserver() catch @as(u32, 0x08080808);
 
         var ring = brk: {
             var params = std.mem.zeroes(linux.io_uring_params);
@@ -118,46 +120,4 @@ fn nowMs() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
-}
-
-fn readResolvConfNameserver() !u32 {
-    const path = "/etc/resolv.conf\x00";
-    const flags: linux.O = @bitCast(@as(u32, 0));
-    const raw_fd = linux.open(@ptrCast(path), flags, 0);
-    if (raw_fd < 0) return error.FileNotFound;
-    const fd: i32 = @intCast(raw_fd);
-    defer _ = linux.close(fd);
-
-    var buf: [4096]u8 = undefined;
-    const raw = linux.read(fd, &buf, buf.len);
-    const n_signed: isize = @bitCast(raw);
-    if (n_signed <= 0) return error.FileNotFound;
-    const content = buf[0..@as(usize, @intCast(n_signed))];
-
-    var it = std.mem.splitScalar(u8, content, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "nameserver ")) {
-            const ip_str = std.mem.trim(u8, trimmed["nameserver ".len..], " \t\r");
-            if (parseIpv4(ip_str)) |ip| return ip else |_| continue;
-        }
-    }
-    return error.NoNameserverFound;
-}
-
-fn parseIpv4(ip_str: []const u8) !u32 {
-    var parts = std.mem.splitScalar(u8, ip_str, '.');
-    var octets: [4]u8 = undefined;
-    var i: usize = 0;
-    while (parts.next()) |part| : (i += 1) {
-        if (i >= 4) return error.InvalidIp;
-        octets[i] = try std.fmt.parseInt(u8, part, 10);
-    }
-    if (i != 4) return error.InvalidIp;
-    const ip = (@as(u32, octets[0]) << 24) |
-        (@as(u32, octets[1]) << 16) |
-        (@as(u32, octets[2]) << 8) |
-        (@as(u32, octets[3]));
-    // 修改原因：DNS nameserver 地址最终会写入 sockaddr，需保持网络字节序内存布局。
-    return std.mem.nativeToBig(u32, ip);
 }

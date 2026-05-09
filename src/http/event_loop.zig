@@ -182,6 +182,12 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                     self.pool.slots[conn_ptr.pool_idx].line4.writev_in_flight = 0;
                 }
                 self.closeConn(conn_id, conn_ptr.fd);
+            } else if (conn_ptr.state == .waiting_computation) {
+                // 修复：waiting_computation 状态存在但从未被分发，落入 else 会误杀连接。
+                // 此状态下不投递 IO，CQE 仅需归还 buffer。
+                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                    self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
+                }
             } else {
                 self.closeConn(conn_id, conn_ptr.fd);
             }
