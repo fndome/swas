@@ -354,7 +354,7 @@ pub const Next = struct {
             std.log.err("Next.go: no default Next instance set", .{});
             return;
         };
-        n.push(T, ctx, execFn, n.default_stack_size);
+        _ = n.push(T, ctx, execFn, n.default_stack_size);
     }
 
     pub fn goWithStackConfigurable(
@@ -367,7 +367,7 @@ pub const Next = struct {
             std.log.err("Next.goWithStackConfigurable: no default Next instance set", .{});
             return;
         };
-        n.push(T, ctx, execFn, stack_size);
+        _ = n.push(T, ctx, execFn, stack_size);
     }
 
     pub fn push(
@@ -376,13 +376,13 @@ pub const Next = struct {
         ctx: T,
         comptime execFn: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
         stack_size: u32,
-    ) void {
-        const user = self.allocator.create(T) catch return;
+    ) bool {
+        const user = self.allocator.create(T) catch return false;
         user.* = ctx;
 
         const gc = self.allocator.create(TaskCtx) catch {
             self.allocator.destroy(user);
-            return;
+            return false;
         };
         gc.* = .{ .next = self, .userCtx = user, .stack_size = stack_size };
 
@@ -451,7 +451,10 @@ pub const Next = struct {
             self.allocator.destroy(gc);
             self.allocator.destroy(user);
             std.log.err("Next.push: ringbuffer full after retry, task dropped", .{});
+            return false;
         }
+        // 修改原因：HTTP/WS 调用方需要知道是否入队成功，失败时才能回收请求缓冲。
+        return true;
     }
 
     /// ── Next.chainGoSubmit ─────────────────────────────────

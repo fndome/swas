@@ -201,6 +201,7 @@ pub const HttpWork = extern struct {
     content_length: u64 = 0,
     path_offset: u16 = 0,
     path_len: u16 = 0,
+    /// 修改原因：这里缓存 body 起点，而不是裸 header 结束下标，以兼容 "\r\n\r\n" 与 "\n\n"。
     headers_end: u16 = 0,
     /// 上次短读的 buffer ID（用于跨 TCP 分片的 header 拼包）
     pending_bid: u16 = 0,

@@ -128,21 +128,22 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             if (after_method < effective_nread) {
                 const path_start = after_method;
                 if (std.mem.indexOfScalar(u8, effective_buf[path_start..effective_nread], ' ')) |sp2| {
+                    const raw_target = effective_buf[path_start..][0..sp2];
+                    // 修改原因：路由匹配只使用 path，不能把 query string 一起写入 fast-path cache。
+                    const q_pos = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
                     hw.path_offset = @intCast(path_start);
-                    hw.path_len = @intCast(sp2);
+                    hw.path_len = @intCast(q_pos);
                 }
             }
         }
         if (std.mem.indexOf(u8, effective_buf, "\r\n\r\n")) |pos| {
-            hw.headers_end = @intCast(pos);
+            // 修改原因：后续要计算 body 起点，CRLF 和 LF-only 分隔符长度不同。
+            hw.headers_end = @intCast(pos + 4);
         } else if (std.mem.indexOf(u8, effective_buf, "\n\n")) |pos| {
-            hw.headers_end = @intCast(pos);
+            hw.headers_end = @intCast(pos + 2);
         }
-        if (std.mem.indexOf(u8, effective_buf, "Content-Length:")) |cl_pos| {
-            const val_start = cl_pos + "Content-Length:".len;
-            var end = val_start;
-            while (end < effective_nread and effective_buf[end] != '\r' and effective_buf[end] != '\n') : (end += 1) {}
-            const val = std.mem.trim(u8, effective_buf[val_start..end], " \t");
+        if (helpers.extractHeader(effective_buf, "Content-Length")) |val| {
+            // 修改原因：HTTP header 名大小写不敏感，lowercase content-length 也必须生效。
             hw.content_length = std.fmt.parseInt(u64, val, 10) catch 0;
         }
         if (hw.content_length > OVERSIZED_THRESHOLD) {
@@ -154,7 +155,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         if (conn.pool_idx == 0xFFFFFFFF) break :brk false;
         const hw3 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
         if (hw3.content_length == 0) break :brk false;
-        const headers_end = if (hw3.headers_end > 0) hw3.headers_end + 4 else effective_nread;
+        const headers_end = if (hw3.headers_end > 0) hw3.headers_end else effective_nread;
         const body_avail: usize = if (effective_nread > headers_end) effective_nread - headers_end else 0;
         break :brk body_avail < hw3.content_length;
     };
@@ -162,7 +163,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     if (body_incomplete) {
         const slot = &self.pool.slots[conn.pool_idx];
         const hw4 = sticker.httpWork(slot);
-        const headers_end = if (hw4.headers_end > 0) hw4.headers_end + 4 else effective_nread;
+        const headers_end = if (hw4.headers_end > 0) hw4.headers_end else effective_nread;
         if (headers_end >= effective_nread) {
             slot.line5.ws.compute.job_id = conn_id;
             slot.line5.ws.compute.buffer_ptr = hw4.content_length;
@@ -350,10 +351,24 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         self.middlewares.wildcard.items.len > 0 or
         self.handlers.count() > 0;
     if (has_async) {
-        const selected_buf = effective_buf;
+        var selected_buf = effective_buf;
+        var request_data_owned = false;
+        if (pending_to_free != 0) {
+            selected_buf = self.allocator.dupe(u8, effective_buf) catch {
+                self.buffer_pool.markReplenish(conn.read_bid);
+                conn.read_len = 0;
+                self.respond(conn, 500, "Internal Server Error");
+                return;
+            };
+            // 修改原因：跨 TCP 分片时 effective_buf 指向栈上 combo，fiber/队列不能持有栈指针。
+            request_data_owned = true;
+        }
         const method_str = getMethodFromRequest(selected_buf) orelse "GET";
 
         const t = self.http_ctx_pool.create(self.allocator) catch {
+            if (request_data_owned) self.allocator.free(selected_buf);
+            self.buffer_pool.markReplenish(conn.read_bid);
+            conn.read_len = 0;
             self.respond(conn, 500, "Internal Server Error");
             return;
         };
@@ -367,15 +382,21 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             .method_len = method_cap,
             .path_len = path_cap,
             .request_data = @constCast(selected_buf),
+            .request_data_owned = request_data_owned,
         };
         @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
         @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
 
         if (self.shared_fiber_active) {
             if (self.next) |*n| {
-                n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                if (n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024)) {
+                    self.http_ctx_pool.destroy(t);
+                } else {
+                    http_fiber.httpTaskCleanup(t);
+                    self.respond(conn, 503, "Service Unavailable");
+                }
             } else {
-                self.http_ctx_pool.destroy(t);
+                http_fiber.httpTaskCleanup(t);
                 self.respond(conn, 503, "Service Unavailable");
             }
         } else {

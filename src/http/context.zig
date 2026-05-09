@@ -5,6 +5,8 @@ pub const Context = struct {
     pub const ContentType = enum { plain, json, html };
 
     request_data: []const u8,
+    // 修改原因：请求体不能复用 response body 字段，否则 POST 会被误判为已响应。
+    request_body: []const u8 = "",
     path: []const u8,
     app_ctx: ?*anyopaque,
 
@@ -55,13 +57,15 @@ pub const Context = struct {
     }
 
     pub fn getHeader(self: *Context, key: []const u8) ?[]const u8 {
+        const header_name = if (key.len > 0 and key[key.len - 1] == ':') key[0 .. key.len - 1] else key;
         var lines = std.mem.splitSequence(u8, self.request_data, "\r\n");
         while (lines.next()) |line| {
             if (line.len == 0) break;
-            if (std.ascii.startsWithIgnoreCase(line, key)) {
-                if (line.len > key.len) {
-                    return std.mem.trim(u8, line[key.len..], ": \t\r\n");
-                }
+            if (std.ascii.startsWithIgnoreCase(line, header_name)) {
+                if (line.len <= header_name.len) return null;
+                const after = line[header_name.len..];
+                // 修改原因：要求 header 名后紧跟冒号，避免 Host 误匹配 Hostile。
+                if (after[0] == ':') return std.mem.trim(u8, after[1..], " \t\r\n");
             }
         }
         return null;
@@ -69,9 +73,12 @@ pub const Context = struct {
 
     /// 从请求 path 的 query string 中提取指定参数值。e.g. ctx.query("to")
     pub fn query(self: *Context, name: []const u8) ?[]const u8 {
-        const uri_end = if (std.mem.indexOfScalar(u8, self.request_data, ' ')) |sp| sp else self.request_data.len;
-        const first_line = self.request_data[0..uri_end];
+        const line_end = std.mem.indexOf(u8, self.request_data, "\r\n") orelse
+            std.mem.indexOfScalar(u8, self.request_data, '\n') orelse
+            self.request_data.len;
+        const first_line = self.request_data[0..line_end];
         const method_end = std.mem.indexOfScalar(u8, first_line, ' ') orelse return null;
+        // 修改原因：旧代码把 first_line 截到第一个空格，只剩 method，导致 query 永远取不到。
         const uri_part = std.mem.trimStart(u8, first_line[method_end + 1 ..], " ");
         const uri = uri_part[0 .. (std.mem.indexOfScalar(u8, uri_part, ' ') orelse uri_part.len)];
 
@@ -91,6 +98,7 @@ pub const Context = struct {
     /// 获取 POST/PUT/PATCH 请求体。
     /// 自动从 Content-Length 取长度。无 body 返回空串。
     pub fn requestBody(self: *Context) []const u8 {
+        if (self.request_body.len > 0) return self.request_body;
         const header_end = std.mem.indexOf(u8, self.request_data, "\r\n\r\n") orelse
             std.mem.indexOf(u8, self.request_data, "\n\n") orelse
             return "";
@@ -128,7 +136,8 @@ pub const Context = struct {
     /// 判断 Content-Type 是否为 JSON
     pub fn isJson(self: *Context) bool {
         const ct = self.getContentType();
-        return std.mem.eql(u8, ct, "application/json");
+        // 修改原因：HTTP Content-Type 的 type/subtype 大小写不敏感。
+        return std.ascii.eqlIgnoreCase(ct, "application/json");
     }
 
     pub fn clearHeaders(self: *Context) void {
@@ -142,3 +151,37 @@ pub const Context = struct {
         if (self.headers) |*h| h.deinit(self.allocator);
     }
 };
+
+test "Context.query parses URI from request line" {
+    var ctx = Context{
+        .request_data = "GET /search?q=zig&lang=zh HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        .path = "/search",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("zig", ctx.query("q").?);
+    try std.testing.expectEqualStrings("zh", ctx.query("lang").?);
+    try std.testing.expect(ctx.query("missing") == null);
+}
+
+test "Context.getHeader requires exact header name" {
+    var ctx = Context{
+        .request_data = "GET / HTTP/1.1\r\nHostile: nope\r\nHost: example.com\r\n\r\n",
+        .path = "/",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("example.com", ctx.getHeader("Host").?);
+    try std.testing.expectEqualStrings("example.com", ctx.getHeader("Host:").?);
+}
+
+test "Context.requestBody prefers oversized body storage" {
+    var ctx = Context{
+        .request_data = "POST / HTTP/1.1\r\nContent-Length: 999\r\n\r\n",
+        .request_body = "detached body",
+        .path = "/",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("detached body", ctx.requestBody());
+}

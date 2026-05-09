@@ -178,6 +178,7 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
     {
         var temp_ctx = Context{
             .request_data = effective_buf,
+            .request_body = body_buf,
             .path = path,
             .app_ctx = self.app_ctx,
             .allocator = self.allocator,
@@ -311,11 +312,15 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
 
         if (self.shared_fiber_active) {
             if (self.next) |*n| {
-                n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                if (n.push(HttpTaskCtx, t.*, httpTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024)) {
+                    self.http_ctx_pool.destroy(t);
+                } else {
+                    // 修改原因：入队失败时必须释放 body_buf/read buffer，避免大块池泄漏。
+                    http_fiber.httpTaskCleanup(t);
+                    self.respond(conn, 503, "Service Unavailable");
+                }
             } else {
-                self.http_ctx_pool.destroy(t);
-                self.buffer_pool.markReplenish(bid);
-                self.large_pool.release(body_buf);
+                http_fiber.httpTaskCleanup(t);
                 self.respond(conn, 503, "Service Unavailable");
             }
         } else {

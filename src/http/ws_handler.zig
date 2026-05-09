@@ -245,7 +245,14 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
 
             if (self.shared_fiber_active) {
                 if (self.next) |*n| {
-                    n.push(ws_fiber.WsTaskCtx, t.*, ws_fiber.wsTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024);
+                    if (n.push(ws_fiber.WsTaskCtx, t.*, ws_fiber.wsTaskExecWrapperWithOwnership, self.cfg.fiber_stack_size_kb * 1024)) {
+                        self.ws_ctx_pool.destroy(t);
+                    } else {
+                        // 修改原因：WS 任务入队失败时必须释放复制前持有的 payload，避免池泄漏。
+                        ws_fiber.wsTaskCleanup(t);
+                        self.closeConn(conn_id, conn.fd);
+                        return;
+                    }
                 } else {
                     self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
                     self.ws_ctx_pool.destroy(t);
