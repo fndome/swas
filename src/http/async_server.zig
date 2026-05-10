@@ -244,7 +244,8 @@ pub const AsyncServer = struct {
         };
 
         var use_ff = false;
-        const ff_freelist = std.ArrayList(u16).empty;
+        var ff_freelist = try std.ArrayList(u16).initCapacity(allocator, MAX_FIXED_FILES);
+        errdefer ff_freelist.deinit(allocator);
         if (ring.register_files_sparse(MAX_FIXED_FILES)) {
             use_ff = true;
         } else |_| {}
