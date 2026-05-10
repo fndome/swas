@@ -11,8 +11,6 @@ pub const DNS_FD_MAGIC: u64 = 0xCADE_0000_0000_0000;
 const fd_set = extern struct {
     fds_bits: [32]u32 align(8),
 };
-const FD_SET_BITS = fd_set.fds_bits.len * @bitSizeOf(u32);
-
 const FD_SET_WORD_BITS: usize = 32;
 const FD_SET_CAPACITY: usize = 32 * FD_SET_WORD_BITS;
 
@@ -152,15 +150,6 @@ pub const CaresDns = struct {
         _ = self.rs.ring.submit() catch {};
     }
 };
-
-fn fdSetContains(set: *const fd_set, fd: i32) bool {
-    if (fd < 0) return false;
-    const fd_u: usize = @intCast(fd);
-    if (fd_u >= FD_SET_BITS) return false;
-    const idx = fd_u / @bitSizeOf(u32);
-    const bit = @as(u32, 1) << @as(u5, @truncate(fd_u));
-    return (set.fds_bits[idx] & bit) != 0;
-}
 
 fn dnsCallback(
     arg: ?*anyopaque,
