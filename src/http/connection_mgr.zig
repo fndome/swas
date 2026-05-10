@@ -49,6 +49,11 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
                 self.large_pool.release(buf);
                 slot.line3.large_buf_ptr = 0;
             }
+            // stream_ptr may reference a heap-allocated StreamHandle that was
+            // never finished. Clear it so the slot can be safely reused.
+            if (slot.line3.stream_ptr != 0) {
+                slot.line3.stream_ptr = 0;
+            }
         }
 
         if (!conn.write_bufs_freed) {
