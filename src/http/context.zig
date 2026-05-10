@@ -117,9 +117,13 @@ pub const Context = struct {
         const start = header_end + sep;
         if (start >= self.request_data.len) return "";
 
-        const cl = self.getContentLength();
-        const end = if (cl > 0) @min(start + cl, self.request_data.len) else self.request_data.len;
-        return self.request_data[start..end];
+        if (self.getHeader("Content-Length:")) |raw_cl| {
+            // 修改原因：Content-Length 缺失和显式 0 不能都当成 0；显式 0 必须返回空 body。
+            const cl = std.fmt.parseInt(usize, raw_cl, 10) catch return "";
+            const end = @min(start + cl, self.request_data.len);
+            return self.request_data[start..end];
+        }
+        return self.request_data[start..];
     }
 
     /// 解析请求头方法（GET/POST/PUT/...）
@@ -206,4 +210,14 @@ test "Context.requestBody honors Content-Length with LF-only headers" {
     };
     try std.testing.expectEqual(@as(usize, 4), ctx.getContentLength());
     try std.testing.expectEqualStrings("abcd", ctx.requestBody());
+}
+
+test "Context.requestBody returns empty body for explicit zero Content-Length" {
+    var ctx = Context{
+        .request_data = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\nnext-request-bytes",
+        .path = "/",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("", ctx.requestBody());
 }
