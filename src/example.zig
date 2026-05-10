@@ -139,6 +139,19 @@ const Example = struct {
         ctx.status = 200;
     }
 
+    fn httpMethodHandler(allocator: Allocator, ctx: *Context) anyerror!void {
+        const method = ctx.method();
+        const request_body = ctx.requestBody();
+        // 修改原因：自测需要覆盖常见 HTTP 方法，并验证 PUT/PATCH/POST 的 JSON body 会被业务层读到后按 JSON 返回。
+        const body = if (request_body.len > 0)
+            try std.fmt.allocPrint(allocator, "{{\"method\":\"{s}\",\"body\":{s}}}", .{ method, request_body })
+        else
+            try std.fmt.allocPrint(allocator, "{{\"method\":\"{s}\",\"body\":null}}", .{method});
+        ctx.body = body;
+        ctx.content_type = .json;
+        ctx.status = 200;
+    }
+
     fn wsEchoHandler(conn_id: u64, frame: *const Frame, ctx: *anyopaque) void {
         if (frame.opcode == .text or frame.opcode == .binary) {
             const ws = @as(*WsServer, @ptrCast(@alignCast(ctx)));
@@ -175,6 +188,11 @@ const Example = struct {
         try server.useThenRespondImmediately("/antpath-verify", jwtMiddleware);
         try server.use("/admin", logMiddleware);
         try server.GET("/hello", helloHandler);
+        try server.GET("/http-method", httpMethodHandler);
+        try server.POST("/http-method", httpMethodHandler);
+        try server.PUT("/http-method", httpMethodHandler);
+        try server.PATCH("/http-method", httpMethodHandler);
+        try server.DELETE("/http-method", httpMethodHandler);
         try server.GET("/admin/dashboard", helloHandler);
         try server.ws("/echo", wsEchoHandler);
 

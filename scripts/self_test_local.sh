@@ -29,6 +29,40 @@ require_cmd() {
   fi
 }
 
+curl_expect() {
+  local method="$1"
+  local path="$2"
+  local expected="$3"
+  local data="${4:-}"
+
+  : >"$headers_file"
+  : >"$body_file"
+  if [[ -n "$data" ]]; then
+    curl -fsS --max-time 3 -X "$method" -H 'Connection: close' -H 'Content-Type: application/json' --data "$data" \
+      -D "$headers_file" "http://127.0.0.1:${EXAMPLE_PORT}${path}" -o "$body_file"
+  else
+    # 修改原因：方法矩阵会连续打开多条 curl 连接，显式关闭连接可避免自测被小连接池容量干扰。
+    curl -fsS --max-time 3 -X "$method" -H 'Connection: close' \
+      -D "$headers_file" "http://127.0.0.1:${EXAMPLE_PORT}${path}" -o "$body_file"
+  fi
+
+  if ! grep -Fq "$expected" "$body_file"; then
+    printf 'unexpected %s %s response, expected body fragment %s:\n' "$method" "$path" "$expected" >&2
+    cat "$headers_file" >&2 || true
+    cat "$body_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+  if ! grep -iq '^Content-Type: application/json' "$headers_file"; then
+    printf 'unexpected %s %s content-type:\n' "$method" "$path" >&2
+    cat "$headers_file" >&2 || true
+    exit 1
+  fi
+  # 修改原因：给关闭 CQE 一个事件循环周期，避免方法矩阵测试变成短连接回收压力测试。
+  sleep 0.1
+}
+
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -86,7 +120,7 @@ for _ in $(seq 1 30); do
     cat "$server_log" >&2 || true
     exit 1
   fi
-  if curl -fsS --max-time 2 -D "$headers_file" "http://127.0.0.1:${EXAMPLE_PORT}/hello" -o "$body_file" 2>/dev/null; then
+  if curl -fsS --max-time 2 -H 'Connection: close' -D "$headers_file" "http://127.0.0.1:${EXAMPLE_PORT}/hello" -o "$body_file" 2>/dev/null; then
     break
   fi
   sleep 0.2
@@ -104,6 +138,15 @@ fi
 cat "$headers_file"
 cat "$body_file"
 printf '\n'
+
+log "HTTP method JSON tests"
+# 修改原因：覆盖 GET/POST/PUT/PATCH/DELETE，避免只测 GET 冒烟时漏掉 body 读取和方法路由问题。
+curl_expect GET /http-method '"method":"GET"'
+curl_expect DELETE /http-method '"method":"DELETE"'
+curl_expect POST /http-method '"body":{"post":true}' '{"post":true}'
+curl_expect PUT /http-method '"body":{"put":true}' '{"put":true}'
+curl_expect PATCH /http-method '"body":{"patch":true}' '{"patch":true}'
+
 cleanup
 SERVER_PID=""
 
