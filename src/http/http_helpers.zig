@@ -83,12 +83,14 @@ pub fn extractQueryParam(uri: []const u8, name: []const u8) ?[]const u8 {
 
 /// 从 HTTP 请求头部提取指定 header 的值（大小写不敏感）
 pub fn extractHeader(data: []const u8, name: []const u8) ?[]const u8 {
-    var lines = std.mem.splitSequence(u8, data, "\r\n");
-    while (lines.next()) |line| {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
         if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, name)) {
             if (line.len <= name.len) return null;
             const after = line[name.len..];
+            // 修改原因：tcp_read 已支持 LF-only 请求头结束符，header 提取也必须同样兼容，同时仍要求冒号避免误匹配。
             if (after.len > 0 and after[0] == ':') {
                 return std.mem.trim(u8, after[1..], " \t\r\n");
             }
@@ -150,4 +152,11 @@ test "isKeepAliveConnection uses request line and exact Connection tokens" {
     try std.testing.expect(isKeepAliveConnection("GET / HTTP/1.1\r\nConnection: enclose\r\n\r\n"));
     try std.testing.expect(!isKeepAliveConnection("GET / HTTP/1.1\nConnection: close\n\n"));
     try std.testing.expect(isKeepAliveConnection("GET / HTTP/1.0\r\nConnection: keep-alive, upgrade\r\n\r\n"));
+}
+
+test "extractHeader supports LF-only request headers" {
+    const req = "POST / HTTP/1.1\nHost: example.test\nContent-Length: 4\n\nbody";
+
+    try std.testing.expectEqualStrings("4", extractHeader(req, "Content-Length").?);
+    try std.testing.expect(extractHeader(req, "Content") == null);
 }
