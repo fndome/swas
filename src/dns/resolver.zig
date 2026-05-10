@@ -71,6 +71,8 @@ pub const DnsResolver = struct {
             _ = linux.close(fd);
             return error.BindFailed;
         }
+        // 修改原因：bind 成功后如果后续注册 user_data 失败，必须关闭 UDP fd，避免初始化失败路径泄漏 socket。
+        errdefer _ = linux.close(fd);
 
         const rs = RingShared.bind(ring, registry);
         const dns_ud = try rs.alloc(@ptrCast(@constCast(&fd)), &dnsDispatch);
