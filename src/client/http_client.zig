@@ -136,6 +136,35 @@ fn onClose(stream: *RingSharedClient, ctx: ?*anyopaque) void {
 
 const REQUEST_POOL_SIZE = 30;
 
+const RequestParts = struct {
+    headers: ?[]u8 = null,
+    body: ?[]u8 = null,
+
+    fn deinit(self: *RequestParts, allocator: Allocator) void {
+        if (self.headers) |h| {
+            allocator.free(h);
+            self.headers = null;
+        }
+        if (self.body) |b| {
+            allocator.free(b);
+            self.body = null;
+        }
+    }
+};
+
+fn duplicateRequestParts(allocator: Allocator, headers: ?[]const u8, body: ?[]const u8) !RequestParts {
+    var parts = RequestParts{};
+    errdefer parts.deinit(allocator);
+    if (headers) |h| {
+        // 修改原因：调用方传入 headers 时复制失败必须返回 OOM，不能静默丢掉鉴权等请求头继续发送。
+        parts.headers = try allocator.dupe(u8, h);
+    }
+    if (body) |b| {
+        parts.body = try allocator.dupe(u8, b);
+    }
+    return parts;
+}
+
 fn initReqFreelist() [REQUEST_POOL_SIZE]usize {
     var freelist: [REQUEST_POOL_SIZE]usize = undefined;
     for (0..REQUEST_POOL_SIZE) |i| {
@@ -263,31 +292,19 @@ pub const HttpClient = struct {
     }
 
     pub fn request(self: *HttpClient, method: []const u8, url: []const u8, headers: ?[]const u8, body: ?[]const u8) !Response {
-        var headers_dup: ?[]u8 = if (headers) |h| self.allocator.dupe(u8, h) catch null else null;
-        errdefer if (headers_dup) |h| self.allocator.free(h);
-        var body_dup: ?[]u8 = if (body) |b| self.allocator.dupe(u8, b) catch {
-            if (headers_dup) |h| self.allocator.free(h);
-            headers_dup = null;
-            return error.OutOfMemory;
-        } else null;
-        errdefer if (body_dup) |b| self.allocator.free(b);
+        var parts = try duplicateRequestParts(self.allocator, headers, body);
+        errdefer parts.deinit(self.allocator);
 
-        const ctx = self.acquireReq() orelse {
-            if (headers_dup) |h| self.allocator.free(h);
-            if (body_dup) |b| self.allocator.free(b);
-            headers_dup = null;
-            body_dup = null;
-            return error.PoolFull;
-        };
+        const ctx = self.acquireReq() orelse return error.PoolFull;
         var release_on_error = true;
         errdefer if (release_on_error) self.releaseReq(ctx);
         ctx.method = method;
         ctx.url = url;
-        ctx.headers = headers_dup;
-        ctx.body = body_dup;
+        ctx.headers = parts.headers;
+        ctx.body = parts.body;
         ctx.done = false;
-        headers_dup = null; // 所有权已移交给 ctx
-        body_dup = null;
+        parts.headers = null; // 所有权已移交给 ctx
+        parts.body = null;
 
         try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
         {
@@ -624,4 +641,18 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 8080), parsed.port);
     try std.testing.expectEqualStrings("/path", parsed.path);
+}
+
+test "HttpClient preserves request headers allocation failures" {
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, duplicateRequestParts(failing.allocator(), "Authorization: Bearer token\r\n", null));
+    }
+
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        try std.testing.expectError(error.OutOfMemory, duplicateRequestParts(failing.allocator(), "Content-Type: application/json\r\n", "{}"));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    }
 }
