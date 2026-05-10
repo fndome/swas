@@ -68,13 +68,14 @@ pub const Context = struct {
 
     pub fn getHeader(self: *Context, key: []const u8) ?[]const u8 {
         const header_name = if (key.len > 0 and key[key.len - 1] == ':') key[0 .. key.len - 1] else key;
-        var lines = std.mem.splitSequence(u8, self.request_data, "\r\n");
-        while (lines.next()) |line| {
+        var lines = std.mem.splitScalar(u8, self.request_data, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, "\r");
             if (line.len == 0) break;
             if (std.ascii.startsWithIgnoreCase(line, header_name)) {
                 if (line.len <= header_name.len) return null;
                 const after = line[header_name.len..];
-                // 修改原因：要求 header 名后紧跟冒号，避免 Host 误匹配 Hostile。
+                // 修改原因：同时支持 CRLF/LF-only 请求头，但仍要求 header 名后紧跟冒号，避免 Host 误匹配 Hostile。
                 if (after[0] == ':') return std.mem.trim(u8, after[1..], " \t\r\n");
             }
         }
@@ -90,7 +91,7 @@ pub const Context = struct {
         const method_end = std.mem.indexOfScalar(u8, first_line, ' ') orelse return null;
         // 修改原因：旧代码把 first_line 截到第一个空格，只剩 method，导致 query 永远取不到。
         const uri_part = std.mem.trimStart(u8, first_line[method_end + 1 ..], " ");
-        const uri = uri_part[0 .. (std.mem.indexOfScalar(u8, uri_part, ' ') orelse uri_part.len)];
+        const uri = uri_part[0..(std.mem.indexOfScalar(u8, uri_part, ' ') orelse uri_part.len)];
 
         const q_pos = std.mem.indexOfScalar(u8, uri, '?') orelse return null;
         const qs = uri[q_pos + 1 ..];
@@ -194,4 +195,15 @@ test "Context.requestBody prefers oversized body storage" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expectEqualStrings("detached body", ctx.requestBody());
+}
+
+test "Context.requestBody honors Content-Length with LF-only headers" {
+    var ctx = Context{
+        .request_data = "POST / HTTP/1.1\nContent-Length: 4\n\nabcdef",
+        .path = "/",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(@as(usize, 4), ctx.getContentLength());
+    try std.testing.expectEqualStrings("abcd", ctx.requestBody());
 }
