@@ -45,7 +45,6 @@ pub fn extractBid(cqe_flags: u32) u16 {
 }
 
 /// ── Slot 生命周期 ─────────────────────────────────────
-
 /// 分配并初始化一个槽位。返回 index + user_data token。
 pub fn slotAlloc(pool: anytype, fd: i32, conn_gen_id: *u32, now_ms: i64) struct { idx: u32, token: u64 } {
     const idx = pool.acquire() orelse return .{ .idx = 0xFFFFFFFF, .token = 0 };
@@ -87,7 +86,6 @@ pub fn slotFree(pool: anytype, idx: u32) void {
 }
 
 /// ── TTL 扫描器 ────────────────────────────────────────
-
 /// 增量滑窗 TTL 扫描。每轮检查 scan_cursor 起的 window 个活跃槽位。
 /// 返回超时槽位的索引列表（调用方负责 close）。
 pub fn ttlScan(
@@ -125,13 +123,11 @@ pub fn ttlScan(
 }
 
 /// ── 大报文判定 ────────────────────────────────────────
-
 pub fn isOversized(content_length: u64) bool {
     return content_length > OVERSIZED_THRESHOLD;
 }
 
 /// ── 限速检查 ──────────────────────────────────────────
-
 /// 简单滑动窗口限速。返回 true 表示放行，false 表示超限。
 pub fn rateLimitCheck(slot: *StackSlot, now_ms: i64, max_per_window: u32, window_ms: i64) bool {
     if (now_ms - slot.line1.req_window_ms >= window_ms) {
@@ -145,7 +141,6 @@ pub fn rateLimitCheck(slot: *StackSlot, now_ms: i64, max_per_window: u32, window
 }
 
 /// ── user_data 构造快捷方式 ────────────────────────────
-
 pub fn readToken(slot: *const StackSlot) u64 {
     return packUserData(slot.line1.gen_id, @truncate(0)); // idx set by caller
 }
@@ -155,7 +150,6 @@ pub fn closeToken(slot: *const StackSlot, idx: u32) u64 {
 }
 
 /// ── Workspace 访问 ────────────────────────────────────
-
 /// 二级计算区原始字节（60B），用于短读拼包等通用操作
 pub fn rawWorkspace(slot: *StackSlot) []u8 {
     return &slot.line5.ws.raw;
@@ -179,7 +173,6 @@ pub fn computeWork(slot: *StackSlot) *ComputeWork {
 /// ── Worker Pool 零拷贝移交 ────────────────────────────
 /// 将大块 buffer 指针和 slot index 存入 workspace.compute，
 /// Worker 处理完后通过 index 找回 slot 写入 result_code。
-
 pub fn dispatchCompute(slot: *StackSlot, job_id: u64, buf_ptr: u64) void {
     const cw = &slot.line5.ws.compute;
     cw.job_id = job_id;
@@ -194,7 +187,6 @@ pub fn completeCompute(slot: *StackSlot, result_code: i32) void {
 /// ── ChunkStream 指针存取 ──────────────────────────────
 /// stream_ptr 存于 slot.line3，指向堆分配的 StreamHandle。
 /// IO 线程读完数据 → feed → 攒够 → dispatch → Worker 线程解析。
-
 pub fn getStream(slot: *StackSlot) ?*anyopaque {
     const ptr = @as(usize, @intCast(slot.line3.stream_ptr));
     if (ptr == 0) return null;
@@ -210,7 +202,6 @@ pub fn clearStream(slot: *StackSlot) void {
 }
 
 /// ── 协议视图切换 ──────────────────────────────────────
-
 /// HTTP → WebSocket 升级：清空 HTTP 解析残留，初始化 WS 视图
 pub fn switchToWs(slot: *StackSlot) void {
     @memset(&slot.line5.ws.raw, 0);
@@ -219,7 +210,6 @@ pub fn switchToWs(slot: *StackSlot) void {
 }
 
 /// ── 哨兵校验 ──────────────────────────────────────────
-
 pub fn sentinelIntact(slot: *const StackSlot) bool {
     return slot.line5.sentinel == 0x53574153;
 }
@@ -227,7 +217,6 @@ pub fn sentinelIntact(slot: *const StackSlot) bool {
 /// ── 全系统连接管理（封装 pool + hashmap 双查）──────────
 /// 过渡期同时维护 pool.slots[idx] 和 AutoHashMap(conn_id → Connection)。
 /// 未来 pool.slots 自含 Connection 后这些函数消失。
-
 /// CQE 分发入口：从 user_data 拿到 slot + Connection。
 /// 幽灵事件防御 → null；hashmap 无条目 → null。
 pub fn lookupByToken(
@@ -265,6 +254,10 @@ pub fn connAlloc(
 ) !u64 {
     const result = slotAlloc(pool, fd, conn_gen_id, now_ms);
     if (result.idx == 0xFFFFFFFF) return error.PoolFull;
+    errdefer {
+        // 修改原因：connections.put 失败时必须归还已加入 live 的 slot，否则连接池容量会永久泄漏。
+        slotFree(pool, result.idx);
+    }
 
     const slot = &pool.slots[result.idx];
     slot.line2.conn_id = conn_id;
@@ -317,4 +310,28 @@ pub fn dispatchToken(
     const slot = getSlotChecked(pool, user_data) orelse return null;
     const conn = connections.getPtr(slot.line2.conn_id) orelse return null;
     return .{ .conn = conn, .slot = slot };
+}
+
+test "connAlloc releases slot when connection map insert fails" {
+    const TestConn = struct {};
+    const FailingConnections = struct {
+        pub fn put(self: *@This(), conn_id: u64, conn: TestConn) !void {
+            _ = self;
+            _ = conn_id;
+            _ = conn;
+            return error.OutOfMemory;
+        }
+    };
+
+    var pool = try StackPool(StackSlot, 1).init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    pool.warmup();
+
+    var connections = FailingConnections{};
+    var gen_id: u32 = 1;
+
+    try std.testing.expectError(error.OutOfMemory, connAlloc(&pool, &connections, 42, 7, &gen_id, 100, TestConn{}));
+    try std.testing.expectEqual(@as(u32, 1), pool.freelist_top);
+    try std.testing.expectEqual(@as(usize, 0), pool.live.items.len);
+    try std.testing.expectEqual(@as(u32, 0), pool.slots[0].line1.gen_id);
 }
