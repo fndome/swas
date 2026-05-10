@@ -208,6 +208,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             conn.read_len = 0;
             conn.state = .receiving_body;
             self.submitBodyRead(conn, large_buf, slot) catch {
+                // 修改原因：body read SQE 提交失败后不会再进入 processBodyRequest，必须归还之前保留的 header read buffer。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_bid = 0;
+                conn.read_len = 0;
                 self.large_pool.release(large_buf);
                 slot.line3.large_buf_ptr = 0;
                 self.closeConn(conn_id, conn.fd);
@@ -232,6 +236,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             conn.read_len = 0;
             conn.state = .receiving_body;
             self.submitBodyRead(conn, large_buf, slot) catch {
+                // 修改原因：body read SQE 提交失败后不会再进入 processBodyRequest，必须归还之前保留的 header read buffer。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_bid = 0;
+                conn.read_len = 0;
                 self.large_pool.release(large_buf);
                 slot.line3.large_buf_ptr = 0;
                 self.closeConn(conn_id, conn.fd);
