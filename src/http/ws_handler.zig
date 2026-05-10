@@ -16,6 +16,19 @@ const ws_fiber = @import("ws_fiber.zig");
 const logErr = helpers.logErr;
 const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
+fn finishSynchronousWsHandler(self: *AsyncServer, conn_id: u64, conn: *Connection, bid: u16) void {
+    // 修改原因：同步兜底 handler 使用的 payload 可能还指向 read buffer，必须等 handler 返回后再归还 bid。
+    self.buffer_pool.markReplenish(bid);
+    conn.read_buf_recycled = true;
+    conn.read_len = 0;
+    if (conn.state != .ws_writing) {
+        conn.state = .ws_reading;
+        self.submitRead(conn_id, conn) catch {
+            self.closeConn(conn_id, conn.fd);
+        };
+    }
+}
+
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
     var pending_token: ?[]u8 = null;
     defer if (pending_token) |token| self.allocator.free(token);
@@ -221,15 +234,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                 payload_tier = @intCast(a.tier);
             } else {
                 payload_full = self.allocator.dupe(u8, frame.payload) catch {
-                    self.buffer_pool.markReplenish(bid);
-                    conn.read_len = 0;
                     handler(conn_id, &frame, self.ws_server.ctx);
-                    if (conn.state != .ws_writing) {
-                        conn.state = .ws_reading;
-                        self.submitRead(conn_id, conn) catch {
-                            self.closeConn(conn_id, conn.fd);
-                        };
-                    }
+                    finishSynchronousWsHandler(self, conn_id, conn, bid);
                     return;
                 };
                 payload_tier = 0xFF;
@@ -241,12 +247,7 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             const t = self.ws_ctx_pool.create(self.allocator) catch {
                 self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
                 handler(conn_id, &frame, self.ws_server.ctx);
-                if (conn.state != .ws_writing) {
-                    conn.state = .ws_reading;
-                    self.submitRead(conn_id, conn) catch {
-                        self.closeConn(conn_id, conn.fd);
-                    };
-                }
+                finishSynchronousWsHandler(self, conn_id, conn, bid);
                 return;
             };
             t.* = .{
@@ -274,6 +275,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                     self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
                     self.ws_ctx_pool.destroy(t);
                     handler(conn_id, &frame, self.ws_server.ctx);
+                    finishSynchronousWsHandler(self, conn_id, conn, bid);
+                    return;
                 }
             } else {
                 var fiber = Fiber.init(self.shared_fiber_stack);
