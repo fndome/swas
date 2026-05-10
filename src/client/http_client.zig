@@ -444,7 +444,13 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
             stream.connectRawTimeout(ip, parsed.port, 5000) catch {
                 if (retries == 0) {
                     stream.deinit();
-                    stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch break;
+                    // retry init must not fall through on failure: stream is
+                    // already freed, and stream.deinit() below would double-free
+                    stream = RingSharedClient.init(ctx.allocator, client.ring_b.rs, onData, onClose, @ptrCast(@constCast(cache)), null) catch {
+                        ctx.response = makeErrorResponse(ctx.allocator, 502, "client init failed after retry");
+                        ctx.notify();
+                        return;
+                    };
                     continue;
                 }
                 break;
