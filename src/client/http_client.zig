@@ -34,7 +34,13 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     const path = if (path_start) |p| rest[p..] else "/";
     const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
     const host = if (colon) |c| host_port[0..c] else host_port;
-    const port: u16 = if (colon) |c| std.fmt.parseInt(u16, host_port[c + 1 ..], 10) catch 80 else 80;
+    if (host.len == 0) return error.InvalidUrl;
+    const port: u16 = if (colon) |c| blk: {
+        const port_text = host_port[c + 1 ..];
+        // 修改原因：显式端口写错时不能静默回退到 80，否则请求会发到错误上游。
+        if (port_text.len == 0) return error.InvalidUrl;
+        break :blk std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidUrl;
+    } else 80;
     return .{ .host = try allocator.dupe(u8, host), .port = port, .path = path };
 }
 
@@ -529,4 +535,16 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "HttpClient parseUrl rejects malformed explicit ports" {
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:abc/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://:8080/"));
+
+    const parsed = try parseUrl(std.testing.allocator, "http://example.com:8080/path");
+    defer std.testing.allocator.free(parsed.host);
+    try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqual(@as(u16, 8080), parsed.port);
+    try std.testing.expectEqualStrings("/path", parsed.path);
 }
