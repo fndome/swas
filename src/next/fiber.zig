@@ -93,7 +93,7 @@ pub const Fiber = struct {
         data: []const u8,
     };
 
-    const RESUME_QUEUE_CAP = 512;
+    const RESUME_QUEUE_CAP = 1024;
     pub threadlocal var resume_queue: [RESUME_QUEUE_CAP]ResumeEntry = [_]ResumeEntry{.{ .slot_idx = 0, .gen_id = 0, .data = "" }} ** RESUME_QUEUE_CAP;
     pub threadlocal var resume_head: u16 = 0;
     pub threadlocal var resume_tail: u16 = 0;
