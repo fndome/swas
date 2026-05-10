@@ -135,6 +135,8 @@ pub const RingSharedClient = struct {
         errdefer {
             // 修改原因：connect SQE 入队或 submit 失败时，fd/id 仍挂在 client 上会导致后续重复 close 或注册表残留。
             if (registered) self.rs.remove(self.id);
+            // 修改原因：内层 errdefer 会先把 self.fd 复位，必须在复位前关闭本次创建的 socket，避免外层守卫看不到 fd。
+            if (self.fd == fd) _ = linux.close(fd);
             self.id = 0;
             self.fd = -1;
             self.state = .idle;
