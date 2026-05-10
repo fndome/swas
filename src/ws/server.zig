@@ -47,6 +47,7 @@ pub const WsServer = struct {
                 std.debug.print("ws closeAllActive: failed to send close to conn {}: {}\n", .{ entry.key_ptr.*, err });
             };
         }
+        self.active.clearRetainingCapacity();
     }
 
     pub fn register(self: *WsServer, path: []const u8, handler: WsHandler) !void {
