@@ -147,6 +147,7 @@ pub const DnsResolver = struct {
 
     fn sendQuery(self: *DnsResolver, hostname: []const u8, txid: u16) !void {
         const query = try packet.buildQuery(hostname, txid);
+        const query_bytes = query.bytes();
         var addr = linux.sockaddr.in{
             .family = linux.AF.INET,
             .port = @byteSwap(self.nameserver_port),
@@ -154,7 +155,7 @@ pub const DnsResolver = struct {
             .zero = [_]u8{0} ** 8,
         };
         // UDP sendto on non-blocking socket: small packet (<100B) always succeeds
-        _ = linux.sendto(self.udp_fd, &query, query.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        _ = linux.sendto(self.udp_fd, query_bytes.ptr, query_bytes.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
         self.submitRecv();
     }
 
