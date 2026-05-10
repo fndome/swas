@@ -456,6 +456,8 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
         ctx.cleanup();
+        // 修改原因：请求过大时还没有写入上游，必须归还已借出的 pipe，避免连接池项永久停在 borrowed 状态。
+        cache.release(pipe, nowMs());
         ctx.response = makeErrorResponse(ctx.allocator, 502, "request too large");
         ctx.notify();
         return;
