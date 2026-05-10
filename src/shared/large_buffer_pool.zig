@@ -34,6 +34,13 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
 
         pub fn init(allocator: Allocator) !Self {
             var blocks: [capacity][]u8 = undefined;
+            var allocated_count: usize = 0;
+            errdefer {
+                // 修改原因：初始化时按块逐个分配，中途 OOM 需要释放已经成功分配的块，避免启动失败泄漏大缓冲。
+                for (blocks[0..allocated_count]) |block| {
+                    allocator.free(block);
+                }
+            }
             var freelist: [capacity]usize = undefined;
             var allocated: usize = 0;
             errdefer {
@@ -42,6 +49,7 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
             }
             for (0..capacity) |i| {
                 blocks[i] = try allocator.alloc(u8, block_size);
+                allocated_count += 1;
                 allocated += 1;
                 freelist[i] = capacity - 1 - i;
             }
