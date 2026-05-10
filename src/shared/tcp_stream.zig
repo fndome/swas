@@ -106,7 +106,18 @@ pub const RingSharedClient = struct {
         const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
         const fd: i32 = @intCast(raw_fd);
         if (fd < 0) return error.SocketFailed;
-        errdefer _ = linux.close(fd);
+        errdefer {
+            // 修改原因：connect 提交失败时 self.fd/self.id 已经写入，必须同步清理，避免调用方 deinit 时重复关闭 fd 或留下 registry 项。
+            if (self.id != 0) {
+                self.rs.remove(self.id);
+                self.id = 0;
+            }
+            if (self.fd == fd) {
+                _ = linux.close(fd);
+                self.fd = -1;
+            }
+            self.state = .idle;
+        }
 
         var addr_in = linux.sockaddr.in{
             .family = linux.AF.INET,
@@ -139,18 +150,19 @@ pub const RingSharedClient = struct {
 
     fn submitPollOut(self: *RingSharedClient, timeout_ms: u32) !void {
         const ring = self.rs.ringPtr();
-        const needed_sqes: usize = if (timeout_ms > 0) 2 else 1;
-        if (@as(usize, ring.sq_ready()) + needed_sqes > ring.sq.sqes.len) return error.SubmissionQueueFull;
-
-        // 修改原因：SQE 申请/submit 失败必须传回 connectRawTimeout，不能吞错后让连接永久停在 connecting。
-        const sqe = try ring.nop(self.id);
+        // 修改原因：CONNECT SQE 都拿不到时不能静默成功，否则连接会永久停在 connecting 且 fd/registry 无法回收。
+        const sqe = ring.nop(self.id) catch return error.ConnectSubmitQueueFull;
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
         sqe.fd = self.fd;
         sqe.addr = @intFromPtr(&self.connect_addr);
         sqe.off = self._connect_addrlen;
         if (timeout_ms > 0) {
+            const tsqe = ring.nop(0) catch {
+                // 修改原因：超时 SQE 不足时前面的 CONNECT SQE 已占位，至少要提交 CONNECT，不能提前 return 造成无完成事件。
+                _ = ring.submit() catch {};
+                return;
+            };
             sqe.flags |= linux.IOSQE_IO_LINK; // link LINK_TIMEOUT next
-            const tsqe = try ring.nop(0);
             tsqe.opcode = @enumFromInt(15); // IORING_OP_LINK_TIMEOUT
             // 修改原因：LINK_TIMEOUT 的 timespec 会被内核异步读取，不能指向本函数的栈变量。
             self.connect_timeout_ts = .{
@@ -161,7 +173,7 @@ pub const RingSharedClient = struct {
             tsqe.len = 1;
             // CONNECT + LINK_TIMEOUT submitted together — no orphan window
         }
-        _ = try ring.submit();
+        _ = ring.submit() catch {};
     }
 
     pub fn write(self: *RingSharedClient, data: []const u8) !void {
@@ -226,19 +238,8 @@ pub const RingSharedClient = struct {
                 // Disable Nagle — low-latency microservice calls
                 const one: i32 = 1;
                 _ = linux.setsockopt(self.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(i32));
-                // Register as fixed file to avoid kernel fd lookup per I/O
-                if (self.rs.ringPtr().register_files_sparse(1)) {
-                    if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
-                        self.fixed_index = 0;
-                    } else |err| {
-                        // Non-fatal: the connection operates correctly with
-                        // non-fixed files; logging helps diagnose performance
-                        // degradation when many connections fail this path.
-                        std.log.warn("RingSharedClient: register_files_update failed: {s}", .{@errorName(err)});
-                    }
-                } else |err| {
-                    std.log.warn("RingSharedClient: register_files_sparse failed: {s}", .{@errorName(err)});
-                }
+                // 修改原因：RingSharedClient 没有 fixed-file 槽位分配器；多个连接共用 slot 0 会互相覆盖 fd。
+                self.fixed_index = 0xFFFF;
                 self.submitRead() catch {
                     self.onClose();
                 };

@@ -34,9 +34,23 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
 
         pub fn init(allocator: Allocator) !Self {
             var blocks: [capacity][]u8 = undefined;
+            var allocated_count: usize = 0;
+            errdefer {
+                // 修改原因：初始化时按块逐个分配，中途 OOM 需要释放已经成功分配的块，避免启动失败泄漏大缓冲。
+                for (blocks[0..allocated_count]) |block| {
+                    allocator.free(block);
+                }
+            }
             var freelist: [capacity]usize = undefined;
+            var allocated: usize = 0;
+            errdefer {
+                // 修改原因：初始化中途 OOM 时必须释放已分配 block，否则大块池启动失败会泄漏内存。
+                for (blocks[0..allocated]) |block| allocator.free(block);
+            }
             for (0..capacity) |i| {
                 blocks[i] = try allocator.alloc(u8, block_size);
+                allocated_count += 1;
+                allocated += 1;
                 freelist[i] = capacity - 1 - i;
             }
             return Self{
@@ -85,4 +99,13 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
 /// 向后兼容: 1MB × N 块, 用于大报文 (Content-Length > 32KB)
 pub fn LargeBufferPool(comptime capacity: usize) type {
     return BufferBlockPool(1024 * 1024, capacity);
+}
+
+test "BufferBlockPool.init frees partial blocks on allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const allocator = failing_allocator.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, BufferBlockPool(16, 4).init(allocator));
+    try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    try std.testing.expectEqual(failing_allocator.allocations, failing_allocator.deallocations);
 }
