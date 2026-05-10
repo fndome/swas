@@ -238,6 +238,11 @@ pub const RingSharedClient = struct {
                     return;
                 }
                 if (isWriteCqe(user_data)) {
+                    if (res == 0) {
+                        // 修改原因：非空 write 返回 0 表示没有写入进展，继续 flush 会重复提交同一段缓冲并卡住。
+                        self.onClose();
+                        return;
+                    }
                     // 修改原因：keep-alive 复用时旧 read CQE 可能在新 write 之后返回；
                     // 只有带写标记的 CQE 才能推进 write_offset，避免把 read 完成误当写完成。
                     self.write_offset += @intCast(res);
