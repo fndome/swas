@@ -8,10 +8,10 @@ pub const ProcessFn = *const fn (ctx: ?*anyopaque, chunk: []const u8, resp: *Def
 pub const StreamHandle = struct {
     const Self = @This();
 
-    large_buf: []u8,            // IO write target: LargeBufferPool 1MB
-    offset: usize,              // bytes accumulated in large_buf
-    threshold: usize,           // dispatch trigger byte count
-    eof: bool,                  // stream finished
+    large_buf: []u8, // IO write target: LargeBufferPool 1MB
+    offset: usize, // bytes accumulated in large_buf
+    threshold: usize, // dispatch trigger byte count
+    eof: bool, // stream finished
     job_id: u64,
     slot_idx: u32,
     resp: *DeferredResponse,
@@ -67,7 +67,10 @@ pub const StreamHandle = struct {
 
     pub fn finish(self: *Self) bool {
         self.eof = true;
-        if (self.offset > 0) { self.dispatch(); return true; }
+        if (self.offset > 0) {
+            self.dispatch();
+            return true;
+        }
         return false;
     }
 
@@ -97,7 +100,10 @@ pub const StreamHandle = struct {
             .job_id = self.job_id,
             .slot_idx = self.slot_idx,
         };
-        Next.submit(ChunkDispatchCtx, ctx, runChunkWorker);
+        if (!Next.trySubmit(ChunkDispatchCtx, ctx, runChunkWorker)) {
+            // 修改原因：Next.trySubmit 可能因未初始化 worker pool 或 OOM 拒绝任务，此时必须释放已复制的 chunk。
+            self.resp.allocator.free(chunk_copy);
+        }
     }
 };
 

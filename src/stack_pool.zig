@@ -17,7 +17,11 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
 
         pub fn init(allocator: Allocator) !Self {
             const slots = try allocator.alloc(T, capacity);
+            errdefer allocator.free(slots);
             const freelist = try allocator.alloc(u32, capacity);
+            errdefer allocator.free(freelist);
+            // 修改原因：live 预分配失败时前面两个数组已经申请成功，必须用 errdefer 回收，避免初始化 OOM 泄漏。
+            const live = try std.ArrayList(u32).initCapacity(allocator, capacity);
 
             for (freelist, 0..) |*f, i| {
                 f.* = @intCast(i); // sequential for stream prefetcher
@@ -27,7 +31,7 @@ pub fn StackPool(comptime T: type, comptime capacity: usize) type {
                 .slots = slots,
                 .freelist = freelist,
                 .freelist_top = @intCast(capacity),
-                .live = try std.ArrayList(u32).initCapacity(allocator, capacity),
+                .live = live,
             };
         }
 
