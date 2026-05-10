@@ -128,9 +128,8 @@ pub const CaresDns = struct {
             if (fd_ptr.* >= 0) {
                 const fd = fd_ptr.*;
                 const user_data = DNS_FD_MAGIC + @as(u64, @intCast(fd));
-                const sqe = self.rs.ring.nop(user_data) catch continue;
-                sqe.opcode = @enumFromInt(7);
-                sqe.fd = @intCast(fd);
+                // 修改原因：POLL_REMOVE 用 target_user_data 定位原 poll，单独写 fd 不能取消对应的 DNS poll SQE。
+                _ = self.rs.ring.poll_remove(user_data, user_data) catch continue;
                 fd_ptr.* = -1;
             }
         }
