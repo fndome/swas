@@ -9,6 +9,14 @@ const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
 const maxWriteRetries = @import("http_response.zig").maxWriteRetries;
 
+fn queuePendingWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
+    self.pending_writes.append(self.allocator, conn_id) catch {
+        // 修改原因：写 SQE 没提交成功时如果连重试队列也入不了，继续返回成功会让连接永久停在 writing。
+        logErr("submitWrite: pend queue full, close fd={d}", .{conn.fd});
+        return error.PendingWriteQueueFull;
+    };
+}
+
 pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
     if (conn.write_offset == 0) {
         conn.write_start_ms = milliTimestamp(self.io);
@@ -61,9 +69,7 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         // next iteration rather than dropping the write
         const sqe = self.ring.writev(user_data, fd, iovs[0..count], 0) catch {
             slot.line4.writev_in_flight = 0;
-            self.pending_writes.append(self.allocator, conn_id) catch {
-                logErr("submitWrite: pend queue full, drop write for fd={d}", .{conn.fd});
-            };
+            try queuePendingWrite(self, conn_id, conn);
             return;
         };
         if (conn.fixed_index != 0xFFFF) sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -74,9 +80,7 @@ pub fn submitWrite(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
         // SQ full — push to pending queue for retry next iteration
         const sqe = self.ring.write(user_data, fd, to_send, 0) catch {
             slot.line4.writev_in_flight = 0;
-            self.pending_writes.append(self.allocator, conn_id) catch {
-                logErr("submitWrite: pend queue full, drop write for fd={d}", .{conn.fd});
-            };
+            try queuePendingWrite(self, conn_id, conn);
             return;
         };
         if (conn.fixed_index != 0xFFFF) sqe.flags |= linux.IOSQE_FIXED_FILE;

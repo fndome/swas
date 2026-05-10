@@ -16,11 +16,27 @@ const ws_fiber = @import("ws_fiber.zig");
 const logErr = helpers.logErr;
 const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
+fn finishSynchronousWsHandler(self: *AsyncServer, conn_id: u64, conn: *Connection, bid: u16) void {
+    // 修改原因：同步兜底 handler 使用的 payload 可能还指向 read buffer，必须等 handler 返回后再归还 bid。
+    self.buffer_pool.markReplenish(bid);
+    conn.read_buf_recycled = true;
+    conn.read_len = 0;
+    if (conn.state != .ws_writing) {
+        conn.state = .ws_reading;
+        self.submitRead(conn_id, conn) catch {
+            self.closeConn(conn_id, conn.fd);
+        };
+    }
+}
+
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
+    var pending_token: ?[]u8 = null;
+    defer if (pending_token) |token| self.allocator.free(token);
+
     const full_uri = helpers.getFullUri(data);
     if (full_uri) |uri| {
         if (helpers.extractQueryParam(uri, "token")) |token| {
-            conn.ws_token = self.allocator.dupe(u8, token) catch null;
+            pending_token = self.allocator.dupe(u8, token) catch null;
         }
     }
 
@@ -75,6 +91,9 @@ pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: [
 
     self.buffer_pool.markReplenish(bid);
     conn.read_len = 0;
+    // 修改原因：只有握手成功后才能把 token 挂到连接上，避免失败升级路径泄漏或污染 HTTP 连接状态。
+    conn.ws_token = pending_token;
+    pending_token = null;
     conn.keep_alive = false;
     conn.write_headers_len = len;
     conn.write_offset = 0;
@@ -215,16 +234,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                 payload_tier = @intCast(a.tier);
             } else {
                 payload_full = self.allocator.dupe(u8, frame.payload) catch {
-                    // 修改原因：frame.payload 仍指向 read buffer，必须等同步 handler 返回后再归还 bid，避免 payload 被池复用。
                     handler(conn_id, &frame, self.ws_server.ctx);
-                    self.buffer_pool.markReplenish(bid);
-                    conn.read_len = 0;
-                    if (conn.state != .ws_writing) {
-                        conn.state = .ws_reading;
-                        self.submitRead(conn_id, conn) catch {
-                            self.closeConn(conn_id, conn.fd);
-                        };
-                    }
+                    finishSynchronousWsHandler(self, conn_id, conn, bid);
                     return;
                 };
                 payload_tier = 0xFF;
@@ -247,6 +258,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                         self.closeConn(conn_id, conn.fd);
                     };
                 }
+                handler(conn_id, &frame, self.ws_server.ctx);
+                finishSynchronousWsHandler(self, conn_id, conn, bid);
                 return;
             };
             t.* = .{
@@ -274,6 +287,8 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
                     self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
                     self.ws_ctx_pool.destroy(t);
                     handler(conn_id, &frame, self.ws_server.ctx);
+                    finishSynchronousWsHandler(self, conn_id, conn, bid);
+                    return;
                 }
             } else {
                 var fiber = Fiber.init(self.shared_fiber_stack);
@@ -356,10 +371,15 @@ pub fn wsSendFn(ctx: *anyopaque, conn_id: u64, opcode: Opcode, payload: []const 
     try sendWsFrame(self, conn_id, opcode, payload);
 }
 
+fn shouldQueueWsSend(conn: *const Connection) bool {
+    return conn.is_writing or conn.state == .ws_writing;
+}
+
 pub fn sendWsFrame(self: *AsyncServer, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
     const conn = self.getConn(conn_id) orelse return;
 
-    if (conn.is_writing) {
+    // 修改原因：协议层 ping/close 响应会进入 ws_writing 但不设置 is_writing，应用发送必须排队避免覆盖 response_buf。
+    if (shouldQueueWsSend(conn)) {
         const dup = self.allocator.dupe(u8, payload) catch {
             return error.OutOfMemory;
         };
@@ -452,4 +472,16 @@ fn maxWriteRetries(total: usize) u8 {
     const base: usize = total / 4096;
     const retries: usize = if (base < 4) @as(usize, 4) else if (base > 64) @as(usize, 64) else base;
     return @intCast(retries);
+}
+
+test "sendWsFrame queues while protocol write is in flight" {
+    var conn = Connection{};
+    try std.testing.expect(!shouldQueueWsSend(&conn));
+
+    conn.state = .ws_writing;
+    try std.testing.expect(shouldQueueWsSend(&conn));
+
+    conn.state = .ws_reading;
+    conn.is_writing = true;
+    try std.testing.expect(shouldQueueWsSend(&conn));
 }

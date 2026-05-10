@@ -72,10 +72,19 @@ const WorkerPool = struct {
 
     fn init(allocator: Allocator, count: u8) !WorkerPool {
         const workers = try allocator.alloc(std.Thread, count);
+        errdefer allocator.free(workers);
         var stack_pool: [STACK_POOL_SIZE][]u8 = undefined;
+        var stack_count: usize = 0;
+        errdefer {
+            // 修改原因：初始化中途失败时 WorkerPool 还没有交给调用方，已分配的 fiber 栈必须在这里回收。
+            for (stack_pool[0..stack_count]) |stack| {
+                allocator.free(stack);
+            }
+        }
         var stack_freelist: [STACK_POOL_SIZE]usize = undefined;
         for (0..STACK_POOL_SIZE) |i| {
             stack_pool[i] = try allocator.alloc(u8, FIBER_STACK);
+            stack_count += 1;
             stack_freelist[i] = STACK_POOL_SIZE - 1 - i;
         }
         var pool = WorkerPool{
@@ -93,7 +102,7 @@ const WorkerPool = struct {
             w.* = std.Thread.spawn(.{}, workerLoop, .{ &pool, @as(u8, @intCast(i)) }) catch {
                 @atomicStore(bool, &pool.stop, true, .release);
                 for (workers[0..i]) |pw| pw.join();
-                allocator.free(workers);
+                // 修改原因：线程创建失败时先收停并 join 已启动线程，再交给 errdefer 统一释放栈和 workers。
                 return error.ThreadSpawnFailed;
             };
         }
@@ -260,7 +269,7 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
             .task = pt.task,
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
-            .stack = pt.stack,  // 栈随任务跨 yield 存活
+            .stack = pt.stack, // 栈随任务跨 yield 存活
         }) catch {
             // OOM: cannot re-park the fiber. Release stack and task
             // to avoid leaking resources since the poll may never trigger.
@@ -321,17 +330,25 @@ pub const Next = struct {
         ctx: T,
         comptime execFn: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
     ) void {
+        _ = trySubmit(T, ctx, execFn);
+    }
+
+    pub fn trySubmit(
+        comptime T: type,
+        ctx: T,
+        comptime execFn: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
+    ) bool {
         const n = @atomicLoad(?*Next, &default_next, .acquire) orelse {
             std.log.err("Next.submit: no default Next instance set", .{});
-            return;
+            return false;
         };
-        const user = n.allocator.create(T) catch return;
+        const user = n.allocator.create(T) catch return false;
         user.* = ctx;
 
         if (n.pool) |p| {
             const task = n.allocator.create(PoolTask) catch {
                 n.allocator.destroy(user);
-                return;
+                return false;
             };
             task.* = .{
                 .next = null,
@@ -349,12 +366,13 @@ pub const Next = struct {
                 .alloc = n.allocator,
             };
             p.submit(task);
-            return;
+            return true;
         }
 
         // No pool — log error, destroy user ctx
         std.log.err("Next.submit: no worker pool configured. Call initPool4NextSubmit(n) first.", .{});
         n.allocator.destroy(user);
+        return false;
     }
 
     pub fn go(

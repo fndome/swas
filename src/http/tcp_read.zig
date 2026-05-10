@@ -26,8 +26,14 @@ const httpTaskExec = http_fiber.httpTaskExec;
 const httpTaskExecWrapperWithOwnership = http_fiber.httpTaskExecWrapperWithOwnership;
 const httpTaskComplete = http_fiber.httpTaskComplete;
 
+fn prepareReadSubmission(conn: *Connection) void {
+    conn.read_buf_recycled = false;
+}
+
 pub fn submitRead(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
     _ = conn_id;
+    // 修改原因：read_buf_recycled 针对单次 read CQE，重新提交 buffer-selection read 前必须重置。
+    prepareReadSubmission(conn);
     const user_data = packUserData(conn.gen_id, conn.pool_idx);
     const fd = if (conn.fixed_index != 0xFFFF) @as(i32, @intCast(conn.fixed_index)) else conn.fd;
     const sqe = self.ring.read(user_data, fd, .{
@@ -202,6 +208,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             conn.read_len = 0;
             conn.state = .receiving_body;
             self.submitBodyRead(conn, large_buf, slot) catch {
+                // 修改原因：body read SQE 提交失败后不会再进入 processBodyRequest，必须归还之前保留的 header read buffer。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_bid = 0;
+                conn.read_len = 0;
                 self.large_pool.release(large_buf);
                 slot.line3.large_buf_ptr = 0;
                 self.closeConn(conn_id, conn.fd);
@@ -226,6 +236,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             conn.read_len = 0;
             conn.state = .receiving_body;
             self.submitBodyRead(conn, large_buf, slot) catch {
+                // 修改原因：body read SQE 提交失败后不会再进入 processBodyRequest，必须归还之前保留的 header read buffer。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_bid = 0;
+                conn.read_len = 0;
                 self.large_pool.release(large_buf);
                 slot.line3.large_buf_ptr = 0;
                 self.closeConn(conn_id, conn.fd);
@@ -467,4 +481,10 @@ test "header reassembly rejects at full buffer without terminator" {
     try std.testing.expect(headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE, reassembledHeaderLimit(8192)));
     try std.testing.expect(!headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE - 1, reassembledHeaderLimit(8192)));
     try std.testing.expectEqual(@as(usize, MAX_REASSEMBLED_HEADER_SIZE), reassembledHeaderLimit(16 * 1024));
+}
+
+test "submitRead preparation resets recycled marker for next CQE" {
+    var conn = Connection{ .read_buf_recycled = true };
+    prepareReadSubmission(&conn);
+    try std.testing.expect(!conn.read_buf_recycled);
 }
