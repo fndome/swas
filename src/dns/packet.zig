@@ -81,11 +81,15 @@ fn encodeName(name: []const u8, out: []u8) !usize {
     while (it.next()) |label| {
         if (label.len > 63) return error.LabelTooLong;
         if (label.len == 0) return error.EmptyLabel;
+        // 修改原因：DNS 名称线格式最长 255 字节，超长 hostname 必须返回错误，不能继续写固定缓冲区导致越界。
+        if (off + 1 + label.len + 1 > 255) return error.NameTooLong;
+        if (off + 1 + label.len > out.len) return error.NameTooLong;
         out[off] = @intCast(label.len);
         off += 1;
         @memcpy(out[off..][0..label.len], label);
         off += label.len;
     }
+    if (off + 1 > out.len) return error.NameTooLong;
     out[off] = 0;
     off += 1;
     return off;
@@ -197,6 +201,21 @@ test "buildQuery reports actual DNS message length" {
     try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, query.buf[0..2], .big));
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, query.buf[query.len - 4 ..][0..2], .big));
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, query.buf[query.len - 2 ..][0..2], .big));
+}
+
+test "buildQuery rejects DNS names longer than wire limit" {
+    var name_buf: [259]u8 = undefined;
+    var pos: usize = 0;
+    for (0..130) |i| {
+        if (i != 0) {
+            name_buf[pos] = '.';
+            pos += 1;
+        }
+        name_buf[pos] = 'a';
+        pos += 1;
+    }
+
+    try std.testing.expectError(error.NameTooLong, buildQuery(name_buf[0..pos], 0x1234));
 }
 
 test "parseResponse tolerates malformed answer name" {
