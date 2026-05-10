@@ -260,7 +260,7 @@ fn resumeParked(pool: *WorkerPool, pt: *ParkedTask, parked: *std.ArrayList(Parke
             .task = pt.task,
             .poll_fn = poll,
             .poll_ctx = poll_ctx,
-            .stack = pt.stack,  // 栈随任务跨 yield 存活
+            .stack = pt.stack, // 栈随任务跨 yield 存活
         }) catch {
             // OOM: cannot re-park the fiber. Release stack and task
             // to avoid leaking resources since the poll may never trigger.
@@ -321,17 +321,25 @@ pub const Next = struct {
         ctx: T,
         comptime execFn: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
     ) void {
+        _ = trySubmit(T, ctx, execFn);
+    }
+
+    pub fn trySubmit(
+        comptime T: type,
+        ctx: T,
+        comptime execFn: fn (*T, *const fn (?*anyopaque, []const u8) void) void,
+    ) bool {
         const n = @atomicLoad(?*Next, &default_next, .acquire) orelse {
             std.log.err("Next.submit: no default Next instance set", .{});
-            return;
+            return false;
         };
-        const user = n.allocator.create(T) catch return;
+        const user = n.allocator.create(T) catch return false;
         user.* = ctx;
 
         if (n.pool) |p| {
             const task = n.allocator.create(PoolTask) catch {
                 n.allocator.destroy(user);
-                return;
+                return false;
             };
             task.* = .{
                 .next = null,
@@ -349,12 +357,13 @@ pub const Next = struct {
                 .alloc = n.allocator,
             };
             p.submit(task);
-            return;
+            return true;
         }
 
         // No pool — log error, destroy user ctx
         std.log.err("Next.submit: no worker pool configured. Call initPool4NextSubmit(n) first.", .{});
         n.allocator.destroy(user);
+        return false;
     }
 
     pub fn go(
