@@ -34,6 +34,7 @@ pub fn freeFixedIndex(self: *AsyncServer, idx: u16) void {
 
 pub fn onAcceptComplete(self: *AsyncServer, res: i32, user_data: u64) void {
     _ = user_data;
+    self.accept_outstanding = false;
     if (res < 0) {
         logErr("accept failed: {}", .{res});
         self.accept_stalled = true;

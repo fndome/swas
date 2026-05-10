@@ -72,7 +72,8 @@ pub fn run(self: *AsyncServer) !void {
             logErr("flushReplenish deferred: {s}", .{@errorName(err)});
         };
 
-        if (self.accept_stalled) {
+        if (self.accept_stalled or !self.accept_outstanding) {
+            // 修改原因：短连接关闭 CQE 和 accept CQE 交错时 accept 链可能断掉，主循环要能主动补提。
             self.submitAccept() catch |err| {
                 logErr("accept chain recovery failed: {s}", .{@errorName(err)});
             };

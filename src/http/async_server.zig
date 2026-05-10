@@ -63,6 +63,8 @@ pub const AsyncServer = struct {
     io: std.Io,
     ring: linux.IoUring,
     listen_fd: i32,
+    accept_addr: linux.sockaddr = undefined,
+    accept_addrlen: u32 = @sizeOf(linux.sockaddr),
     next_conn_id: u64,
     connections: std.AutoHashMap(u64, Connection),
     /// StackPool array-indexed connection pool (migrating from AutoHashMap)
@@ -82,6 +84,7 @@ pub const AsyncServer = struct {
     /// Set when submitAccept fails; cleared on successful submission.
     /// Used by the event loop to detect and recover broken accept chains.
     accept_stalled: bool = false,
+    accept_outstanding: bool = false,
 
     use_fixed_files: bool = false,
     fixed_file_freelist: std.ArrayList(u16),
@@ -455,10 +458,12 @@ pub const AsyncServer = struct {
     }
 
     pub fn submitAccept(self: *Self) !void {
-        var addr: linux.sockaddr = undefined;
-        var addrlen: u32 = @sizeOf(linux.sockaddr);
-        _ = try self.ring.accept(ACCEPT_USER_DATA, @intCast(self.listen_fd), &addr, &addrlen, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+        if (self.accept_outstanding) return;
+        // 修改原因：io_uring accept 异步完成后才写 addr/addrlen，不能把栈上局部变量指针提交给内核。
+        self.accept_addrlen = @sizeOf(linux.sockaddr);
+        _ = try self.ring.accept(ACCEPT_USER_DATA, @intCast(self.listen_fd), &self.accept_addr, &self.accept_addrlen, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
         self.accept_stalled = false;
+        self.accept_outstanding = true;
     }
 
     pub fn submitRead(self: *Self, conn_id: u64, conn: *Connection) !void {
