@@ -17,10 +17,13 @@ const logErr = helpers.logErr;
 const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
+    var pending_token: ?[]u8 = null;
+    defer if (pending_token) |token| self.allocator.free(token);
+
     const full_uri = helpers.getFullUri(data);
     if (full_uri) |uri| {
         if (helpers.extractQueryParam(uri, "token")) |token| {
-            conn.ws_token = self.allocator.dupe(u8, token) catch null;
+            pending_token = self.allocator.dupe(u8, token) catch null;
         }
     }
 
@@ -75,6 +78,9 @@ pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: [
 
     self.buffer_pool.markReplenish(bid);
     conn.read_len = 0;
+    // 修改原因：只有握手成功后才能把 token 挂到连接上，避免失败升级路径泄漏或污染 HTTP 连接状态。
+    conn.ws_token = pending_token;
+    pending_token = null;
     conn.keep_alive = false;
     conn.write_headers_len = len;
     conn.write_offset = 0;
