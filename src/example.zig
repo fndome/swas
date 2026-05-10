@@ -111,7 +111,9 @@ const Example = struct {
     fn jwtMiddleware(allocator: Allocator, ctx: *Context) anyerror!bool {
         _ = allocator;
         std.debug.print("[Middleware] Request: {s}\n", .{ctx.path});
-        ctx.text(401, "Unauthorized") catch {};
+        ctx.text(401, "Unauthorized") catch |err| {
+            std.log.err("jwtMiddleware: ctx.text failed: {s}", .{@errorName(err)});
+        };
         return true;
     }
 
