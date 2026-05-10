@@ -11,6 +11,7 @@ pub const DNS_FD_MAGIC: u64 = 0xCADE_0000_0000_0000;
 const fd_set = extern struct {
     fds_bits: [32]u32 align(8),
 };
+const FD_SET_BITS = fd_set.fds_bits.len * @bitSizeOf(u32);
 
 const struct_hostent = extern struct {
     h_name: [*:0]u8,
@@ -102,12 +103,13 @@ pub const CaresDns = struct {
         _ = @memset(@as([*]u8, @ptrCast(&wfds))[0..@sizeOf(fd_set)], 0);
 
         const nfds = ares_fds(self.channel, &fds, &wfds);
+        const max_fd = @min(nfds, @as(i32, @intCast(FD_SET_BITS)));
         var registered_count: usize = 0;
         var fd: i32 = 0;
-        while (fd < nfds and registered_count < self.registered_fds.len) : (fd += 1) {
-            const bit = @as(u32, 1) << @as(u5, @truncate(@as(u32, @bitCast(fd))));
-            const read_set = (fds.fds_bits[@intCast(@as(u32, @bitCast(fd)) / 32)] & bit) != 0;
-            const write_set = (wfds.fds_bits[@intCast(@as(u32, @bitCast(fd)) / 32)] & bit) != 0;
+        while (fd < max_fd and registered_count < self.registered_fds.len) : (fd += 1) {
+            // 修改原因：fd_set 只有 1024 bit，不能按 ares_fds 返回的 nfds 无界索引 fds_bits。
+            const read_set = fdSetContains(&fds, fd);
+            const write_set = fdSetContains(&wfds, fd);
             if (!read_set and !write_set) continue;
 
             const user_data = DNS_FD_MAGIC + @as(u64, @intCast(fd));
@@ -138,6 +140,15 @@ pub const CaresDns = struct {
     }
 };
 
+fn fdSetContains(set: *const fd_set, fd: i32) bool {
+    if (fd < 0) return false;
+    const fd_u: usize = @intCast(fd);
+    if (fd_u >= FD_SET_BITS) return false;
+    const idx = fd_u / @bitSizeOf(u32);
+    const bit = @as(u32, 1) << @as(u5, @truncate(fd_u));
+    return (set.fds_bits[idx] & bit) != 0;
+}
+
 fn dnsCallback(
     arg: ?*anyopaque,
     status: i32,
@@ -157,4 +168,13 @@ fn dnsCallback(
     } else {
         self.result_ok = false;
     }
+}
+
+test "CaresDns fd_set lookup clamps fds outside local fd_set" {
+    var set = fd_set{ .fds_bits = [_]u32{0} ** 32 };
+    set.fds_bits[31] = @as(u32, 1) << 31;
+
+    try std.testing.expect(fdSetContains(&set, 1023));
+    try std.testing.expect(!fdSetContains(&set, 1024));
+    try std.testing.expect(!fdSetContains(&set, -1));
 }
