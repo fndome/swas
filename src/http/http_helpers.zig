@@ -116,6 +116,17 @@ pub fn parseIpv4(ip_str: []const u8) !u32 {
     return std.mem.nativeToBig(u32, ip);
 }
 
+fn parseNameserverLine(line: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const keyword = "nameserver";
+    if (!std.mem.startsWith(u8, trimmed, keyword)) return null;
+    const rest = trimmed[keyword.len..];
+    // 修改原因：resolv.conf 允许用任意空白分隔关键字和值，不能只识别单个空格。
+    if (rest.len == 0 or (rest[0] != ' ' and rest[0] != '\t')) return null;
+    const ip_str = std.mem.trim(u8, rest, " \t\r");
+    return parseIpv4(ip_str) catch null;
+}
+
 /// Parse /etc/resolv.conf for the first nameserver entry.
 /// Previously duplicated in async_server.zig and client/ring.zig.
 pub fn readResolvConfNameserver() !u32 {
@@ -134,11 +145,7 @@ pub fn readResolvConfNameserver() !u32 {
 
     var it = std.mem.splitScalar(u8, content, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "nameserver ")) {
-            const ip_str = std.mem.trim(u8, trimmed["nameserver ".len..], " \t\r");
-            if (parseIpv4(ip_str)) |ip| return ip else |_| continue;
-        }
+        if (parseNameserverLine(line)) |ip| return ip;
     }
     return error.NoNameserverFound;
 }
@@ -159,4 +166,10 @@ test "extractHeader supports LF-only request headers" {
 
     try std.testing.expectEqualStrings("4", extractHeader(req, "Content-Length").?);
     try std.testing.expect(extractHeader(req, "Content") == null);
+}
+
+test "parseNameserverLine accepts whitespace separated resolv.conf entries" {
+    try std.testing.expectEqual(try parseIpv4("1.1.1.1"), parseNameserverLine("nameserver\t1.1.1.1").?);
+    try std.testing.expectEqual(try parseIpv4("8.8.8.8"), parseNameserverLine("  nameserver   8.8.8.8  ").?);
+    try std.testing.expect(parseNameserverLine("nameserverfoo 9.9.9.9") == null);
 }
