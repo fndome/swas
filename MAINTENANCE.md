@@ -4,6 +4,8 @@
 
 > 基于多轮深度分析 + 修复的实战经验。简洁有效。
 
+> 通过auto-github-tool创建Issue, 安装: cnpm install -g auto-github-tool ，命令：agt list          # 查看 Issue 列表  agt create        # 并使用交互式菜单新建 Issue
+
 ---
 
 ## Bug 历史追踪（发现 bug 后第一件事）
