@@ -105,7 +105,7 @@ pub const RingB = struct {
         // 修改原因：copy_cqes 会自动推进 CQ head，不能再对复制出来的 CQE 调 cqe_seen。
         for (cqes[0..n]) |*cqe| {
             const ud = cqe.user_data;
-            if (ud & CLIENT_USER_DATA_FLAG != 0) {
+            if ((ud & CLIENT_USER_DATA_FLAG) != 0) {
                 self.registry.dispatch(ud, cqe.res);
             }
         }
