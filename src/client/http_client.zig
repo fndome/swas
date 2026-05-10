@@ -272,7 +272,7 @@ pub const HttpClient = struct {
                 if (nowMs() >= deadline_ms or @atomicLoad(bool, &self.stop, .acquire)) {
                     @atomicStore(bool, &ctx.cancelled, true, .release);
                     @atomicStore(bool, &ctx.done, true, .release);
-                    self.releaseReq(ctx);
+                    // 修改原因：本函数已有 errdefer 负责错误返回时归还 ctx，超时分支不能手动归还两次污染请求池 freelist。
                     return error.RequestTimeout;
                 }
             }
