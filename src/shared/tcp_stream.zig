@@ -131,8 +131,17 @@ pub const RingSharedClient = struct {
         self.id = self.rs.allocUserData();
         self.connect_addr = addr.*;
         self._connect_addrlen = @sizeOf(linux.sockaddr.in);
+        var registered = false;
+        errdefer {
+            // 修改原因：connect SQE 入队或 submit 失败时，fd/id 仍挂在 client 上会导致后续重复 close 或注册表残留。
+            if (registered) self.rs.remove(self.id);
+            self.id = 0;
+            self.fd = -1;
+            self.state = .idle;
+        }
 
         self.rs.register(self.id, @ptrCast(self), &clientDispatch) catch return error.RegisterFailed;
+        registered = true;
         self.state = .connecting;
 
         _ = linux.connect(fd, @ptrCast(&addr_in), @sizeOf(linux.sockaddr.in));
