@@ -37,6 +37,10 @@ pub fn parseFrame(data: []u8) !Frame {
         .close, .ping, .pong => if (!fin or payload_len > 125) return error.InvalidFrame,
         else => {},
     }
+    if (opcode == .close and payload_len == 1) {
+        // 修改原因：Close 帧 payload 要么为空，要么至少包含 2 字节状态码；1 字节会让关闭原因解析半截数据。
+        return error.InvalidFrame;
+    }
 
     var mask_key: [4]u8 = undefined;
     if (mask) {
@@ -64,6 +68,9 @@ test "parseFrame rejects invalid client control frames" {
 
     var oversized_ping = [_]u8{ 0x89, 0xFE, 0, 126, 0, 0, 0, 0 };
     try std.testing.expectError(error.InvalidFrame, parseFrame(&oversized_ping));
+
+    var one_byte_close = [_]u8{ 0x88, 0x81, 0, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&one_byte_close));
 }
 
 test "control frames allow the RFC maximum payload" {
