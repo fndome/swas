@@ -32,7 +32,16 @@ pub const ParsedResponse = struct {
     addrs: AddrList,
 };
 
-pub fn buildQuery(hostname: []const u8, txid: u16) ![MAX_PACKET_SIZE]u8 {
+pub const QueryPacket = struct {
+    buf: [MAX_PACKET_SIZE]u8,
+    len: usize,
+
+    pub fn bytes(self: *const QueryPacket) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn buildQuery(hostname: []const u8, txid: u16) !QueryPacket {
     var buf: [MAX_PACKET_SIZE]u8 = [_]u8{0} ** MAX_PACKET_SIZE;
     var off: usize = 0;
 
@@ -58,7 +67,8 @@ pub fn buildQuery(hostname: []const u8, txid: u16) ![MAX_PACKET_SIZE]u8 {
     std.mem.writeInt(u16, buf[off..][0..2], 1, .big);
     off += 2;
 
-    return buf;
+    // 修改原因：DNS UDP 请求只能发送实际写入的报文长度，不能把 512 字节缓冲区整体发出去。
+    return .{ .buf = buf, .len = off };
 }
 
 fn encodeName(name: []const u8, out: []u8) !usize {
@@ -177,6 +187,16 @@ fn skipName(packet: []const u8, start: usize) usize {
 pub fn parseTxid(packet: []const u8) u16 {
     if (packet.len < 2) return 0;
     return std.mem.readInt(u16, packet[0..2], .big);
+}
+
+test "buildQuery reports actual DNS message length" {
+    const query = try buildQuery("example.com", 0x1234);
+
+    try std.testing.expectEqual(@as(usize, 29), query.len);
+    try std.testing.expectEqual(query.len, query.bytes().len);
+    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, query.buf[0..2], .big));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, query.buf[query.len - 4 ..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, query.buf[query.len - 2 ..][0..2], .big));
 }
 
 test "parseResponse tolerates malformed answer name" {
