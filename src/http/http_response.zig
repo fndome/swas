@@ -39,7 +39,7 @@ pub fn maxWriteRetries(total: usize) u8 {
     return @intCast(retries);
 }
 
-fn headerOnlyCapacity(extra_headers_len: usize) usize {
+pub fn headerOnlyCapacity(extra_headers_len: usize) usize {
     return 256 + extra_headers_len;
 }
 

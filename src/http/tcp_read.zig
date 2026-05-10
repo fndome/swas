@@ -363,7 +363,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
                     self.closeConn(conn_id, conn.fd);
                 };
             } else if (extra_headers.len > 0) {
-                if (!self.ensureWriteBuf(conn, 256 + extra_headers.len)) {
+                if (!self.ensureWriteBuf(conn, headerOnlyCapacity(extra_headers.len))) {
                     self.closeConn(conn_id, conn.fd);
                     return;
                 }
@@ -459,6 +459,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
 }
 
 const statusText = @import("http_response.zig").statusText;
+const headerOnlyCapacity = @import("http_response.zig").headerOnlyCapacity;
 
 fn fitsLargeBodyBuffer(content_length: u64) bool {
     return content_length <= MAX_BUFFERED_BODY_SIZE;
