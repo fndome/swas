@@ -24,7 +24,8 @@ pub const BufferPool = struct {
         errdefer allocator.free(slab);
 
         // 修改原因：markReplenish 运行在读完成热路径，不能第一次归还 bid 时再因队列扩容 OOM 丢失 read buffer。
-        var replenish_queue = try std.ArrayList(u16).initCapacity(allocator, block_count);
+        // Double capacity to absorb duplicate-bid edge cases before each flush cycle.
+        var replenish_queue = try std.ArrayList(u16).initCapacity(allocator, block_count * 2);
         errdefer replenish_queue.deinit(allocator);
 
         var self = BufferPool{
@@ -70,8 +71,13 @@ pub const BufferPool = struct {
     }
 
     /// Queue a bid for replenish back to io_uring.
+    /// Skips duplicate bids already in the queue to prevent silent pool shrink
+    /// when the append-OOM path is hit.
     pub fn markReplenish(self: *BufferPool, bid: u16) void {
         if (bid >= self.block_count) return;
+        for (self.replenish_queue.items) |queued| {
+            if (queued == bid) return;
+        }
         self.replenish_queue.append(self.allocator, bid) catch |err| {
             std.log.err("markReplenish: failed to append bid={d}: {s}", .{ bid, @errorName(err) });
         };
