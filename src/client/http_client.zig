@@ -136,10 +136,19 @@ fn onClose(stream: *RingSharedClient, ctx: ?*anyopaque) void {
 
 const REQUEST_POOL_SIZE = 30;
 
+fn initReqFreelist() [REQUEST_POOL_SIZE]usize {
+    var freelist: [REQUEST_POOL_SIZE]usize = undefined;
+    for (0..REQUEST_POOL_SIZE) |i| {
+        freelist[REQUEST_POOL_SIZE - 1 - i] = i;
+    }
+    return freelist;
+}
+
 pub const HttpClient = struct {
     allocator: Allocator,
     ring_b: *RingB,
     cache: *TinyCache,
+    pool_lock: std.Thread.Mutex,
     req_pool_free: [REQUEST_POOL_SIZE]usize,
     req_pool_top: usize,
     req_pool_items: [REQUEST_POOL_SIZE]RequestContext,
@@ -151,15 +160,12 @@ pub const HttpClient = struct {
 
     pub fn init(allocator: Allocator, ring_b: *RingB) !*HttpClient {
         const self = try allocator.create(HttpClient);
-        var freelist: [REQUEST_POOL_SIZE]usize = undefined;
-        for (0..REQUEST_POOL_SIZE) |i| {
-            freelist[REQUEST_POOL_SIZE - 1 - i] = i;
-        }
         self.* = .{
             .allocator = allocator,
             .ring_b = ring_b,
             .cache = &ring_b.http_cache,
-            .req_pool_free = freelist,
+            .pool_lock = .{},
+            .req_pool_free = initReqFreelist(),
             .req_pool_top = REQUEST_POOL_SIZE,
             .req_pool_items = undefined,
             .req_gen = [_]u64{0} ** REQUEST_POOL_SIZE,
@@ -181,6 +187,12 @@ pub const HttpClient = struct {
     }
 
     fn isBorrowed(self: *HttpClient, idx: usize) bool {
+        self.pool_lock.lock();
+        defer self.pool_lock.unlock();
+        return self.isBorrowedLocked(idx);
+    }
+
+    fn isBorrowedLocked(self: *HttpClient, idx: usize) bool {
         for (0..self.req_pool_top) |j| {
             if (self.req_pool_free[j] == idx) return false;
         }
@@ -188,6 +200,8 @@ pub const HttpClient = struct {
     }
 
     fn acquireReq(self: *HttpClient) ?*RequestContext {
+        self.pool_lock.lock();
+        defer self.pool_lock.unlock();
         if (self.req_pool_top == 0) return null;
         self.req_pool_top -= 1;
         const idx = self.req_pool_free[self.req_pool_top];
@@ -210,6 +224,18 @@ pub const HttpClient = struct {
     }
 
     fn releaseReq(self: *HttpClient, ctx: *RequestContext) void {
+        self.releaseReqInternal(ctx, false);
+    }
+
+    fn releaseCancelledReq(self: *HttpClient, ctx: *RequestContext) void {
+        self.releaseReqInternal(ctx, true);
+    }
+
+    fn releaseReqInternal(self: *HttpClient, ctx: *RequestContext, deinit_response: bool) void {
+        self.pool_lock.lock();
+        defer self.pool_lock.unlock();
+        if (!self.isBorrowedLocked(ctx.pool_id)) return;
+        if (deinit_response) ctx.response.deinit();
         ctx.cleanup();
         self.req_gen[ctx.pool_id] +%= 1; // bump gen → 旧 fiber notify 失效
         self.req_pool_free[self.req_pool_top] = ctx.pool_id;
@@ -253,7 +279,8 @@ pub const HttpClient = struct {
             body_dup = null;
             return error.PoolFull;
         };
-        errdefer self.releaseReq(ctx);
+        var release_on_error = true;
+        errdefer if (release_on_error) self.releaseReq(ctx);
         ctx.method = method;
         ctx.url = url;
         ctx.headers = headers_dup;
@@ -269,10 +296,12 @@ pub const HttpClient = struct {
             const deadline_ms = nowMs() + REQUEST_TIMEOUT_MS;
             while (!@atomicLoad(bool, &ctx.done, .acquire)) {
                 std.Thread.yield() catch {};
+                if (@atomicLoad(bool, &ctx.done, .acquire)) break;
                 if (nowMs() >= deadline_ms or @atomicLoad(bool, &self.stop, .acquire)) {
                     @atomicStore(bool, &ctx.cancelled, true, .release);
                     @atomicStore(bool, &ctx.done, true, .release);
-                    self.releaseReq(ctx);
+                    // 修改原因：超时后 IO fiber 仍可能持有 ctx，不能由调用线程释放后立刻复用该槽位。
+                    release_on_error = false;
                     return error.RequestTimeout;
                 }
             }
@@ -299,9 +328,13 @@ const RequestContext = struct {
 
     // Notify is called from the IO thread (via InvokeQueue -> handleRequest).
     // request() spins on the caller thread. Single-writer single-reader:
-    // @atomicStore/.acquire is sufficient; a full mutex is unnecessary.
+    // @atomicStore/.acquire is sufficient for the completion flag.
     fn notify(self: *RequestContext) void {
-        if (@atomicLoad(bool, &self.cancelled, .acquire)) return;
+        if (@atomicLoad(bool, &self.cancelled, .acquire)) {
+            // 修改原因：取消请求的 response 由后台 IO 完成路径创建，必须在这里释放并归还请求池槽位。
+            self.client.releaseCancelledReq(self);
+            return;
+        }
         @atomicStore(bool, &self.done, true, .release);
     }
 
@@ -456,6 +489,8 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     var req_buf: [4096]u8 = undefined;
     const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
         ctx.cleanup();
+        // 修改原因：请求过大时还没有写入上游，必须归还已借出的 pipe，避免连接池项永久停在 borrowed 状态。
+        cache.release(pipe, nowMs());
         ctx.response = makeErrorResponse(ctx.allocator, 502, "request too large");
         ctx.notify();
         return;
@@ -535,6 +570,42 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "HttpClient cancelled notify returns request slot once" {
+    var client = HttpClient{
+        .allocator = std.testing.allocator,
+        .ring_b = undefined,
+        .cache = undefined,
+        .pool_lock = .{},
+        .req_pool_free = initReqFreelist(),
+        .req_pool_top = REQUEST_POOL_SIZE,
+        .req_pool_items = undefined,
+        .req_gen = [_]u64{0} ** REQUEST_POOL_SIZE,
+        .next_gen = 0,
+        .stop = false,
+    };
+
+    const ctx = client.acquireReq() orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const pool_id = ctx.pool_id;
+    try std.testing.expectEqual(@as(usize, REQUEST_POOL_SIZE - 1), client.req_pool_top);
+
+    ctx.response = makeErrorResponse(std.testing.allocator, 504, "timeout");
+    @atomicStore(bool, &ctx.cancelled, true, .release);
+    ctx.notify();
+
+    try std.testing.expectEqual(@as(usize, REQUEST_POOL_SIZE), client.req_pool_top);
+    var seen: usize = 0;
+    for (client.req_pool_free[0..client.req_pool_top]) |idx| {
+        if (idx == pool_id) seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+
+    ctx.notify();
+    try std.testing.expectEqual(@as(usize, REQUEST_POOL_SIZE), client.req_pool_top);
 }
 
 test "HttpClient parseUrl rejects malformed explicit ports" {

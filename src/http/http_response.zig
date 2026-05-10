@@ -39,6 +39,10 @@ pub fn maxWriteRetries(total: usize) u8 {
     return @intCast(retries);
 }
 
+fn headerOnlyCapacity(extra_headers_len: usize) usize {
+    return 256 + extra_headers_len;
+}
+
 pub fn ensureWriteBuf(self: *AsyncServer, conn: *Connection, min_size: usize) bool {
     if (conn.response_buf) |existing| {
         if (existing.len >= min_size) return true;
@@ -80,8 +84,8 @@ pub fn respond(self: *AsyncServer, conn: *Connection, status: u16, text: []const
 }
 
 pub fn respondWithHeader(self: *AsyncServer, conn: *Connection, status: u16, text: []const u8, extra_headers: []const u8) void {
-    // 修改原因：extra_headers 长度由调用方决定，固定 512 会让长 header 在 bufPrint 时误报 500。
-    if (!ensureWriteBuf(self, conn, 512 + extra_headers.len)) {
+    // 修改原因：extra_headers 来自调用方，必须按实际长度扩容，否则长 header 会 bufPrint 失败并误回 500。
+    if (!ensureWriteBuf(self, conn, headerOnlyCapacity(extra_headers.len))) {
         self.closeConn(conn.id, conn.fd);
         return;
     }
@@ -98,6 +102,11 @@ pub fn respondWithHeader(self: *AsyncServer, conn: *Connection, status: u16, tex
     self.submitWrite(conn.id, conn) catch {
         self.closeConn(conn.id, conn.fd);
     };
+}
+
+test "respondWithHeader capacity scales with extra headers" {
+    try std.testing.expectEqual(@as(usize, 256), headerOnlyCapacity(0));
+    try std.testing.expectEqual(@as(usize, 768), headerOnlyCapacity(512));
 }
 
 pub fn respondJson(self: *AsyncServer, conn: *Connection, status: u16, json_body: []const u8) void {
