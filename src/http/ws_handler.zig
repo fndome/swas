@@ -356,10 +356,15 @@ pub fn wsSendFn(ctx: *anyopaque, conn_id: u64, opcode: Opcode, payload: []const 
     try sendWsFrame(self, conn_id, opcode, payload);
 }
 
+fn shouldQueueWsSend(conn: *const Connection) bool {
+    return conn.is_writing or conn.state == .ws_writing;
+}
+
 pub fn sendWsFrame(self: *AsyncServer, conn_id: u64, opcode: Opcode, payload: []const u8) !void {
     const conn = self.getConn(conn_id) orelse return;
 
-    if (conn.is_writing) {
+    // 修改原因：协议层 ping/close 响应会进入 ws_writing 但不设置 is_writing，应用发送必须排队避免覆盖 response_buf。
+    if (shouldQueueWsSend(conn)) {
         const dup = self.allocator.dupe(u8, payload) catch {
             return error.OutOfMemory;
         };
@@ -452,4 +457,16 @@ fn maxWriteRetries(total: usize) u8 {
     const base: usize = total / 4096;
     const retries: usize = if (base < 4) @as(usize, 4) else if (base > 64) @as(usize, 64) else base;
     return @intCast(retries);
+}
+
+test "sendWsFrame queues while protocol write is in flight" {
+    var conn = Connection{};
+    try std.testing.expect(!shouldQueueWsSend(&conn));
+
+    conn.state = .ws_writing;
+    try std.testing.expect(shouldQueueWsSend(&conn));
+
+    conn.state = .ws_reading;
+    conn.is_writing = true;
+    try std.testing.expect(shouldQueueWsSend(&conn));
 }
