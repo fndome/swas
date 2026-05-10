@@ -80,7 +80,8 @@ pub fn respond(self: *AsyncServer, conn: *Connection, status: u16, text: []const
 }
 
 pub fn respondWithHeader(self: *AsyncServer, conn: *Connection, status: u16, text: []const u8, extra_headers: []const u8) void {
-    if (!ensureWriteBuf(self, conn, 512)) {
+    // 修改原因：extra_headers 长度由调用方决定，固定 512 会让长 header 在 bufPrint 时误报 500。
+    if (!ensureWriteBuf(self, conn, 512 + extra_headers.len)) {
         self.closeConn(conn.id, conn.fd);
         return;
     }
