@@ -22,17 +22,36 @@ pub fn getPathFromRequest(buf: []const u8) ?[]const u8 {
 }
 
 pub fn isKeepAliveConnection(buf: []const u8) bool {
-    const http11 = std.mem.indexOf(u8, buf, "HTTP/1.1") != null;
-    var lines = std.mem.splitSequence(u8, buf, "\r\n");
-    while (lines.next()) |line| {
+    const http11 = requestLineIsHttp11(buf);
+    var lines = std.mem.splitScalar(u8, buf, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
         if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, "Connection:")) {
             const value = std.mem.trim(u8, line["Connection:".len..], " \t");
-            if (std.ascii.indexOfIgnoreCase(value, "close") != null) return false;
-            if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) return true;
+            // 修改原因：Connection 是逗号分隔 token，不能用子串匹配；同时协议版本只能从请求行判断。
+            if (headerValueHasToken(value, "close")) return false;
+            if (headerValueHasToken(value, "keep-alive")) return true;
         }
     }
     return http11;
+}
+
+fn requestLineIsHttp11(buf: []const u8) bool {
+    const end = std.mem.indexOf(u8, buf, "\r\n") orelse
+        std.mem.indexOfScalar(u8, buf, '\n') orelse
+        buf.len;
+    const line = std.mem.trim(u8, buf[0..end], "\r");
+    return std.mem.endsWith(u8, line, "HTTP/1.1");
+}
+
+fn headerValueHasToken(value: []const u8, token: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
+    }
+    return false;
 }
 
 /// 从 HTTP 请求行中提取 URI 的完整路径（含 query string）
@@ -124,4 +143,11 @@ pub fn readResolvConfNameserver() !u32 {
 
 pub fn logErr(comptime format: []const u8, args: anytype) void {
     std.debug.print("[ERROR] " ++ format ++ "\n", args);
+}
+
+test "isKeepAliveConnection uses request line and exact Connection tokens" {
+    try std.testing.expect(!isKeepAliveConnection("GET / HTTP/1.0\r\nX-Debug: HTTP/1.1\r\n\r\n"));
+    try std.testing.expect(isKeepAliveConnection("GET / HTTP/1.1\r\nConnection: enclose\r\n\r\n"));
+    try std.testing.expect(!isKeepAliveConnection("GET / HTTP/1.1\nConnection: close\n\n"));
+    try std.testing.expect(isKeepAliveConnection("GET / HTTP/1.0\r\nConnection: keep-alive, upgrade\r\n\r\n"));
 }
