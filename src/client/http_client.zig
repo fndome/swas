@@ -393,13 +393,21 @@ fn handleRequest(allocator: Allocator, ctx_ptr: **RequestContext) void {
     });
 }
 
+fn requestHeaderTerminator(headers: []const u8) []const u8 {
+    // 修改原因：调用方常传入单行 header；缺少结尾 CRLF 时直接拼接会把后续请求头拼进上一行。
+    if (headers.len == 0) return "";
+    if (std.mem.endsWith(u8, headers, "\n")) return "";
+    return "\r\n";
+}
+
 fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
     if (body) |b| {
         if (headers) |h| {
+            const header_term = requestHeaderTerminator(h);
             return std.fmt.bufPrint(
                 buf,
-                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-                .{ method, path, host, h, b.len, b },
+                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+                .{ method, path, host, h, header_term, b.len, b },
             );
         }
         return std.fmt.bufPrint(
@@ -409,10 +417,11 @@ fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u
         );
     }
     if (headers) |h| {
+        const header_term = requestHeaderTerminator(h);
         return std.fmt.bufPrint(
             buf,
-            "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Connection: keep-alive\r\n\r\n",
-            .{ method, path, host, h },
+            "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Connection: keep-alive\r\n\r\n",
+            .{ method, path, host, h, header_term },
         );
     }
     return std.fmt.bufPrint(
@@ -579,6 +588,19 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
         ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
         ctx.notify();
     }
+}
+
+test "HttpClient buildRequest terminates caller headers" {
+    var buf: [512]u8 = undefined;
+
+    const get_req = try buildRequest(&buf, "GET", "/", "example.com", "Authorization: Bearer token", null);
+    try std.testing.expect(std.mem.indexOf(u8, get_req, "Authorization: Bearer token\r\nConnection: keep-alive") != null);
+
+    const post_req = try buildRequest(&buf, "POST", "/", "example.com", "Content-Type: application/json", "{}");
+    try std.testing.expect(std.mem.indexOf(u8, post_req, "Content-Type: application/json\r\nContent-Length: 2") != null);
+
+    const already_terminated = try buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\r\n", null);
+    try std.testing.expect(std.mem.indexOf(u8, already_terminated, "X-Test: ok\r\nConnection: keep-alive") != null);
 }
 
 test "HttpClient responseCompleteLen waits for Content-Length body" {
