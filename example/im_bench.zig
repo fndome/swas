@@ -51,6 +51,7 @@ const DEFAULT_PORT = 19090;
 const CONNS = 50;
 const REQS_PER_CONN = 100;
 const DRAIN_IDLE_ROUNDS = 20;
+const DRAIN_POLL_TIMEOUT_MS = 10;
 const RESPONSE_MARKER = "{\"ok\":true}";
 
 fn benchHandler(allocator: std.mem.Allocator, ctx: *sws.Context) anyerror!void {
@@ -91,6 +92,22 @@ fn drainAvailable(fd: i32, buf: []u8) usize {
     return recv;
 }
 
+fn waitReadable(fds: []const i32) bool {
+    var poll_fds: [CONNS]std.posix.pollfd = undefined;
+    var count: usize = 0;
+    for (fds) |dfd| {
+        if (dfd == 0) continue;
+        poll_fds[count] = .{
+            .fd = dfd,
+            .events = std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
+            .revents = 0,
+        };
+        count += 1;
+    }
+    if (count == 0) return false;
+    return (std.posix.poll(poll_fds[0..count], DRAIN_POLL_TIMEOUT_MS) catch return false) != 0;
+}
+
 fn drainUntil(fds: []const i32, buf: []u8, recv: *usize, target: usize, max_idle_rounds: usize) void {
     var idle_rounds: usize = 0;
     while (recv.* < target and idle_rounds < max_idle_rounds) {
@@ -104,8 +121,12 @@ fn drainUntil(fds: []const i32, buf: []u8, recv: *usize, target: usize, max_idle
         if (progressed) {
             idle_rounds = 0;
         } else {
-            idle_rounds += 1;
-            _ = linux.nanosleep(&linux.timespec{ .sec = 0, .nsec = 10_000_000 }, null);
+            // 修改原因：固定 sleep 10ms 会把 100 轮 smoke benchmark 人为限制在约 5k req/s；poll 可在响应到达时立即继续。
+            if (waitReadable(fds)) {
+                idle_rounds = 0;
+            } else {
+                idle_rounds += 1;
+            }
         }
     }
 }

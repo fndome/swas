@@ -21,12 +21,17 @@ pub const BufferPool = struct {
 
     pub fn init(allocator: Allocator, block_count: usize) !BufferPool {
         const slab = try allocator.alloc(u8, block_count * BUFFER_SIZE);
+        errdefer allocator.free(slab);
+
+        // 修改原因：markReplenish 运行在读完成热路径，不能第一次归还 bid 时再因队列扩容 OOM 丢失 read buffer。
+        var replenish_queue = try std.ArrayList(u16).initCapacity(allocator, block_count);
+        errdefer replenish_queue.deinit(allocator);
 
         var self = BufferPool{
             .allocator = allocator,
             .slab = slab,
             .block_count = block_count,
-            .replenish_queue = std.ArrayList(u16).empty,
+            .replenish_queue = replenish_queue,
             .tier_freelists = undefined,
         };
         for (0..TIER_COUNT) |i| {
@@ -160,3 +165,10 @@ pub const BufferPool = struct {
         pending_replenish: usize,
     };
 };
+
+test "BufferPool preallocates replenish queue for read buffers" {
+    var pool = try BufferPool.init(std.testing.allocator, 2);
+    defer pool.deinit();
+
+    try std.testing.expect(pool.replenish_queue.capacity >= 2);
+}
