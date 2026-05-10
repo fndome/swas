@@ -152,6 +152,8 @@ pub const RingSharedClient = struct {
 
     fn submitPollOut(self: *RingSharedClient, timeout_ms: u32) !void {
         const ring = self.rs.ringPtr();
+        // 修改原因：带超时的 connect 必须同时拿到 CONNECT 和 LINK_TIMEOUT 两个 SQE；否则会提交一个没有超时保护的连接。
+        if (!hasConnectSqeCapacity(@intCast(ring.sq_ready()), ring.sq.sqes.len, timeout_ms)) return error.ConnectSubmitQueueFull;
         // 修改原因：CONNECT SQE 都拿不到时不能静默成功，否则连接会永久停在 connecting 且 fd/registry 无法回收。
         const sqe = ring.nop(self.id) catch return error.ConnectSubmitQueueFull;
         sqe.opcode = @enumFromInt(27); // IORING_OP_CONNECT
@@ -319,8 +321,20 @@ fn isWriteCqe(user_data: u64) bool {
     return (user_data & CLIENT_WRITE_USER_DATA_FLAG) != 0;
 }
 
+fn hasConnectSqeCapacity(ready: usize, capacity: usize, timeout_ms: u32) bool {
+    if (ready > capacity) return false;
+    const needed: usize = if (timeout_ms > 0) 2 else 1;
+    return capacity - ready >= needed;
+}
+
 test "RingSharedClient distinguishes write CQE user data" {
     const base = @as(u64, 1) << 62;
     try std.testing.expect(!isWriteCqe(base));
     try std.testing.expect(isWriteCqe(base | CLIENT_WRITE_USER_DATA_FLAG));
+}
+
+test "RingSharedClient connect submit checks timeout SQE capacity" {
+    try std.testing.expect(hasConnectSqeCapacity(254, 256, 5000));
+    try std.testing.expect(!hasConnectSqeCapacity(255, 256, 5000));
+    try std.testing.expect(hasConnectSqeCapacity(255, 256, 0));
 }
