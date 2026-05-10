@@ -34,9 +34,17 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
 
         pub fn init(allocator: Allocator) !Self {
             var blocks: [capacity][]u8 = undefined;
+            var allocated_count: usize = 0;
+            errdefer {
+                // 修改原因：初始化时按块逐个分配，中途 OOM 需要释放已经成功分配的块，避免启动失败泄漏大缓冲。
+                for (blocks[0..allocated_count]) |block| {
+                    allocator.free(block);
+                }
+            }
             var freelist: [capacity]usize = undefined;
             for (0..capacity) |i| {
                 blocks[i] = try allocator.alloc(u8, block_size);
+                allocated_count += 1;
                 freelist[i] = capacity - 1 - i;
             }
             return Self{
@@ -85,4 +93,16 @@ pub fn BufferBlockPool(comptime block_size: usize, comptime capacity: usize) typ
 /// 向后兼容: 1MB × N 块, 用于大报文 (Content-Length > 32KB)
 pub fn LargeBufferPool(comptime capacity: usize) type {
     return BufferBlockPool(1024 * 1024, capacity);
+}
+
+test "BufferBlockPool frees partial blocks when init allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+    });
+    const allocator = failing_allocator.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, BufferBlockPool(8, 4).init(allocator));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    try std.testing.expectEqual(failing_allocator.allocations, failing_allocator.deallocations);
 }
