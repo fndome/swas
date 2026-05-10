@@ -4,6 +4,8 @@ const websocket_magic = "258EAFA5-E914-47DA-95CA-5AB9DC11B85B";
 
 pub fn isUpgradeRequest(data: []const u8) bool {
     if (std.mem.indexOf(u8, data, "\r\n\r\n") == null) return false;
+    // 修改原因：WebSocket 握手只能使用 HTTP/1.1 GET；只看 Upgrade 头会把 POST/HTTP1.0 请求误升级。
+    if (!requestLineIsWebSocketGet(data)) return false;
 
     var has_upgrade = false;
     var has_connection_upgrade = false;
@@ -38,6 +40,16 @@ pub fn isUpgradeRequest(data: []const u8) bool {
         }
     }
     return has_upgrade and has_connection_upgrade and has_ws_key and has_ws_version;
+}
+
+fn requestLineIsWebSocketGet(data: []const u8) bool {
+    const end = std.mem.indexOf(u8, data, "\r\n") orelse return false;
+    const line = data[0..end];
+    var parts = std.mem.tokenizeScalar(u8, line, ' ');
+    const method = parts.next() orelse return false;
+    _ = parts.next() orelse return false;
+    const version = parts.next() orelse return false;
+    return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, version, "HTTP/1.1");
 }
 
 fn headerValueHasToken(value: []const u8, token: []const u8) bool {
@@ -135,4 +147,24 @@ test "isUpgradeRequest validates Sec-WebSocket-Key nonce" {
         "Sec-WebSocket-Key: YWJj\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     try std.testing.expect(!isUpgradeRequest(wrong_decoded_len));
+}
+
+test "isUpgradeRequest requires GET HTTP/1.1 request line" {
+    const post_upgrade =
+        "POST /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(post_upgrade));
+
+    const http10_upgrade =
+        "GET /ws HTTP/1.0\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(http10_upgrade));
 }
