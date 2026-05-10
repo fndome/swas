@@ -31,6 +31,10 @@ pub const WsServer = struct {
 
     pub fn deinit(self: *WsServer) void {
         self.active.deinit();
+        var it = self.handlers.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.handlers.deinit();
     }
 
@@ -46,7 +50,14 @@ pub const WsServer = struct {
     }
 
     pub fn register(self: *WsServer, path: []const u8, handler: WsHandler) !void {
-        try self.handlers.put(path, handler);
+        const key = try self.allocator.dupe(u8, path);
+        // 修改原因：WebSocket 路由表必须拥有 path key；否则调用方传入临时 buffer 后会留下悬空 key。
+        errdefer self.allocator.free(key);
+        const gop = try self.handlers.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = handler;
     }
 
     pub fn hasHandlers(self: *const WsServer) bool {
@@ -121,4 +132,27 @@ test "WsServer basic" {
     try std.testing.expect(server.getActive(42) != null);
     server.removeActive(42);
     try std.testing.expect(server.getActive(42) == null);
+}
+
+test "WsServer register owns path keys" {
+    const allocator = std.testing.allocator;
+
+    const send_fn = struct {
+        fn send(_: *anyopaque, _: u64, _: Opcode, _: []const u8) !void {}
+    }.send;
+    const handler = struct {
+        fn h(_: u64, _: *const Frame, _: *anyopaque) void {}
+    }.h;
+
+    var server = WsServer.init(allocator, send_fn);
+    server.ctx = undefined;
+    defer server.deinit();
+
+    const dynamic_path = try allocator.dupe(u8, "/dynamic");
+    try server.register(dynamic_path, handler);
+    allocator.free(dynamic_path);
+
+    try std.testing.expect(server.getHandler("/dynamic") != null);
+    try server.register("/dynamic", handler);
+    try std.testing.expect(server.getHandler("/dynamic") != null);
 }
