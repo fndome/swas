@@ -48,8 +48,11 @@ pub fn extractBid(cqe_flags: u32) u16 {
 /// 分配并初始化一个槽位。返回 index + user_data token。
 pub fn slotAlloc(pool: anytype, fd: i32, conn_gen_id: *u32, now_ms: i64) struct { idx: u32, token: u64 } {
     const idx = pool.acquire() orelse return .{ .idx = 0xFFFFFFFF, .token = 0 };
-    const gen_id = conn_gen_id.*;
-    conn_gen_id.* +%= 1;
+    var gen_id = conn_gen_id.*;
+    // 修改原因：gen_id=0 会被 getSlotChecked 视为无效，计数器初始化或回绕时必须跳过 0。
+    if (gen_id == 0) gen_id = 1;
+    conn_gen_id.* = gen_id +% 1;
+    if (conn_gen_id.* == 0) conn_gen_id.* = 1;
 
     const slot = &pool.slots[idx];
     // Debug: verify sentinel intact (catches buffer overflow from previous slot user)
@@ -334,4 +337,19 @@ test "connAlloc releases slot when connection map insert fails" {
     try std.testing.expectEqual(@as(u32, 1), pool.freelist_top);
     try std.testing.expectEqual(@as(usize, 0), pool.live.items.len);
     try std.testing.expectEqual(@as(u32, 0), pool.slots[0].line1.gen_id);
+}
+
+test "slotAlloc skips zero generation ids" {
+    var pool = try StackPool(StackSlot, 1).init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    pool.warmup();
+
+    var gen_id: u32 = 0;
+    const allocated = slotAlloc(&pool, 42, &gen_id, 100);
+    defer slotFree(&pool, allocated.idx);
+
+    try std.testing.expect(allocated.idx != 0xFFFFFFFF);
+    try std.testing.expectEqual(@as(u32, 1), pool.slots[allocated.idx].line1.gen_id);
+    try std.testing.expectEqual(@as(u32, 2), gen_id);
+    try std.testing.expect(getSlotChecked(&pool, allocated.token) != null);
 }
