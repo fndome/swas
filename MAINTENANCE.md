@@ -2,7 +2,35 @@
 
 > `async_server.zig` 已拆分为 12 个子模块 (2725→526 行)。模块速查见底部关键文件表。
 
-> 基于 8 轮深度分析 + 20 项修复的实战经验。简洁有效。
+> 基于多轮深度分析 + 修复的实战经验。简洁有效。
+
+---
+
+## Bug 历史追踪（发现 bug 后第一件事）
+
+**每个 bug 在动手修之前，必须先搞清楚它的来历：**
+
+```
+git log -p -S "<关键代码>" -- <文件>    # 这段代码是谁、哪个 commit 引入的？
+git log --oneline -- <文件>             # 这个文件被修过几次？
+```
+
+**回答三个问题：**
+
+| 问题 | 命令 | 常见结论 |
+|------|------|---------|
+| 是什么时候引入的？ | `git log -S` | 新功能附带 / merge 冲突解错 / 初版就有 |
+| 之前有人试图修过吗？ | `git log --oneline -- <file>` 查找相关 commit message | 修过但没修全 / 修错了方向 / 从未被注意 |
+| 当时为什么那样写？ | `git show <commit> --format=full` | 看 commit message + diff 上下文 |
+
+**四种 bug 来源（本仓库实测）：**
+
+| 来源 | 占比 | 特征 | 修复策略 |
+|------|------|------|---------|
+| **merge 冲突解错** | ~40% | `diff-tree --cc` 有合并块，双方代码都保留了 | 选边或重写，不要简单叠加 |
+| **新功能附带** | ~15% | `git log -S` 定位到某个 feature commit | 理解原意图后最小改动 |
+| **修了但没修全** | ~25% | 之前有个 "fix:" commit，但遗漏了某个路径 | 补全所有错误路径 |
+| **从未被发现** | ~20% | 没有相关 commit，代码从初版就在 | 按正常优先级修复 |
 
 ---
 
@@ -117,6 +145,75 @@ self.pool.slots[conn.pool_idx].line4.writev_in_flight = 0;
 3. **验证**：源码逐行确认，排除假阳性
 
 **关键：第二轮刻意不看第一轮的结果，换一个分析框架重新读。**
+
+### 怎样排除假阳性（本仓库实测 ~30% 初始报告是误报）
+
+最常见的三类误报，验证方法：
+
+| 误报类型 | 示例 | 正确验证方法 |
+|---------|------|-------------|
+| "队列会累积 zombie" | `retryPendingWrites` 跳过 null 条目 | 手推循环：空条目也会推进 `i`，最终 `shrinkRetainingCapacity` 全清 |
+| "资源泄漏" | timeout 后 slot 没释放 | 检查是否是设计如此：是否有 errdefer 兜底？是否有异步回收路径？ |
+| "空指针/空 optional" | `saved_call` 可能为 null | 反向追踪调用链：谁设置了这个值？调用方是否总有守卫？ |
+
+**判断准则**：如果 `git log -S` 显示这段代码多轮审计都没人报过，大概率不是 bug，而是你的理解有问题。先问"为什么这样设计是对的"，再问"哪里可能出错"。
+
+---
+
+## 反向 merge 是最大的 bug 来源
+
+**永远不要 `git merge main` 进 feature 分支。用 `git rebase main`。**
+
+反向 merge（`Merge branch 'main' into codex/...`）造成的问题：
+
+1. **冲突解决时容易两边都保留**：`diff-tree --cc` 的合并块里 `+` 和 ` +` 两套代码并存，导致 double-free、重复调用、冗余变量
+2. **PR 变成空 merge**：feature 分支的改动被 main 已有代码覆盖，PR 贡献零 diff，fix 丢失
+3. **历史污染**：graph 产生不必要的分叉，`git log --first-parent` 看不清主线
+
+**检测存量反向 merge：**
+```bash
+git log --oneline --all --grep="Merge branch 'main' into"
+```
+
+**检测空 merge（fix 丢失的 PR）：**
+```bash
+# 对每个 PR merge commit：
+git diff --stat <merge>^1 <merge>
+# 输出为空 → 此 PR 的修复已丢失
+```
+
+**检测冲突解错的 merge：**
+```bash
+git diff-tree --cc -p <merge_commit>
+# 有输出 → 存在手动解决的冲突，逐 hunk 检查是否两边都保留了
+```
+
+---
+
+## 冲突解决检查清单
+
+`diff-tree --cc` 输出的每个 hunk，逐条检查：
+
+- [ ] 是否同一个变量被声明了两次？（如 `allocated` 和 `allocated_count`）
+- [ ] 是否同一函数被调用了两次？（如 `handler()` + `handler()`）
+- [ ] 是否清理逻辑重复？（如手动释放 + `finishXxxHandler` 内释放）
+- [ ] 是否有未使用的死代码？（如 `fdSetContains` + `fdSetHas` 并存）
+- [ ] 两个分支的修复方向是否不同？（如 `512 + len` vs `headerOnlyCapacity(len)`）
+
+**核心原则：冲突解决是"选边或重写"，不是"两边都留着"。**
+
+---
+
+## 常见"修了但没修全"的模式
+
+| 模式 | 示例 | 怎么补全 |
+|------|------|---------|
+| `catch break` 导致 fallthrough | `stream.deinit(); stream = init(...) catch break;` → break 后还走 `stream.deinit()` | 改成 `catch { ...; return; }` |
+| `catch return` 在回退路径上 | `dupe(body) catch { dupe(fallback) catch return; }` → 第二层 OOM 静默 return | 回退也失败就接受灾难，但加注释说明 |
+| 只加了 log 没解决问题 | `pushResume` 队列满 `log.err(...); return;` → fiber 挂起 | 扩容或降级策略 |
+| 预分配不足埋雷 | `ArrayList.empty` 在热路径 `append` → OOM 丢数据 | `initCapacity` 到已知上限 |
+
+**判断方法**：看之前的 "fix:" commit 改了哪些行，再检查相邻的 `catch` / `defer` / `return` 路径是否都覆盖了。
 
 ---
 
