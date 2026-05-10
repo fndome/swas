@@ -215,19 +215,8 @@ pub const RingSharedClient = struct {
                 // Disable Nagle — low-latency microservice calls
                 const one: i32 = 1;
                 _ = linux.setsockopt(self.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(i32));
-                // Register as fixed file to avoid kernel fd lookup per I/O
-                if (self.rs.ringPtr().register_files_sparse(1)) {
-                    if (self.rs.ringPtr().register_files_update(0, &[_]linux.fd_t{self.fd})) {
-                        self.fixed_index = 0;
-                    } else |err| {
-                        // Non-fatal: the connection operates correctly with
-                        // non-fixed files; logging helps diagnose performance
-                        // degradation when many connections fail this path.
-                        std.log.warn("RingSharedClient: register_files_update failed: {s}", .{@errorName(err)});
-                    }
-                } else |err| {
-                    std.log.warn("RingSharedClient: register_files_sparse failed: {s}", .{@errorName(err)});
-                }
+                // 修改原因：RingSharedClient 没有 fixed-file 槽位分配器；多个连接共用 slot 0 会互相覆盖 fd。
+                self.fixed_index = 0xFFFF;
                 self.submitRead() catch {
                     self.onClose();
                 };
