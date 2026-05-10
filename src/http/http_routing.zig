@@ -26,6 +26,31 @@ const httpTaskExecWrapperWithOwnership = http_fiber.httpTaskExecWrapperWithOwner
 const httpTaskComplete = http_fiber.httpTaskComplete;
 const statusText = http_response.statusText;
 
+fn appendPreciseMiddleware(allocator: Allocator, precise: *std.StringHashMap(std.ArrayList(Middleware)), pattern: []const u8, middleware: Middleware) !void {
+    var owned_key: ?[]u8 = try allocator.dupe(u8, pattern);
+    errdefer if (owned_key) |key| allocator.free(key);
+
+    const key = owned_key.?;
+    var inserted_new = false;
+    errdefer if (inserted_new) {
+        _ = precise.remove(key);
+        allocator.free(key);
+    };
+
+    const gop = try precise.getOrPut(key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = std.ArrayList(Middleware).empty;
+        owned_key = null;
+        inserted_new = true;
+    } else {
+        allocator.free(key);
+        owned_key = null;
+    }
+
+    // 修改原因：getOrPut 新插入 key 后 append 仍可能失败，失败时必须回滚 map，避免残留已释放 key。
+    try gop.value_ptr.append(allocator, middleware);
+}
+
 /// 注册中间件，在 fiber 中执行。可用 Next.submit() 卸 CPU 重活。
 pub fn use(self: *AsyncServer, pattern: []const u8, middleware: Middleware) !void {
     ensureNext(self);
@@ -42,15 +67,7 @@ pub fn use(self: *AsyncServer, pattern: []const u8, middleware: Middleware) !voi
         return;
     }
     if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
-        const key = try self.allocator.dupe(u8, pattern);
-        errdefer self.allocator.free(key);
-        const gop = try self.middlewares.precise.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = std.ArrayList(Middleware).empty;
-        } else {
-            self.allocator.free(key);
-        }
-        try gop.value_ptr.append(self.allocator, middleware);
+        try appendPreciseMiddleware(self.allocator, &self.middlewares.precise, pattern, middleware);
 
         return;
     }
@@ -90,15 +107,7 @@ pub fn useThenRespondImmediately(self: *AsyncServer, pattern: []const u8, middle
         return;
     }
     if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
-        const key = try self.allocator.dupe(u8, pattern);
-        errdefer self.allocator.free(key);
-        const gop = try self.respond_middlewares.precise.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = std.ArrayList(Middleware).empty;
-        } else {
-            self.allocator.free(key);
-        }
-        try gop.value_ptr.append(self.allocator, middleware);
+        try appendPreciseMiddleware(self.allocator, &self.respond_middlewares.precise, pattern, middleware);
         return;
     }
     for (self.respond_middlewares.wildcard.items) |*entry| {
@@ -349,4 +358,34 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
     self.buffer_pool.markReplenish(bid);
     conn.read_len = 0;
     self.respond(conn, 404, "Not Found");
+}
+
+fn testMiddleware(_: Allocator, _: *Context) anyerror!bool {
+    return true;
+}
+
+fn deinitPreciseMiddlewareMap(allocator: Allocator, precise: *std.StringHashMap(std.ArrayList(Middleware))) void {
+    var it = precise.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    precise.deinit();
+}
+
+test "appendPreciseMiddleware rolls back inserted key on append failure" {
+    for (0..8) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        var precise = std.StringHashMap(std.ArrayList(Middleware)).init(allocator);
+        defer deinitPreciseMiddlewareMap(allocator, &precise);
+
+        appendPreciseMiddleware(allocator, &precise, "/oom", testMiddleware) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), precise.count());
+            continue;
+        };
+
+        try std.testing.expectEqual(@as(usize, 1), precise.count());
+    }
 }
