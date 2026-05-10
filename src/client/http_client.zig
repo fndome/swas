@@ -25,11 +25,22 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
+fn firstPathOrQueryIndex(rest: []const u8) ?usize {
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const query = std.mem.indexOfScalar(u8, rest, '?');
+    if (slash) |s| {
+        if (query) |q| return @min(s, q);
+        return s;
+    }
+    return query;
+}
+
 fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     var rest = url;
     if (std.mem.startsWith(u8, rest, "https://")) return error.TlsNotSupported;
     if (std.mem.startsWith(u8, rest, "http://")) rest = rest["http://".len..];
-    const path_start = std.mem.indexOfScalar(u8, rest, '/');
+    // 修改原因：合法 URL 可以省略路径但直接带 query，例如 http://host?x=1；此时也必须从 host 中切出去。
+    const path_start = firstPathOrQueryIndex(rest);
     const host_port = if (path_start) |p| rest[0..p] else rest;
     const path = if (path_start) |p| rest[p..] else "/";
     const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
@@ -400,34 +411,41 @@ fn requestHeaderTerminator(headers: []const u8) []const u8 {
     return "\r\n";
 }
 
+fn requestTargetPrefix(path: []const u8) []const u8 {
+    // 修改原因：URL 形如 http://host?x=1 时 path 以 ? 开头，HTTP origin-form 必须补成 /?x=1。
+    if (path.len > 0 and path[0] == '?') return "/";
+    return "";
+}
+
 fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
+    const target_prefix = requestTargetPrefix(path);
     if (body) |b| {
         if (headers) |h| {
             const header_term = requestHeaderTerminator(h);
             return std.fmt.bufPrint(
                 buf,
-                "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-                .{ method, path, host, h, header_term, b.len, b },
+                "{s} {s}{s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Content-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+                .{ method, target_prefix, path, host, h, header_term, b.len, b },
             );
         }
         return std.fmt.bufPrint(
             buf,
-            "{s} {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
-            .{ method, path, host, b.len, b },
+            "{s} {s}{s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
+            .{ method, target_prefix, path, host, b.len, b },
         );
     }
     if (headers) |h| {
         const header_term = requestHeaderTerminator(h);
         return std.fmt.bufPrint(
             buf,
-            "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Connection: keep-alive\r\n\r\n",
-            .{ method, path, host, h, header_term },
+            "{s} {s}{s} HTTP/1.1\r\nHost: {s}\r\n{s}{s}Connection: keep-alive\r\n\r\n",
+            .{ method, target_prefix, path, host, h, header_term },
         );
     }
     return std.fmt.bufPrint(
         buf,
-        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
-        .{ method, path, host },
+        "{s} {s}{s} HTTP/1.1\r\nHost: {s}\r\nConnection: keep-alive\r\n\r\n",
+        .{ method, target_prefix, path, host },
     );
 }
 
@@ -601,6 +619,9 @@ test "HttpClient buildRequest terminates caller headers" {
 
     const already_terminated = try buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\r\n", null);
     try std.testing.expect(std.mem.indexOf(u8, already_terminated, "X-Test: ok\r\nConnection: keep-alive") != null);
+
+    const query_only_path = try buildRequest(&buf, "GET", "?x=1", "example.com", null, null);
+    try std.testing.expect(std.mem.startsWith(u8, query_only_path, "GET /?x=1 HTTP/1.1\r\n"));
 }
 
 test "HttpClient responseCompleteLen waits for Content-Length body" {
@@ -663,6 +684,12 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 8080), parsed.port);
     try std.testing.expectEqualStrings("/path", parsed.path);
+
+    const parsed_query = try parseUrl(std.testing.allocator, "http://example.com?x=1");
+    defer std.testing.allocator.free(parsed_query.host);
+    try std.testing.expectEqualStrings("example.com", parsed_query.host);
+    try std.testing.expectEqual(@as(u16, 80), parsed_query.port);
+    try std.testing.expectEqualStrings("?x=1", parsed_query.path);
 }
 
 test "HttpClient preserves request headers allocation failures" {
