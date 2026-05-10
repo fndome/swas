@@ -57,7 +57,13 @@ pub const Pipe = struct {
             }
             return;
         }
-        try self.read_buf.appendSlice(self.allocator, data);
+        self.read_buf.appendSlice(self.allocator, data) catch |err| {
+            // 修改原因：append OOM 时也要唤醒正在 reader.read() 里等待的 fiber，否则请求会一直挂起。
+            if (Fiber.isYielded()) {
+                Fiber.pushResume(0, 0, &.{});
+            }
+            return err;
+        };
         if (Fiber.isYielded()) {
             Fiber.pushResume(0, 0, data);
         }
@@ -139,4 +145,19 @@ test "Pipe.Reader.read returns zero for empty destination" {
 
     var empty: [0]u8 = .{};
     try std.testing.expectEqual(@as(usize, 0), try pipe.reader().read(empty[0..]));
+}
+
+test "Pipe.feed reports append allocation failure" {
+    var backing: [1]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var pipe = Pipe{
+        .allocator = fba.allocator(),
+        .stream = undefined,
+        .read_buf = std.ArrayList(u8).empty,
+        .write_buf = std.ArrayList(u8).empty,
+        .max_read = 8,
+    };
+    defer pipe.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, pipe.feed("overflow"));
 }
