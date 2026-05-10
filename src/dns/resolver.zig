@@ -108,10 +108,17 @@ pub const DnsResolver = struct {
         return @as(i64, @intCast(@divTrunc(ts.nanoseconds, @as(i96, std.time.ns_per_ms))));
     }
 
-    fn nextTxid(self: *DnsResolver) u16 {
-        const txid = self.next_txid;
-        self.next_txid +%= 1;
-        return txid;
+    fn nextTxid(self: *DnsResolver) !u16 {
+        var attempts: usize = 0;
+        while (attempts < std.math.maxInt(u16)) : (attempts += 1) {
+            const txid = self.next_txid;
+            self.next_txid +%= 1;
+            if (self.next_txid == 0) self.next_txid = 1;
+            if (txid == 0) continue;
+            // 修改原因：txid 仍在 pending 时不能复用，否则响应会覆盖旧查询并唤醒错误 fiber。
+            if (!self.pending.contains(txid)) return txid;
+        }
+        return error.DnsTxidExhausted;
     }
 
     pub fn resolve(self: *DnsResolver, hostname: []const u8) !u32 {
@@ -121,7 +128,7 @@ pub const DnsResolver = struct {
             return cached.addrs[0];
         }
 
-        const txid = self.nextTxid();
+        const txid = try self.nextTxid();
 
         try self.sendQuery(hostname, txid);
 
@@ -242,3 +249,44 @@ pub const DnsResolver = struct {
         }
     }
 };
+
+fn testPendingQuery(txid: u16) PendingQuery {
+    return .{
+        .txid = txid,
+        .hostname = "example.test",
+        .deadline_ms = 0,
+        .retries = 0,
+        .slot = undefined,
+    };
+}
+
+test "DnsResolver nextTxid skips zero and pending ids" {
+    var resolver = DnsResolver{
+        .allocator = std.testing.allocator,
+        .rs = undefined,
+        .io = undefined,
+        .udp_fd = -1,
+        .dns_ud = 0,
+        .nameserver_ip = 0,
+        .nameserver_port = packet.DNS_PORT,
+        .cache = DnsCache.init(std.testing.allocator),
+        .pending = std.AutoHashMap(u16, PendingQuery).init(std.testing.allocator),
+        .results = std.AutoHashMap(u16, QueryResult).init(std.testing.allocator),
+        .next_txid = 1,
+        .recv_buf = [_]u8{0} ** packet.MAX_PACKET_SIZE,
+        .recv_outstanding = false,
+    };
+    defer resolver.cache.deinit();
+    defer resolver.pending.deinit();
+    defer resolver.results.deinit();
+
+    try resolver.pending.put(1, testPendingQuery(1));
+    try std.testing.expectEqual(@as(u16, 2), try resolver.nextTxid());
+
+    resolver.next_txid = 0;
+    try std.testing.expectEqual(@as(u16, 2), try resolver.nextTxid());
+
+    resolver.next_txid = std.math.maxInt(u16);
+    try resolver.pending.put(std.math.maxInt(u16), testPendingQuery(std.math.maxInt(u16)));
+    try std.testing.expectEqual(@as(u16, 2), try resolver.nextTxid());
+}
