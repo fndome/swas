@@ -245,7 +245,19 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             frame_copy.payload = payload_full[0..frame.payload.len];
 
             const t = self.ws_ctx_pool.create(self.allocator) catch {
+                var fallback_frame = frame;
+                fallback_frame.payload = payload_full[0..frame.payload.len];
+                // 修改原因：任务上下文分配失败时仍可同步处理已复制 payload，但处理完成后必须归还原 read buffer。
+                handler(conn_id, &fallback_frame, self.ws_server.ctx);
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
                 self.buffer_pool.freeTieredWriteBuf(payload_full, payload_tier);
+                if (conn.state != .ws_writing) {
+                    conn.state = .ws_reading;
+                    self.submitRead(conn_id, conn) catch {
+                        self.closeConn(conn_id, conn.fd);
+                    };
+                }
                 handler(conn_id, &frame, self.ws_server.ctx);
                 finishSynchronousWsHandler(self, conn_id, conn, bid);
                 return;
