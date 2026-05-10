@@ -119,9 +119,8 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     if (resp.rcode != .NOERROR) return resp;
 
     const ancount = std.mem.readInt(u16, packet[6..8], .big);
-    const nscount = std.mem.readInt(u16, packet[8..10], .big);
-    const arcount = std.mem.readInt(u16, packet[10..12], .big);
-    const total = @as(usize, ancount) + @as(usize, nscount) + @as(usize, arcount);
+    // 修改原因：authority/additional section 中的 A 记录不是当前查询名的答案，不能当解析结果返回。
+    const total = ancount;
 
     var off: usize = 12;
 
@@ -193,6 +192,21 @@ pub fn parseTxid(packet: []const u8) u16 {
     return std.mem.readInt(u16, packet[0..2], .big);
 }
 
+fn appendTestRootARecord(buf: []u8, off: *usize, ip: [4]u8) void {
+    buf[off.*] = 0;
+    off.* += 1;
+    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    off.* += 2;
+    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    off.* += 2;
+    std.mem.writeInt(u32, buf[off.*..][0..4], 60, .big);
+    off.* += 4;
+    std.mem.writeInt(u16, buf[off.*..][0..2], 4, .big);
+    off.* += 2;
+    @memcpy(buf[off.*..][0..4], &ip);
+    off.* += 4;
+}
+
 test "buildQuery reports actual DNS message length" {
     const query = try buildQuery("example.com", 0x1234);
 
@@ -226,6 +240,21 @@ test "parseResponse tolerates malformed answer name" {
 
     const parsed = parseResponse(&pkt);
     try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
+}
+
+test "parseResponse ignores additional A records" {
+    var pkt = [_]u8{0} ** 42;
+    pkt[2] = 0x80; // QR response
+    pkt[7] = 1; // ANCOUNT = 1
+    pkt[11] = 1; // ARCOUNT = 1
+
+    var off: usize = 12;
+    appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
+    appendTestRootARecord(&pkt, &off, .{ 5, 6, 7, 8 });
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(@as(u8, 1), parsed.addrs.len);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x01020304), parsed.addrs.addrs[0]);
 }
 
 test "parseResponse rejects truncated question" {
