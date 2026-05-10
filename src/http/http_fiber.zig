@@ -20,6 +20,12 @@ pub const HttpTaskCtx = struct {
     body_data: ?[]u8 = null,
 };
 
+fn responseHeaderItems(headers: ?*const std.ArrayList(u8)) []const u8 {
+    // 修改原因：响应头只在 respondZeroCopy 同步组包时读取，不能因为复制 OOM 就静默丢掉调用方设置的 headers。
+    if (headers) |h| return h.items;
+    return "";
+}
+
 pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []const u8) void) void {
     const t: *HttpTaskCtx = @ptrCast(@alignCast(caller_ctx));
     std.debug.assert(t.tag == 0x48540001);
@@ -115,11 +121,7 @@ pub fn httpTaskExec(caller_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, [
         return;
     }
 
-    var headers_str: []u8 = "";
-    if (ctx.headers) |list| {
-        headers_str = server.allocator.dupe(u8, list.items) catch "";
-    }
-    defer if (headers_str.len > 0) server.allocator.free(headers_str);
+    const headers_str = responseHeaderItems(if (ctx.headers) |*headers| headers else null);
 
     const response_body = ctx.body orelse {
         logErr("no response body set for conn_id={d}", .{t.conn_id});
@@ -187,4 +189,13 @@ pub fn httpTaskComplete(caller_ctx: ?*anyopaque, _: []const u8) void {
     t.server.shared_fiber_active = false;
     httpTaskRecycle(t);
     t.server.http_ctx_pool.destroy(t);
+}
+
+test "responseHeaderItems borrows header storage" {
+    var headers = std.ArrayList(u8).empty;
+    defer headers.deinit(std.testing.allocator);
+    try headers.appendSlice(std.testing.allocator, "X-Test: ok\r\n");
+
+    try std.testing.expectEqualStrings("X-Test: ok\r\n", responseHeaderItems(&headers));
+    try std.testing.expectEqualStrings("", responseHeaderItems(null));
 }
