@@ -99,6 +99,18 @@ fn drainAvailable(fd: i32, buf: []u8) usize {
     return recv;
 }
 
+fn writeAllRequest(fd: i32, req: []const u8) bool {
+    // 修改原因：高连接数压测时 write 可能短写；半个 HTTP 请求进入连接会污染后续请求，benchmark 必须只统计完整写入。
+    var written_total: usize = 0;
+    while (written_total < req.len) {
+        const raw_written = linux.write(fd, req.ptr + written_total, req.len - written_total);
+        const written: isize = @bitCast(raw_written);
+        if (written <= 0) return false;
+        written_total += @intCast(written);
+    }
+    return true;
+}
+
 fn waitReadable(fds: []const i32, poll_fds: []std.posix.pollfd) bool {
     var count: usize = 0;
     for (fds) |dfd| {
@@ -205,11 +217,7 @@ pub fn main() !void {
     while (round < reqs_per_conn) : (round += 1) {
         for (fds) |fd| {
             if (fd == 0) continue;
-            const raw_written = linux.write(fd, req, req.len);
-            const written: isize = @bitCast(raw_written);
-            if (written == @as(isize, @intCast(req.len))) {
-                sent += 1;
-            }
+            if (writeAllRequest(fd, req)) sent += 1;
         }
         // 修改原因：当前 server 不支持在同一连接中无限 HTTP pipelining，需收齐本轮响应后再发下一轮。
         drainUntil(fds, poll_fds, buf[0..], &recv, sent, DRAIN_IDLE_ROUNDS);
