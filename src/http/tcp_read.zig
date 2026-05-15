@@ -257,25 +257,37 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         }
     }
 
+    var request_buf = effective_buf;
+    if (conn.pool_idx != 0xFFFFFFFF) {
+        const hw_req = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+        if (completeRequestEnd(effective_nread, hw_req.headers_end, hw_req.content_length)) |request_end| {
+            request_buf = effective_buf[0..request_end];
+            if (request_end < effective_nread) {
+                // 修改原因：当前事件循环一次只调度一个 HTTP 请求；同一 read buffer 中的尾随请求若继续 keep-alive 会被静默丢弃并让客户端超时。
+                conn.keep_alive = false;
+            }
+        }
+    }
+
     const path = if (conn.pool_idx != 0xFFFFFFFF) blk: {
         const hw2 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
-        if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= effective_nread)
-            break :blk effective_buf[hw2.path_offset..][0..hw2.path_len];
-        break :blk getPathFromRequest(effective_buf) orelse {
+        if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= request_buf.len)
+            break :blk request_buf[hw2.path_offset..][0..hw2.path_len];
+        break :blk getPathFromRequest(request_buf) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 400, "Bad Request");
             return;
         };
-    } else getPathFromRequest(effective_buf) orelse {
+    } else getPathFromRequest(request_buf) orelse {
         self.buffer_pool.markReplenish(bid);
         conn.read_len = 0;
         self.respond(conn, 400, "Bad Request");
         return;
     };
 
-    if (self.ws_server.hasHandlers() and ws_upgrade.isUpgradeRequest(effective_buf)) {
-        self.tryWsUpgrade(conn_id, conn, path, effective_buf, bid);
+    if (self.ws_server.hasHandlers() and ws_upgrade.isUpgradeRequest(request_buf)) {
+        self.tryWsUpgrade(conn_id, conn, path, request_buf, bid);
         return;
     }
 
@@ -284,7 +296,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         self.respond_middlewares.wildcard.items.len > 0)
     {
         var temp_ctx = Context{
-            .request_data = effective_buf,
+            .request_data = request_buf,
             .path = path,
             .app_ctx = self.app_ctx,
             .allocator = self.allocator,
@@ -400,10 +412,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         self.middlewares.wildcard.items.len > 0 or
         self.handlers.count() > 0;
     if (has_async) {
-        var selected_buf = effective_buf;
+        var selected_buf = request_buf;
         var request_data_owned = false;
         if (pending_to_free != 0) {
-            selected_buf = self.allocator.dupe(u8, effective_buf) catch {
+            selected_buf = self.allocator.dupe(u8, request_buf) catch {
                 self.buffer_pool.markReplenish(conn.read_bid);
                 conn.read_len = 0;
                 self.respond(conn, 500, "Internal Server Error");
@@ -482,6 +494,16 @@ fn headerBufferFullWithoutTerminator(effective_nread: usize, header_limit: usize
     return effective_nread >= header_limit;
 }
 
+fn completeRequestEnd(buffer_len: usize, headers_end: u16, content_length: u64) ?usize {
+    if (headers_end == 0) return null;
+    const header_bytes: usize = headers_end;
+    if (header_bytes > buffer_len) return null;
+    if (content_length > std.math.maxInt(usize) - header_bytes) return null;
+    const end = header_bytes + @as(usize, @intCast(content_length));
+    if (end > buffer_len) return null;
+    return end;
+}
+
 test "large body buffer limit rejects truncation" {
     try std.testing.expect(fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE));
     try std.testing.expect(!fitsLargeBodyBuffer(MAX_BUFFERED_BODY_SIZE + 1));
@@ -519,4 +541,11 @@ test "HTTP work metadata resets between keep-alive requests" {
     try std.testing.expectEqual(@as(u16, 0), hw.path_len);
     try std.testing.expectEqual(@as(u16, 0), hw.headers_end);
     try std.testing.expect(!slot.line1.oversized);
+}
+
+test "completeRequestEnd detects pipelined trailing bytes boundary" {
+    try std.testing.expectEqual(@as(?usize, 12), completeRequestEnd(20, 5, 7));
+    try std.testing.expectEqual(@as(?usize, 5), completeRequestEnd(20, 5, 0));
+    try std.testing.expect(completeRequestEnd(10, 5, 7) == null);
+    try std.testing.expect(completeRequestEnd(10, 0, 0) == null);
 }

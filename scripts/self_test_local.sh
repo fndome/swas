@@ -63,35 +63,6 @@ curl_expect() {
   sleep 0.1
 }
 
-keep_alive_reuse_expect() {
-  local out_file
-  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-keepalive.XXXXXX")"
-
-  (
-    : >"$out_file"
-    exec 3<>"/dev/tcp/127.0.0.1/${EXAMPLE_PORT}"
-    # 修改原因：同一条 keep-alive 连接先发带 body 的 POST，再发无 body 的 GET，可覆盖 per-request Content-Length 残留问题。
-    printf 'POST /missing HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\n{"a":1}' >&3
-    read_http_response "$out_file"
-    printf 'GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
-    timeout 3 cat <&3 >>"$out_file" || true
-    exec 3<&-
-    exec 3>&-
-  ) || {
-    printf 'failed to run keep-alive reuse request\n' >&2
-    cat "$server_log" >&2 || true
-    exit 1
-  }
-
-  if ! grep -Fq 'Not Found' "$out_file" || ! grep -Fq 'Hello from worker' "$out_file"; then
-    printf 'unexpected keep-alive reuse response:\n' >&2
-    cat "$out_file" >&2 || true
-    printf '\nserver log:\n' >&2
-    cat "$server_log" >&2 || true
-    exit 1
-  fi
-}
-
 read_http_response() {
   local out_file="$1"
   local content_length=0
@@ -119,6 +90,133 @@ read_http_response() {
   fi
 }
 
+keep_alive_reuse_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-keepalive.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+
+def read_response(sock):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise RuntimeError("connection closed before headers")
+        data.extend(chunk)
+    head, rest = bytes(data).split(b"\r\n\r\n", 1)
+    content_length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1].strip())
+    while len(rest) < content_length:
+        chunk = sock.recv(content_length - len(rest))
+        if not chunk:
+            raise RuntimeError("connection closed before body")
+        rest += chunk
+    return head + b"\r\n\r\n" + rest[:content_length]
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：同一条 keep-alive 连接先发带 body 的 POST，再发无 body 的 GET，可覆盖 per-request Content-Length 残留问题。
+    sock.sendall(
+        b'POST /missing HTTP/1.1\r\n'
+        b'Host: localhost\r\n'
+        b'Content-Type: application/json\r\n'
+        b'Content-Length: 7\r\n'
+        b'Connection: keep-alive\r\n'
+        b'\r\n'
+        b'{"a":1}'
+    )
+    first = read_response(sock)
+    sock.sendall(b'GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+    chunks = [read_response(sock)]
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(first + b"\n" + b"".join(chunks))
+PY
+  then
+    printf 'failed to run keep-alive reuse request\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'Not Found' "$out_file" || ! grep -Fq 'Hello from worker' "$out_file"; then
+    printf 'unexpected keep-alive reuse response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
+pipelined_extra_bytes_close_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-pipeline.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+payload = (
+    b'POST /http-method HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Content-Type: application/json\r\n'
+    b'Content-Length: 7\r\n'
+    b'Connection: keep-alive\r\n'
+    b'\r\n'
+    b'{"a":1}'
+    b'GET /hello HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Connection: close\r\n'
+    b'\r\n'
+)
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：当前服务端一次只处理一个 HTTP 请求；同一 read buffer 里若带尾随请求，必须关闭连接避免客户端等待被丢弃的第二响应。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            sys.exit(2)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'pipelined request did not close after first response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq '"method":"POST"' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected pipelined request response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -135,6 +233,7 @@ fi
 require_cmd curl
 require_cmd ss
 require_cmd timeout
+require_cmd python3
 
 log "environment"
 uname -a || true
@@ -206,6 +305,9 @@ curl_expect PATCH /http-method '"body":{"patch":true}' '{"patch":true}'
 
 log "keep-alive reuse request test"
 keep_alive_reuse_expect
+
+log "pipelined extra bytes close test"
+pipelined_extra_bytes_close_expect
 
 cleanup
 SERVER_PID=""
