@@ -138,9 +138,8 @@ fn drainUntil(fds: []const i32, poll_fds: []std.posix.pollfd, buf: []u8, recv: *
 }
 
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{ .verbose_log = false }){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // 修改原因：benchmark 目标是测 HTTP/io_uring 路径，不应把 DebugAllocator 的检查开销计入 QPS。
+    const alloc = std.heap.c_allocator;
 
     const port = readPortEnv(DEFAULT_PORT);
     const conns = readUsizeEnv("SWS_BENCH_CONNS", DEFAULT_CONNS);

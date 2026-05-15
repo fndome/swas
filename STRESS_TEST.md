@@ -48,8 +48,9 @@ SWS_BENCH_CONNS=500 SWS_BENCH_REQS_PER_CONN=1000 SWS_BENCH_PORT=19090 ./zig-out/
 
 结果解读：
 
-- `Debug` 构建、`DebugAllocator`、小请求数、客户端和服务端同机都会压低 QPS。
+- `Debug` 构建、小请求数、客户端和服务端同机都会压低 QPS。
 - `ReleaseFast` 只能减少程序自身开销，仍不能消除同机压测的 CPU 和调度竞争。
+- `im_bench` 使用 libc allocator，避免把 DebugAllocator 的检查开销算进 server QPS。
 - 严肃对比需要独立压测机、固定内核参数、固定连接数、固定请求总数，并记录 `ulimit -n`、端口范围、CPU governor、CPU/内存占用。
 
 ## 1. Server Ring A
