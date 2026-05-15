@@ -89,6 +89,8 @@ pub fn computeAcceptKey(key: []const u8, buf: *[29]u8) !void {
     const Sha1 = std.crypto.hash.Sha1;
     const max_key_len: usize = 128 - websocket_magic.len;
     if (key.len > max_key_len) return error.KeyTooLong;
+    // 修改原因：computeAcceptKey 是 public API，不能只依赖调用方先跑 isUpgradeRequest；非法 nonce 不应生成 101 Accept。
+    if (!isValidWsKey(key)) return error.InvalidKey;
 
     var concat: [128]u8 = undefined;
     @memcpy(concat[0..key.len], key);
@@ -163,6 +165,14 @@ test "isUpgradeRequest rejects duplicate Sec-WebSocket-Key" {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     try std.testing.expect(!isUpgradeRequest(duplicate_key));
+}
+
+test "computeAcceptKey validates WebSocket nonce" {
+    var accept: [29]u8 = undefined;
+
+    try computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", &accept);
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept[0..28]);
+    try std.testing.expectError(error.InvalidKey, computeAcceptKey("not-a-valid-websocket-key", &accept));
 }
 
 test "isUpgradeRequest requires GET HTTP/1.1 request line" {
