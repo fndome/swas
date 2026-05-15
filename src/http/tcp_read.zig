@@ -209,6 +209,18 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             self.respond(conn, 413, "Content Too Large");
             return;
         }
+        if (pending_to_free != 0) {
+            // 修改原因：header 跨 TCP 分片时 effective_buf 是栈上重组副本；进入异步 body 读取后必须保存完整请求头，否则完成 body 后会只看到第二片并误路由。
+            const header_copy = self.allocator.dupe(u8, effective_buf[0..headers_end]) catch {
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                conn.keep_alive = false;
+                self.respond(conn, 500, "Internal Server Error");
+                return;
+            };
+            slot.line3.pending_buffer_ptr = @intFromPtr(header_copy.ptr);
+            hw4.header_len = @intCast(header_copy.len);
+        }
         if (headers_end >= effective_nread) {
             const large_buf = self.large_pool.acquire() orelse {
                 self.buffer_pool.markReplenish(bid);

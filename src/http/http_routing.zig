@@ -18,6 +18,7 @@ const logErr = helpers.logErr;
 const ws_upgrade = @import("../ws/upgrade.zig");
 const http_fiber = @import("http_fiber.zig");
 const http_response = @import("http_response.zig");
+const sticker = @import("../stack_pool_sticker.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
 const Next = @import("../next/next.zig").Next;
 const HttpTaskCtx = http_fiber.HttpTaskCtx;
@@ -173,8 +174,32 @@ pub fn ws(self: *AsyncServer, path: []const u8, handler: WsHandler) !void {
 
 pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, body_buf: []u8) void {
     const bid = conn.read_bid;
-    const header_buf = self.buffer_pool.getReadBuf(bid);
-    const effective_buf = header_buf;
+    const slot = if (conn.pool_idx != 0xFFFFFFFF) &self.pool.slots[conn.pool_idx] else null;
+    var owned_request_data: ?[]u8 = null;
+    const effective_buf: []const u8 = blk: {
+        if (slot) |s| {
+            if (s.line3.pending_buffer_ptr != 0) {
+                const hw = sticker.httpWork(s);
+                const header_len: usize = hw.header_len;
+                const saved = @as([*]u8, @ptrFromInt(s.line3.pending_buffer_ptr))[0..header_len];
+                s.line3.pending_buffer_ptr = 0;
+                // 修改原因：跨分片 header 进入异步 body 读取前会被复制到堆上；这里接管所有权，确保路由看到完整请求行。
+                owned_request_data = saved;
+                break :blk saved;
+            }
+        }
+        const header_buf = self.buffer_pool.getReadBuf(bid);
+        if (slot) |s| {
+            const hw = sticker.httpWork(s);
+            if (hw.header_len > 0 and hw.header_len <= header_buf.len) {
+                break :blk header_buf[0..hw.header_len];
+            }
+        }
+        break :blk header_buf;
+    };
+    defer {
+        if (owned_request_data) |saved| self.allocator.free(saved);
+    }
     const path = getPathFromRequest(effective_buf) orelse {
         self.buffer_pool.markReplenish(bid);
         self.large_pool.release(body_buf);
@@ -306,6 +331,7 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
         self.middlewares.wildcard.items.len > 0 or
         self.handlers.count() > 0;
     if (has_async) {
+        const request_data_owned = owned_request_data != null;
         const method_str = getMethodFromRequest(effective_buf) orelse "POST";
         const t = self.http_ctx_pool.create(self.allocator) catch {
             self.buffer_pool.markReplenish(bid);
@@ -323,8 +349,10 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
             .method_len = method_cap,
             .path_len = path_cap,
             .request_data = @constCast(effective_buf),
+            .request_data_owned = request_data_owned,
             .body_data = @constCast(body_buf),
         };
+        if (request_data_owned) owned_request_data = null;
         @memcpy(t.method_buf[0..method_cap], method_str[0..method_cap]);
         @memcpy(t.path_buf[0..path_cap], path[0..path_cap]);
 

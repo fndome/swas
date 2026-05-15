@@ -348,6 +348,14 @@ pub const AsyncServer = struct {
                 // Release large_pool buffer if connection still holds one
                 if (conn.pool_idx != 0xFFFFFFFF) {
                     const slot = &self.pool.slots[conn.pool_idx];
+                    if (slot.line3.pending_buffer_ptr != 0) {
+                        const hw = sticker.httpWork(slot);
+                        const saved: []u8 = @as([*]u8, @ptrFromInt(slot.line3.pending_buffer_ptr))[0..hw.header_len];
+                        // 修改原因：服务器退出时也要释放等待 body 的跨分片 header 副本，避免 deinit 路径泄漏。
+                        self.allocator.free(saved);
+                        slot.line3.pending_buffer_ptr = 0;
+                        hw.header_len = 0;
+                    }
                     if (slot.line3.large_buf_ptr != 0) {
                         const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
                         self.large_pool.release(buf);

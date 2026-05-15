@@ -44,6 +44,14 @@ pub fn closeConn(self: *AsyncServer, conn_id: u64, fd: i32) void {
 
         if (conn.pool_idx != 0xFFFFFFFF) {
             const slot = &self.pool.slots[conn.pool_idx];
+            if (slot.line3.pending_buffer_ptr != 0) {
+                const hw = sticker.httpWork(slot);
+                const saved: []u8 = @as([*]u8, @ptrFromInt(slot.line3.pending_buffer_ptr))[0..hw.header_len];
+                // 修改原因：跨分片 header 可能在等待 body 时暂存到堆上；异常关闭必须释放，避免半包请求泄漏。
+                self.allocator.free(saved);
+                slot.line3.pending_buffer_ptr = 0;
+                hw.header_len = 0;
+            }
             if (slot.line3.large_buf_ptr != 0) {
                 const buf: []u8 = @as([*]u8, @ptrFromInt(slot.line3.large_buf_ptr))[0..slot.line3.large_buf_len];
                 self.large_pool.release(buf);

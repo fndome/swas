@@ -160,6 +160,60 @@ PY
   fi
 }
 
+split_header_body_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-split-body.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：请求头跨 TCP 分片且 body 另一次到达时，服务端必须保留重组后的完整请求行用于路由。
+    sock.sendall(b'POST /htt')
+    time.sleep(0.05)
+    sock.sendall(
+        b'p-method HTTP/1.1\r\n'
+        b'Host: localhost\r\n'
+        b'Content-Type: application/json\r\n'
+        b'Content-Length: 7\r\n'
+        b'Connection: close\r\n'
+        b'\r\n'
+    )
+    time.sleep(0.05)
+    sock.sendall(b'{"a":1}')
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'split header/body request did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq '"method":"POST"' "$out_file" || ! grep -Fq '"body":{"a":1}' "$out_file"; then
+    printf 'unexpected split header/body response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 pipelined_extra_bytes_close_expect() {
   local out_file
   out_file="$(mktemp "${TMPDIR:-/tmp}/sws-pipeline.XXXXXX")"
@@ -357,6 +411,9 @@ curl_expect PATCH /http-method '"body":{"patch":true}' '{"patch":true}'
 
 log "keep-alive reuse request test"
 keep_alive_reuse_expect
+
+log "split header/body request test"
+split_header_body_expect
 
 log "pipelined extra bytes close test"
 pipelined_extra_bytes_close_expect
