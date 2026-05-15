@@ -367,6 +367,8 @@ pub const AsyncServer = struct {
         if (self.user_map) |*um| um.deinit();
         self.deferred_hooks.deinit(self.allocator);
         self.tick_hooks.deinit(self.allocator);
+        // 修改原因：DnsResolver.deinit 会从 io_registry 中移除 dns_ud，必须早于 io_registry.deinit，否则 ReleaseFast 退出会访问已释放的 hashmap。
+        self.dns_resolver.deinit();
         self.io_registry.deinit();
         self.submit_registry.deinit();
         self.ring.deinit();
@@ -385,7 +387,6 @@ pub const AsyncServer = struct {
         self.http_ctx_pool.deinit(self.allocator);
         self.ws_ctx_pool.deinit(self.allocator);
         self.allocator.free(self.shared_fiber_stack);
-        self.dns_resolver.deinit();
         self.pending_writes.deinit(self.allocator);
         self.cfg = undefined;
     }
