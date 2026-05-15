@@ -23,11 +23,14 @@ pub fn parseFrame(data: []u8) !Frame {
     if (payload_len == 126) {
         if (data.len < 4) return error.IncompleteFrame;
         payload_len = std.mem.readInt(u16, data[2..4], .big);
+        // 修改原因：RFC 6455 要求 payload length 使用最短编码；接受非最短编码会放宽协议边界并绕过长度分支校验。
+        if (payload_len < 126) return error.InvalidFrame;
         offset = 4;
     } else if (payload_len == 127) {
         if (data.len < 10) return error.IncompleteFrame;
         payload_len = std.mem.readInt(u64, data[2..10], .big);
         if (payload_len & 0x8000_0000_0000_0000 != 0) return error.InvalidFrame;
+        if (payload_len <= 0xFFFF) return error.InvalidFrame;
         offset = 10;
     }
 
@@ -71,6 +74,14 @@ test "parseFrame rejects invalid client control frames" {
 
     var one_byte_close = [_]u8{ 0x88, 0x81, 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.InvalidFrame, parseFrame(&one_byte_close));
+}
+
+test "parseFrame rejects non-minimal payload length encoding" {
+    var small_as_126 = [_]u8{ 0x81, 0xFE, 0, 125 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&small_as_126));
+
+    var medium_as_127 = [_]u8{ 0x81, 0xFF, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&medium_as_127));
 }
 
 test "control frames allow the RFC maximum payload" {
