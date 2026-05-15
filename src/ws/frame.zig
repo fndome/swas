@@ -58,8 +58,25 @@ pub fn parseFrame(data: []u8) !Frame {
     if (mask) {
         maskPayload(payload, mask_key);
     }
+    if (opcode == .close and payload.len >= 2) {
+        const code = std.mem.readInt(u16, payload[0..2], .big);
+        // 修改原因：Close 帧状态码有保留区间；未校验会把非法关闭原因交给业务层，破坏 WebSocket 协议边界。
+        if (!isValidCloseCode(code)) return error.InvalidFrame;
+    }
 
     return Frame{ .opcode = opcode, .fin = fin, .payload = payload };
+}
+
+fn isValidCloseCode(code: u16) bool {
+    if (code < 1000) return false;
+    if (code >= 1000 and code <= 1015) {
+        return switch (code) {
+            1004, 1005, 1006, 1015 => false,
+            else => true,
+        };
+    }
+    if (code >= 3000 and code <= 4999) return true;
+    return false;
 }
 
 test "parseFrame rejects invalid client control frames" {
@@ -74,6 +91,9 @@ test "parseFrame rejects invalid client control frames" {
 
     var one_byte_close = [_]u8{ 0x88, 0x81, 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.InvalidFrame, parseFrame(&one_byte_close));
+
+    var invalid_close_code = [_]u8{ 0x88, 0x82, 0, 0, 0, 0, 0x03, 0xE7 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&invalid_close_code));
 }
 
 test "parseFrame rejects non-minimal payload length encoding" {
