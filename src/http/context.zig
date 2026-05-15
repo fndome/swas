@@ -9,12 +9,20 @@ fn isHeaderNameChar(ch: u8) bool {
         std.mem.indexOfScalar(u8, token_symbols, ch) != null;
 }
 
+fn isManagedResponseHeader(key: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(key, "content-length") or
+        std.ascii.eqlIgnoreCase(key, "connection") or
+        std.ascii.eqlIgnoreCase(key, "content-type") or
+        std.ascii.eqlIgnoreCase(key, "transfer-encoding");
+}
+
 fn validateResponseHeader(key: []const u8, value: []const u8) !void {
-    // 修改原因：setHeader 会直接序列化到响应头，必须拒绝非法名字和 CR/LF，避免业务输入触发响应头注入。
+    // 修改原因：setHeader 会直接序列化到响应头，必须拒绝非法名字、CR/LF 和框架自动生成的头，避免注入与重复边界头。
     if (key.len == 0) return error.InvalidHeader;
     for (key) |ch| {
         if (!isHeaderNameChar(ch)) return error.InvalidHeader;
     }
+    if (isManagedResponseHeader(key)) return error.InvalidHeader;
     for (value) |ch| {
         if (ch == '\r' or ch == '\n') return error.InvalidHeader;
     }
@@ -222,6 +230,8 @@ test "Context.setHeader rejects response header injection" {
     try ctx.setHeader("X-Test", "ok");
     try std.testing.expectError(error.InvalidHeader, ctx.setHeader("Bad:Name", "ok"));
     try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X-Test", "ok\r\nX-Injected: yes"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("Content-Length", "999"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("Connection", "close"));
 }
 
 test "Context.requestBody prefers oversized body storage" {
