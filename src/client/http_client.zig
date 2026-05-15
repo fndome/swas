@@ -25,6 +25,39 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
+fn isHttpTokenChar(ch: u8) bool {
+    const token_symbols = "!#$%&'*+-.^_`|~";
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        std.mem.indexOfScalar(u8, token_symbols, ch) != null;
+}
+
+fn isCtlOrSpace(ch: u8) bool {
+    return ch <= ' ' or ch == 0x7f;
+}
+
+fn validateMethod(method: []const u8) !void {
+    if (method.len == 0) return error.InvalidMethod;
+    for (method) |ch| {
+        if (!isHttpTokenChar(ch)) return error.InvalidMethod;
+    }
+}
+
+fn validateUrlHost(host: []const u8) !void {
+    if (host.len == 0) return error.InvalidUrl;
+    for (host) |ch| {
+        if (isCtlOrSpace(ch)) return error.InvalidUrl;
+    }
+}
+
+fn validateRequestTarget(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidUrl;
+    for (path) |ch| {
+        if (isCtlOrSpace(ch)) return error.InvalidUrl;
+    }
+}
+
 fn firstPathOrQueryIndex(rest: []const u8) ?usize {
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const query = std.mem.indexOfScalar(u8, rest, '?');
@@ -58,7 +91,9 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     const path = if (path_start) |p| stripFragmentTarget(rest[p..]) else "/";
     const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
     const host = if (colon) |c| host_port[0..c] else host_port;
-    if (host.len == 0) return error.InvalidUrl;
+    // 修改原因：host 和 request-target 会直接拼进请求行/Host 头，必须拒绝 CR/LF/空白控制字符，避免请求头注入。
+    try validateUrlHost(host);
+    try validateRequestTarget(path);
     const port: u16 = if (colon) |c| blk: {
         const port_text = host_port[c + 1 ..];
         // 修改原因：显式端口写错时不能静默回退到 80，否则请求会发到错误上游。
@@ -431,6 +466,14 @@ fn isManagedRequestHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
+fn validateHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!isHttpTokenChar(ch)) return false;
+    }
+    return true;
+}
+
 fn validateCallerHeaders(headers: []const u8) !void {
     // 修改原因：客户端自己生成 Host/Content-Length/Connection；允许调用方重复或提前插入空行会造成请求走私或 body 边界错误。
     if (headers.len == 0) return;
@@ -439,10 +482,14 @@ fn validateCallerHeaders(headers: []const u8) !void {
         const rel_end = std.mem.indexOfScalar(u8, headers[start..], '\n');
         const end = if (rel_end) |idx| start + idx else headers.len;
         const line = std.mem.trimRight(u8, headers[start..end], "\r");
+        // 修改原因：headers 会原样拼接进请求；行内 CR/控制字符会变成请求头注入或畸形报文，必须在客户端边界拒绝。
+        for (line) |ch| {
+            if (ch == '\r' or (ch < ' ' and ch != '\t') or ch == 0x7f) return error.InvalidHeaders;
+        }
         if (line.len == 0) return error.InvalidHeaders;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeaders;
         const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (name.len == 0 or isManagedRequestHeader(name)) return error.InvalidHeaders;
+        if (!validateHeaderName(name) or isManagedRequestHeader(name)) return error.InvalidHeaders;
         if (rel_end) |_| {
             start = end + 1;
         } else {
@@ -458,6 +505,9 @@ fn requestTargetPrefix(path: []const u8) []const u8 {
 }
 
 fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
+    try validateMethod(method);
+    try validateUrlHost(host);
+    try validateRequestTarget(path);
     if (headers) |h| try validateCallerHeaders(h);
     const target_prefix = requestTargetPrefix(path);
     if (body) |b| {
@@ -673,6 +723,11 @@ test "HttpClient buildRequest rejects managed caller headers" {
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "Host: other.example", null));
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "POST", "/", "example.com", "Transfer-Encoding: chunked", "{}"));
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\r\n\r\nX-After: injected", null));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "Bad Name: ok", null));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\rX-Injected: yes", null));
+    try std.testing.expectError(error.InvalidMethod, buildRequest(&buf, "GET\r\nX-Bad: yes", "/", "example.com", null, null));
+    try std.testing.expectError(error.InvalidUrl, buildRequest(&buf, "GET", "/\r\nX-Bad: yes", "example.com", null, null));
+    try std.testing.expectError(error.InvalidUrl, buildRequest(&buf, "GET", "/", "example.com\r\nX-Bad: yes", null, null));
 }
 
 test "HttpClient responseCompleteLen waits for Content-Length body" {
@@ -729,6 +784,9 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:abc/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://:8080/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com\r\nX-Bad: yes/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com/path\r\nX-Bad: yes"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com/a b"));
 
     const parsed = try parseUrl(std.testing.allocator, "http://example.com:8080/path");
     defer std.testing.allocator.free(parsed.host);
