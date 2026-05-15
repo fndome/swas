@@ -173,7 +173,14 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         }
         if (helpers.extractHeader(effective_buf, "Content-Length")) |val| {
             // 修改原因：HTTP header 名大小写不敏感，lowercase content-length 也必须生效。
-            hw.content_length = std.fmt.parseInt(u64, val, 10) catch 0;
+            hw.content_length = parseContentLength(val) catch {
+                // 修改原因：非法 Content-Length 不能按无 body 继续处理，否则坏请求会进入 handler 并污染 keep-alive 连接。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                conn.keep_alive = false;
+                self.respond(conn, 400, "Bad Request");
+                return;
+            };
         }
         if (hw.content_length > OVERSIZED_THRESHOLD) {
             self.pool.slots[conn.pool_idx].line1.oversized = true;
@@ -494,6 +501,15 @@ fn headerBufferFullWithoutTerminator(effective_nread: usize, header_limit: usize
     return effective_nread >= header_limit;
 }
 
+fn parseContentLength(value: []const u8) !u64 {
+    // 修改原因：Content-Length 只能是十进制数字；解析失败时当成 0 会让带 body 的坏请求进入业务逻辑。
+    if (value.len == 0) return error.InvalidContentLength;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.InvalidContentLength;
+    }
+    return std.fmt.parseInt(u64, value, 10) catch error.InvalidContentLength;
+}
+
 fn completeRequestEnd(buffer_len: usize, headers_end: u16, content_length: u64) ?usize {
     if (headers_end == 0) return null;
     const header_bytes: usize = headers_end;
@@ -548,4 +564,11 @@ test "completeRequestEnd detects pipelined trailing bytes boundary" {
     try std.testing.expectEqual(@as(?usize, 5), completeRequestEnd(20, 5, 0));
     try std.testing.expect(completeRequestEnd(10, 5, 7) == null);
     try std.testing.expect(completeRequestEnd(10, 0, 0) == null);
+}
+
+test "parseContentLength rejects malformed values" {
+    try std.testing.expectEqual(@as(u64, 12), try parseContentLength("12"));
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength(""));
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength("abc"));
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength("12x"));
 }
