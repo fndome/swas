@@ -10,6 +10,7 @@ pub fn isUpgradeRequest(data: []const u8) bool {
     var has_upgrade = false;
     var has_connection_upgrade = false;
     var has_ws_key = false;
+    var ws_key_count: u8 = 0;
     var has_ws_version = false;
     var lines = std.mem.splitSequence(u8, data, "\r\n");
     while (lines.next()) |line| {
@@ -28,6 +29,9 @@ pub fn isUpgradeRequest(data: []const u8) bool {
             }
         }
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Key:")) {
+            // 修改原因：后续 extractWsKey 只取第一个 key；重复 key 会让校验值和实际握手值不一致，必须拒绝。
+            ws_key_count += 1;
+            if (ws_key_count > 1) return false;
             const value = std.mem.trim(u8, line["Sec-WebSocket-Key:".len..], " \t\r\n");
             // 修改原因：Sec-WebSocket-Key 必须是 base64 后的 16 字节 nonce；只检查存在会接受非法握手。
             has_ws_key = isValidWsKey(value);
@@ -147,6 +151,18 @@ test "isUpgradeRequest validates Sec-WebSocket-Key nonce" {
         "Sec-WebSocket-Key: YWJj\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     try std.testing.expect(!isUpgradeRequest(wrong_decoded_len));
+}
+
+test "isUpgradeRequest rejects duplicate Sec-WebSocket-Key" {
+    const duplicate_key =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: not-a-valid-websocket-key\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    try std.testing.expect(!isUpgradeRequest(duplicate_key));
 }
 
 test "isUpgradeRequest requires GET HTTP/1.1 request line" {
