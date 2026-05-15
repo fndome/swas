@@ -123,7 +123,9 @@ fn parseNameserverLine(line: []const u8) ?u32 {
     const rest = trimmed[keyword.len..];
     // 修改原因：resolv.conf 允许用任意空白分隔关键字和值，不能只识别单个空格。
     if (rest.len == 0 or (rest[0] != ' ' and rest[0] != '\t')) return null;
-    const ip_str = std.mem.trim(u8, rest, " \t\r");
+    // 修改原因：nameserver 行允许在地址后继续写空白和注释，解析 IP 时只能取第一个字段。
+    var fields = std.mem.tokenizeAny(u8, std.mem.trim(u8, rest, " \t\r"), " \t\r");
+    const ip_str = fields.next() orelse return null;
     return parseIpv4(ip_str) catch null;
 }
 
@@ -171,5 +173,6 @@ test "extractHeader supports LF-only request headers" {
 test "parseNameserverLine accepts whitespace separated resolv.conf entries" {
     try std.testing.expectEqual(try parseIpv4("1.1.1.1"), parseNameserverLine("nameserver\t1.1.1.1").?);
     try std.testing.expectEqual(try parseIpv4("8.8.8.8"), parseNameserverLine("  nameserver   8.8.8.8  ").?);
+    try std.testing.expectEqual(try parseIpv4("1.1.1.1"), parseNameserverLine("nameserver 1.1.1.1 # cloudflare").?);
     try std.testing.expect(parseNameserverLine("nameserverfoo 9.9.9.9") == null);
 }
