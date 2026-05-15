@@ -63,6 +63,62 @@ curl_expect() {
   sleep 0.1
 }
 
+keep_alive_reuse_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-keepalive.XXXXXX")"
+
+  (
+    : >"$out_file"
+    exec 3<>"/dev/tcp/127.0.0.1/${EXAMPLE_PORT}"
+    # 修改原因：同一条 keep-alive 连接先发带 body 的 POST，再发无 body 的 GET，可覆盖 per-request Content-Length 残留问题。
+    printf 'POST /missing HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\n{"a":1}' >&3
+    read_http_response "$out_file"
+    printf 'GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
+    timeout 3 cat <&3 >>"$out_file" || true
+    exec 3<&-
+    exec 3>&-
+  ) || {
+    printf 'failed to run keep-alive reuse request\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  }
+
+  if ! grep -Fq 'Not Found' "$out_file" || ! grep -Fq 'Hello from worker' "$out_file"; then
+    printf 'unexpected keep-alive reuse response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
+read_http_response() {
+  local out_file="$1"
+  local content_length=0
+  local saw_blank=0
+  local line clean
+
+  while IFS= read -r -t 3 line <&3; do
+    printf '%s\n' "$line" >>"$out_file"
+    clean="${line%$'\r'}"
+    if [[ "$clean" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+) ]]; then
+      content_length="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$clean" ]]; then
+      saw_blank=1
+      break
+    fi
+  done
+
+  if (( saw_blank == 0 )); then
+    return 1
+  fi
+  if (( content_length > 0 )); then
+    dd bs=1 count="$content_length" <&3 >>"$out_file" 2>/dev/null
+    printf '\n' >>"$out_file"
+  fi
+}
+
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -78,6 +134,7 @@ fi
 
 require_cmd curl
 require_cmd ss
+require_cmd timeout
 
 log "environment"
 uname -a || true
@@ -146,6 +203,9 @@ curl_expect DELETE /http-method '"method":"DELETE"'
 curl_expect POST /http-method '"body":{"post":true}' '{"post":true}'
 curl_expect PUT /http-method '"body":{"put":true}' '{"put":true}'
 curl_expect PATCH /http-method '"body":{"patch":true}' '{"patch":true}'
+
+log "keep-alive reuse request test"
+keep_alive_reuse_expect
 
 cleanup
 SERVER_PID=""

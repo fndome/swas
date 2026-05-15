@@ -15,6 +15,8 @@ const ws_upgrade = @import("../ws/upgrade.zig");
 const http_fiber = @import("http_fiber.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
 const milliTimestamp = @import("event_loop.zig").milliTimestamp;
+const StackSlot = @import("../stack_pool.zig").StackSlot;
+const HttpWork = @import("../stack_pool.zig").HttpWork;
 const OVERSIZED_THRESHOLD = @import("../stack_pool.zig").OVERSIZED_THRESHOLD;
 const BUFFER_SIZE = @import("../constants.zig").BUFFER_SIZE;
 const READ_BUF_GROUP_ID = @import("../constants.zig").READ_BUF_GROUP_ID;
@@ -28,6 +30,14 @@ const httpTaskComplete = http_fiber.httpTaskComplete;
 
 fn prepareReadSubmission(conn: *Connection) void {
     conn.read_buf_recycled = false;
+}
+
+fn resetHttpWorkForRequest(slot: *StackSlot) *HttpWork {
+    const hw = sticker.httpWork(slot);
+    // 修改原因：keep-alive 复用同一 slot，Content-Length/path 等元数据必须按请求重置，不能继承上一轮 POST。
+    hw.* = .{};
+    slot.line1.oversized = false;
+    return hw;
 }
 
 pub fn submitRead(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
@@ -138,11 +148,10 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         self.pool.slots[conn.pool_idx].line2.last_active_ms = now_ms;
         conn.last_active_ms = now_ms;
 
-        const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
+        const slot = &self.pool.slots[conn.pool_idx];
+        const hw = resetHttpWorkForRequest(slot);
         hw.header_len = @intCast(@min(effective_nread, 65535));
         hw.method = if (effective_nread > 0) effective_buf[0] else 'G';
-        hw.pending_bid = 0;
-        hw.pending_len = 0;
         if (std.mem.indexOfScalar(u8, effective_buf, ' ')) |sp1| {
             const after_method = sp1 + 1;
             if (after_method < effective_nread) {
@@ -488,4 +497,26 @@ test "submitRead preparation resets recycled marker for next CQE" {
     var conn = Connection{ .read_buf_recycled = true };
     prepareReadSubmission(&conn);
     try std.testing.expect(!conn.read_buf_recycled);
+}
+
+test "HTTP work metadata resets between keep-alive requests" {
+    var slot = StackSlot{
+        .line1 = .{},
+        .line2 = .{},
+        .line3 = .{},
+        .line4 = .{},
+        .line5 = .{},
+    };
+    var hw = sticker.httpWork(&slot);
+    hw.content_length = 7;
+    hw.path_offset = 5;
+    hw.path_len = 12;
+    hw.headers_end = 42;
+    slot.line1.oversized = true;
+
+    hw = resetHttpWorkForRequest(&slot);
+    try std.testing.expectEqual(@as(u64, 0), hw.content_length);
+    try std.testing.expectEqual(@as(u16, 0), hw.path_len);
+    try std.testing.expectEqual(@as(u16, 0), hw.headers_end);
+    try std.testing.expect(!slot.line1.oversized);
 }
