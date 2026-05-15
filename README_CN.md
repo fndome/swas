@@ -2,6 +2,31 @@
 
 基于 Linux `io_uring` 的单线程 HTTP + WebSocket 服务器，Zig 0.16.0。
 
+## 项目目标
+
+`sws` 不应该只被理解成一个 `req/s` 演示。它更像是一个 Linux 专用的
+轻量网络运行时：用 Zig、`io_uring`、fiber、显式 buffer 所有权和单 IO
+线程事件循环，把 HTTP、WebSocket、DNS、出站 HTTP client、连接池这些路径
+放在一个可审计的底层框架里。
+
+当前目标按优先级分三层：
+
+1. **正确性优先**：HTTP/1.1、WebSocket、DNS、keep-alive、请求/响应头、
+   body 边界和异常请求必须有清晰行为。
+2. **可验证**：固定自测覆盖 `GET/POST/PUT/PATCH/DELETE`、JSON body、
+   keep-alive、WebSocket、非法请求、DNS 异常和小规模 benchmark。
+3. **有清晰定位**：Linux + `io_uring` 专用，HTTP/1.1 + WebSocket + 出站
+   HTTP client；暂不内建 TLS，需要前置 TLS 代理或后续单独实现 TLS 层。
+
+本机自测里的 QPS 只能说明“小规模正确性和稳定性”。客户端和服务端在同一台
+机器上竞争 CPU，默认 benchmark 也只有 `50 x 100` 个 keep-alive 请求。要做
+更接近性能上限的测试，请使用 ReleaseFast 并显式放大连接数和请求数：
+
+```bash
+zig build -Doptimize=ReleaseFast
+SWS_BENCH_CONNS=500 SWS_BENCH_REQS_PER_CONN=1000 ./zig-out/bin/im-bench
+```
+
 ```
 IO 线程（io_uring Ring A + fiber）:
   ├── accept/read/write CQE → fiber → handler → 发响应

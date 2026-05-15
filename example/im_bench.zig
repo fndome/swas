@@ -38,18 +38,18 @@
 //   # Small smoke test (50 conns, 5k reqs, keep-alive)
 //   SWS_BENCH_PORT=19090 zig build run-im-bench
 //
-//   # Scale test (↑ CONNS, REQS_PER_CONN in this file)
+//   # Scale test
 //   # Monitor: htop, ss -s, free -h, cat /proc/sys/fs/file-nr
 //
-//   SWS_BENCH_PORT=19090 ./zig-out/bin/im-bench
+//   SWS_BENCH_CONNS=500 SWS_BENCH_REQS_PER_CONN=1000 SWS_BENCH_PORT=19090 ./zig-out/bin/im-bench
 const std = @import("std");
 const linux = std.os.linux;
 const sws = @import("sws");
 const AsyncServer = sws.AsyncServer;
 
 const DEFAULT_PORT = 19090;
-const CONNS = 50;
-const REQS_PER_CONN = 100;
+const DEFAULT_CONNS = 50;
+const DEFAULT_REQS_PER_CONN = 100;
 const DRAIN_IDLE_ROUNDS = 20;
 const DRAIN_POLL_TIMEOUT_MS = 10;
 const RESPONSE_MARKER = "{\"ok\":true}";
@@ -81,6 +81,13 @@ fn readPortEnv(default_port: u16) u16 {
     return std.fmt.parseInt(u16, std.mem.span(raw), 10) catch default_port;
 }
 
+fn readUsizeEnv(comptime name: [:0]const u8, default_value: usize) usize {
+    const raw = std.c.getenv(name) orelse return default_value;
+    // 修改原因：benchmark 需要区分小烟测和放大压测，连接数/请求数不能硬编码在源码里。
+    const parsed = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return default_value;
+    return if (parsed == 0) default_value else parsed;
+}
+
 fn drainAvailable(fd: i32, buf: []u8) usize {
     var recv: usize = 0;
     while (true) {
@@ -92,8 +99,7 @@ fn drainAvailable(fd: i32, buf: []u8) usize {
     return recv;
 }
 
-fn waitReadable(fds: []const i32) bool {
-    var poll_fds: [CONNS]std.posix.pollfd = undefined;
+fn waitReadable(fds: []const i32, poll_fds: []std.posix.pollfd) bool {
     var count: usize = 0;
     for (fds) |dfd| {
         if (dfd == 0) continue;
@@ -108,7 +114,7 @@ fn waitReadable(fds: []const i32) bool {
     return (std.posix.poll(poll_fds[0..count], DRAIN_POLL_TIMEOUT_MS) catch return false) != 0;
 }
 
-fn drainUntil(fds: []const i32, buf: []u8, recv: *usize, target: usize, max_idle_rounds: usize) void {
+fn drainUntil(fds: []const i32, poll_fds: []std.posix.pollfd, buf: []u8, recv: *usize, target: usize, max_idle_rounds: usize) void {
     var idle_rounds: usize = 0;
     while (recv.* < target and idle_rounds < max_idle_rounds) {
         var progressed = false;
@@ -122,7 +128,7 @@ fn drainUntil(fds: []const i32, buf: []u8, recv: *usize, target: usize, max_idle
             idle_rounds = 0;
         } else {
             // 修改原因：固定 sleep 10ms 会把 100 轮 smoke benchmark 人为限制在约 5k req/s；poll 可在响应到达时立即继续。
-            if (waitReadable(fds)) {
+            if (waitReadable(fds, poll_fds)) {
                 idle_rounds = 0;
             } else {
                 idle_rounds += 1;
@@ -137,6 +143,8 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     const port = readPortEnv(DEFAULT_PORT);
+    const conns = readUsizeEnv("SWS_BENCH_CONNS", DEFAULT_CONNS);
+    const reqs_per_conn = readUsizeEnv("SWS_BENCH_REQS_PER_CONN", DEFAULT_REQS_PER_CONN);
     const addr = try std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port});
     defer alloc.free(addr);
 
@@ -160,9 +168,14 @@ pub fn main() !void {
     const t0 = nowMs();
 
     // connect clients
-    var fds: [CONNS]i32 = [_]i32{0} ** CONNS;
+    const fds = try alloc.alloc(i32, conns);
+    defer alloc.free(fds);
+    @memset(fds, 0);
+    const poll_fds = try alloc.alloc(std.posix.pollfd, conns);
+    defer alloc.free(poll_fds);
+
     var connected: usize = 0;
-    for (&fds) |*fd| {
+    for (fds) |*fd| {
         const raw = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         if (raw < 0) continue;
         const fd_val: i32 = @intCast(raw);
@@ -190,8 +203,8 @@ pub fn main() !void {
 
     const t_send0 = nowMs();
     var round: usize = 0;
-    while (round < REQS_PER_CONN) : (round += 1) {
-        for (&fds) |fd| {
+    while (round < reqs_per_conn) : (round += 1) {
+        for (fds) |fd| {
             if (fd == 0) continue;
             const raw_written = linux.write(fd, req, req.len);
             const written: isize = @bitCast(raw_written);
@@ -200,12 +213,12 @@ pub fn main() !void {
             }
         }
         // 修改原因：当前 server 不支持在同一连接中无限 HTTP pipelining，需收齐本轮响应后再发下一轮。
-        drainUntil(fds[0..], buf[0..], &recv, sent, DRAIN_IDLE_ROUNDS);
+        drainUntil(fds, poll_fds, buf[0..], &recv, sent, DRAIN_IDLE_ROUNDS);
     }
     // final drain
     // 修改原因：keep-alive 连接不会主动 EOF，阻塞 read 会让 benchmark 在收尾阶段卡住。
-    drainUntil(fds[0..], buf[0..], &recv, sent, DRAIN_IDLE_ROUNDS);
-    for (&fds) |dfd| {
+    drainUntil(fds, poll_fds, buf[0..], &recv, sent, DRAIN_IDLE_ROUNDS);
+    for (fds) |dfd| {
         if (dfd == 0) continue;
         _ = linux.close(dfd);
     }
@@ -219,6 +232,7 @@ pub fn main() !void {
     const per_sec = @divTrunc(@as(i64, @intCast(sent)) * 1000, send_ms);
 
     std.debug.print("\n", .{});
+    std.debug.print("  config:      {d} conns x {d} req/conn\n", .{ conns, reqs_per_conn });
     std.debug.print("  connections: {d} ({d} ms)\n", .{ connected, conn_ms });
     std.debug.print("  sent:        {d} req in {d} ms\n", .{ sent, send_ms });
     std.debug.print("  recv:        {d} resp\n", .{recv});

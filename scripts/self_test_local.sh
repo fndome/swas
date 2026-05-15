@@ -16,6 +16,7 @@ fi
 ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$ROOT/../zig-cache-global}"
 EXAMPLE_PORT="${SWS_EXAMPLE_PORT:-9090}"
 BENCH_PORT="${SWS_BENCH_PORT:-19090}"
+BENCH_OPTIMIZE="${SWS_BENCH_OPTIMIZE:-ReleaseFast}"
 SERVER_PID=""
 
 log() {
@@ -367,8 +368,10 @@ cleanup
 SERVER_PID=""
 
 log "local benchmark"
-"$ZIG_BIN" build run-im-bench --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+# 修改原因：前面的 build/test 保留 Debug 覆盖正确性；benchmark 默认用 ReleaseFast，避免把 Debug 构建开销误读成框架吞吐上限。
+"$ZIG_BIN" build -Doptimize="$BENCH_OPTIMIZE" run-im-bench --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
 
 log "summary"
 printf 'self-test passed on this server.\n'
 printf 'note: this validates correctness and small local load only; client and server share the same machine.\n'
+printf 'benchmark mode: optimize=%s, conns=%s, reqs/conn=%s.\n' "$BENCH_OPTIMIZE" "${SWS_BENCH_CONNS:-50}" "${SWS_BENCH_REQS_PER_CONN:-100}"

@@ -8,7 +8,7 @@
 scripts/self_test_local.sh
 ```
 
-它会依次输出服务器资源限制、运行 `zig build`、`zig build test`、启动示例服务做 `/hello` 冒烟测试，再跑 `run-im-bench`。
+它会依次输出服务器资源限制、运行 `zig build`、`zig build test`、启动示例服务做 `/hello` 冒烟测试，再用 `ReleaseFast` 跑 `run-im-bench`。
 
 这个脚本适合证明：
 
@@ -24,6 +24,33 @@ scripts/self_test_local.sh
 - 跨机器真实网络吞吐。
 
 修改原因：单机自测时压测客户端和服务端会争抢同一台机器资源，必须把结果限定为功能和小规模稳定性验证。
+
+## Benchmark 模式
+
+默认 benchmark 是小烟测：
+
+```bash
+SWS_BENCH_PORT=19090 zig build -Doptimize=ReleaseFast run-im-bench
+```
+
+默认配置：
+
+- `SWS_BENCH_CONNS=50`
+- `SWS_BENCH_REQS_PER_CONN=100`
+- 总请求数：`50 x 100 = 5000`
+
+放大测试时显式设置连接数和每连接请求数：
+
+```bash
+zig build -Doptimize=ReleaseFast
+SWS_BENCH_CONNS=500 SWS_BENCH_REQS_PER_CONN=1000 SWS_BENCH_PORT=19090 ./zig-out/bin/im-bench
+```
+
+结果解读：
+
+- `Debug` 构建、`DebugAllocator`、小请求数、客户端和服务端同机都会压低 QPS。
+- `ReleaseFast` 只能减少程序自身开销，仍不能消除同机压测的 CPU 和调度竞争。
+- 严肃对比需要独立压测机、固定内核参数、固定连接数、固定请求总数，并记录 `ulimit -n`、端口范围、CPU governor、CPU/内存占用。
 
 ## 1. Server Ring A
 

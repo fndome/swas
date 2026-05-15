@@ -4,6 +4,34 @@
 
 `io_uring` based Single Worker Server (HTTP + WebSocket) on Linux, in Zig 0.16.0.
 
+## Project Goal
+
+`sws` is not just a `req/s` demo. It is a small Linux-only network runtime built
+around Zig, `io_uring`, fibers, explicit buffer ownership, and one IO-thread
+event loop. The immediate goal is to make the HTTP/WebSocket/DNS/client paths
+correct, measurable, and easy to audit before chasing larger benchmark numbers.
+
+Current scope:
+
+- HTTP/1.1 server: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, JSON/text/html
+  responses, request body helpers, middleware, keep-alive boundaries.
+- WebSocket: HTTP/1.1 upgrade, frame parse/write, ping/pong/close handling.
+- DNS and outbound HTTP client: async UDP DNS, small TTL cache, keep-alive
+  connection reuse.
+- Linux + `io_uring` only. TLS is not built in; put a TLS proxy in front or add a
+  dedicated TLS layer.
+
+Performance numbers should be read together with the benchmark mode. The local
+self-test is a correctness smoke test: client and server share one machine and
+the default benchmark is only `50 x 100` keep-alive requests. Use
+`-Doptimize=ReleaseFast` and explicit benchmark environment variables before
+comparing throughput:
+
+```bash
+zig build -Doptimize=ReleaseFast
+SWS_BENCH_CONNS=500 SWS_BENCH_REQS_PER_CONN=1000 ./zig-out/bin/im-bench
+```
+
 ```
 IO thread (io_uring Ring A + fiber):
   ├── accept/read/write CQE → fiber → handler → respond
