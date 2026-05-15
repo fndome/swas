@@ -1,6 +1,25 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+fn isHeaderNameChar(ch: u8) bool {
+    const token_symbols = "!#$%&'*+-.^_`|~";
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        std.mem.indexOfScalar(u8, token_symbols, ch) != null;
+}
+
+fn validateResponseHeader(key: []const u8, value: []const u8) !void {
+    // 修改原因：setHeader 会直接序列化到响应头，必须拒绝非法名字和 CR/LF，避免业务输入触发响应头注入。
+    if (key.len == 0) return error.InvalidHeader;
+    for (key) |ch| {
+        if (!isHeaderNameChar(ch)) return error.InvalidHeader;
+    }
+    for (value) |ch| {
+        if (ch == '\r' or ch == '\n') return error.InvalidHeader;
+    }
+}
+
 pub const Context = struct {
     pub const ContentType = enum { plain, json, html };
 
@@ -60,6 +79,7 @@ pub const Context = struct {
     }
 
     pub fn setHeader(self: *Context, key: []const u8, value: []const u8) !void {
+        try validateResponseHeader(key, value);
         if (self.headers == null) {
             self.headers = std.ArrayList(u8).empty;
         }
@@ -188,6 +208,20 @@ test "Context.getHeader requires exact header name" {
     };
     try std.testing.expectEqualStrings("example.com", ctx.getHeader("Host").?);
     try std.testing.expectEqualStrings("example.com", ctx.getHeader("Host:").?);
+}
+
+test "Context.setHeader rejects response header injection" {
+    var ctx = Context{
+        .request_data = "GET / HTTP/1.1\r\n\r\n",
+        .path = "/",
+        .app_ctx = null,
+        .allocator = std.testing.allocator,
+    };
+    defer ctx.deinit();
+
+    try ctx.setHeader("X-Test", "ok");
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("Bad:Name", "ok"));
+    try std.testing.expectError(error.InvalidHeader, ctx.setHeader("X-Test", "ok\r\nX-Injected: yes"));
 }
 
 test "Context.requestBody prefers oversized body storage" {
