@@ -423,6 +423,33 @@ fn requestHeaderTerminator(headers: []const u8) []const u8 {
     return "\r\n";
 }
 
+fn isManagedRequestHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "host") or
+        std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+}
+
+fn validateCallerHeaders(headers: []const u8) !void {
+    // 修改原因：客户端自己生成 Host/Content-Length/Connection；允许调用方重复或提前插入空行会造成请求走私或 body 边界错误。
+    if (headers.len == 0) return;
+    var start: usize = 0;
+    while (start < headers.len) {
+        const rel_end = std.mem.indexOfScalar(u8, headers[start..], '\n');
+        const end = if (rel_end) |idx| start + idx else headers.len;
+        const line = std.mem.trimRight(u8, headers[start..end], "\r");
+        if (line.len == 0) return error.InvalidHeaders;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeaders;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (name.len == 0 or isManagedRequestHeader(name)) return error.InvalidHeaders;
+        if (rel_end) |_| {
+            start = end + 1;
+        } else {
+            break;
+        }
+    }
+}
+
 fn requestTargetPrefix(path: []const u8) []const u8 {
     // 修改原因：URL 形如 http://host?x=1 时 path 以 ? 开头，HTTP origin-form 必须补成 /?x=1。
     if (path.len > 0 and path[0] == '?') return "/";
@@ -430,6 +457,7 @@ fn requestTargetPrefix(path: []const u8) []const u8 {
 }
 
 fn buildRequest(buf: []u8, method: []const u8, path: []const u8, host: []const u8, headers: ?[]const u8, body: ?[]const u8) ![]u8 {
+    if (headers) |h| try validateCallerHeaders(h);
     const target_prefix = requestTargetPrefix(path);
     if (body) |b| {
         if (headers) |h| {
@@ -549,11 +577,11 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     const reader = pipe.reader();
 
     var req_buf: [4096]u8 = undefined;
-    const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch {
+    const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch |err| {
         ctx.cleanup();
         // 修改原因：请求过大时还没有写入上游，必须归还已借出的 pipe，避免连接池项永久停在 borrowed 状态。
         cache.release(pipe, nowMs());
-        ctx.response = makeErrorResponse(ctx.allocator, 502, "request too large");
+        ctx.response = makeErrorResponse(ctx.allocator, 502, if (err == error.InvalidHeaders) "invalid request headers" else "request too large");
         ctx.notify();
         return;
     };
@@ -634,6 +662,16 @@ test "HttpClient buildRequest terminates caller headers" {
 
     const query_only_path = try buildRequest(&buf, "GET", "?x=1", "example.com", null, null);
     try std.testing.expect(std.mem.startsWith(u8, query_only_path, "GET /?x=1 HTTP/1.1\r\n"));
+}
+
+test "HttpClient buildRequest rejects managed caller headers" {
+    var buf: [512]u8 = undefined;
+
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "POST", "/", "example.com", "Content-Length: 999", "{}"));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "Connection: close", null));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "Host: other.example", null));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "POST", "/", "example.com", "Transfer-Encoding: chunked", "{}"));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\r\n\r\nX-After: injected", null));
 }
 
 test "HttpClient responseCompleteLen waits for Content-Length body" {
