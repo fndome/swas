@@ -154,7 +154,7 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
         }
         const rtype = std.mem.readInt(u16, packet[off..][0..2], .big);
         off += 2;
-        _ = std.mem.readInt(u16, packet[off..][0..2], .big);
+        const rclass = std.mem.readInt(u16, packet[off..][0..2], .big);
         off += 2; // class
         const ttl = std.mem.readInt(u32, packet[off..][0..4], .big);
         off += 4;
@@ -163,7 +163,8 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
 
         if (off + rdlen > packet.len) break;
 
-        if (rtype == 1 and rdlen == 4) {
+        // 修改原因：只有 IN class 的 A 记录才是 IPv4 地址答案，不能把 CHAOS/HS 等其它 class 的 A 记录写入连接地址。
+        if (rtype == 1 and rclass == 1 and rdlen == 4) {
             if (resp.addrs.len < AddrList.MAX_ADDRS) {
                 const ip: u32 = (@as(u32, packet[off]) << 24) |
                     (@as(u32, packet[off + 1]) << 16) |
@@ -199,11 +200,15 @@ pub fn parseTxid(packet: []const u8) u16 {
 }
 
 fn appendTestRootARecord(buf: []u8, off: *usize, ip: [4]u8) void {
+    appendTestRootARecordWithClass(buf, off, ip, 1);
+}
+
+fn appendTestRootARecordWithClass(buf: []u8, off: *usize, ip: [4]u8, class: u16) void {
     buf[off.*] = 0;
     off.* += 1;
     std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
     off.* += 2;
-    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    std.mem.writeInt(u16, buf[off.*..][0..2], class, .big);
     off.* += 2;
     std.mem.writeInt(u32, buf[off.*..][0..4], 60, .big);
     off.* += 4;
@@ -271,6 +276,18 @@ test "parseResponse ignores additional A records" {
     const parsed = parseResponse(pkt[0..off]);
     try std.testing.expectEqual(@as(u8, 1), parsed.addrs.len);
     try std.testing.expectEqual(std.mem.nativeToBig(u32, 0x01020304), parsed.addrs.addrs[0]);
+}
+
+test "parseResponse ignores non-IN A records" {
+    var pkt = [_]u8{0} ** 28;
+    pkt[2] = 0x80; // QR response
+    pkt[7] = 1; // ANCOUNT = 1
+
+    var off: usize = 12;
+    appendTestRootARecordWithClass(&pkt, &off, .{ 9, 9, 9, 9 }, 3);
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
 }
 
 test "parseResponse rejects truncated question" {
