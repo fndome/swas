@@ -28,11 +28,23 @@ const ParsedUrl = struct {
 fn firstPathOrQueryIndex(rest: []const u8) ?usize {
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const query = std.mem.indexOfScalar(u8, rest, '?');
-    if (slash) |s| {
-        if (query) |q| return @min(s, q);
-        return s;
+    const fragment = std.mem.indexOfScalar(u8, rest, '#');
+    var best: ?usize = null;
+    if (slash) |s| best = s;
+    if (query) |q| {
+        best = if (best) |b| @min(b, q) else q;
     }
-    return query;
+    if (fragment) |f| {
+        best = if (best) |b| @min(b, f) else f;
+    }
+    return best;
+}
+
+fn stripFragmentTarget(target: []const u8) []const u8 {
+    // 修改原因：URL fragment 只在客户端本地使用，不能出现在 HTTP request-target 中。
+    const no_fragment = target[0..(std.mem.indexOfScalar(u8, target, '#') orelse target.len)];
+    if (no_fragment.len == 0) return "/";
+    return no_fragment;
 }
 
 fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
@@ -42,7 +54,7 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     // 修改原因：合法 URL 可以省略路径但直接带 query，例如 http://host?x=1；此时也必须从 host 中切出去。
     const path_start = firstPathOrQueryIndex(rest);
     const host_port = if (path_start) |p| rest[0..p] else rest;
-    const path = if (path_start) |p| rest[p..] else "/";
+    const path = if (path_start) |p| stripFragmentTarget(rest[p..]) else "/";
     const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
     const host = if (colon) |c| host_port[0..c] else host_port;
     if (host.len == 0) return error.InvalidUrl;
@@ -690,6 +702,16 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectEqualStrings("example.com", parsed_query.host);
     try std.testing.expectEqual(@as(u16, 80), parsed_query.port);
     try std.testing.expectEqualStrings("?x=1", parsed_query.path);
+
+    const parsed_fragment = try parseUrl(std.testing.allocator, "http://example.com/path?q=1#frag");
+    defer std.testing.allocator.free(parsed_fragment.host);
+    try std.testing.expectEqualStrings("example.com", parsed_fragment.host);
+    try std.testing.expectEqualStrings("/path?q=1", parsed_fragment.path);
+
+    const parsed_root_fragment = try parseUrl(std.testing.allocator, "http://example.com#frag");
+    defer std.testing.allocator.free(parsed_root_fragment.host);
+    try std.testing.expectEqualStrings("example.com", parsed_root_fragment.host);
+    try std.testing.expectEqualStrings("/", parsed_root_fragment.path);
 }
 
 test "HttpClient preserves request headers allocation failures" {
