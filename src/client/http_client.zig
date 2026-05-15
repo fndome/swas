@@ -49,8 +49,9 @@ fn stripFragmentTarget(target: []const u8) []const u8 {
 
 fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     var rest = url;
-    if (std.mem.startsWith(u8, rest, "https://")) return error.TlsNotSupported;
-    if (std.mem.startsWith(u8, rest, "http://")) rest = rest["http://".len..];
+    // 修改原因：URL scheme 大小写不敏感，HTTP://host 这类合法 URL 不能被误判成坏 host/port。
+    if (std.ascii.startsWithIgnoreCase(rest, "https://")) return error.TlsNotSupported;
+    if (std.ascii.startsWithIgnoreCase(rest, "http://")) rest = rest["http://".len..];
     // 修改原因：合法 URL 可以省略路径但直接带 query，例如 http://host?x=1；此时也必须从 host 中切出去。
     const path_start = firstPathOrQueryIndex(rest);
     const host_port = if (path_start) |p| rest[0..p] else rest;
@@ -734,6 +735,13 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 8080), parsed.port);
     try std.testing.expectEqualStrings("/path", parsed.path);
+
+    const parsed_upper_scheme = try parseUrl(std.testing.allocator, "HTTP://example.com/upper");
+    defer std.testing.allocator.free(parsed_upper_scheme.host);
+    try std.testing.expectEqualStrings("example.com", parsed_upper_scheme.host);
+    try std.testing.expectEqualStrings("/upper", parsed_upper_scheme.path);
+
+    try std.testing.expectError(error.TlsNotSupported, parseUrl(std.testing.allocator, "HTTPS://example.com/"));
 
     const parsed_query = try parseUrl(std.testing.allocator, "http://example.com?x=1");
     defer std.testing.allocator.free(parsed_query.host);
