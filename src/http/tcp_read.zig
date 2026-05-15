@@ -504,6 +504,8 @@ fn headerBufferFullWithoutTerminator(effective_nread: usize, header_limit: usize
 fn parseContentLength(value: []const u8) !u64 {
     // 修改原因：Content-Length 只能是十进制数字；解析失败时当成 0 会让带 body 的坏请求进入业务逻辑。
     if (value.len == 0) return error.InvalidContentLength;
+    // 修改原因：RFC 7230 禁止前导零 (如 "00")，std.fmt.parseInt 会静默接受。
+    if (value.len > 1 and value[0] == '0') return error.InvalidContentLength;
     for (value) |ch| {
         if (ch < '0' or ch > '9') return error.InvalidContentLength;
     }
@@ -571,4 +573,7 @@ test "parseContentLength rejects malformed values" {
     try std.testing.expectError(error.InvalidContentLength, parseContentLength(""));
     try std.testing.expectError(error.InvalidContentLength, parseContentLength("abc"));
     try std.testing.expectError(error.InvalidContentLength, parseContentLength("12x"));
+    // 修改原因：RFC 7230 禁止前导零，例如 "00"、"01" 必须拒绝。
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength("00"));
+    try std.testing.expectError(error.InvalidContentLength, parseContentLength("01"));
 }

@@ -54,7 +54,9 @@ pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: [
         return;
     };
 
-    if (ws_key.len > 96) {
+    // 修改原因：computeAcceptKey max_key_len = 128 - 36 = 92；这里用 96 的不一致会导致
+    // 93-96 字节 key 通过前置检查后被 computeAcceptKey 拒绝，浪费 buffer 操作。
+    if (ws_key.len > 92) {
         self.buffer_pool.markReplenish(bid);
         conn.read_len = 0;
         self.respond(conn, 400, "Bad Request");

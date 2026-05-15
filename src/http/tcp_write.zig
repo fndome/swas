@@ -115,6 +115,9 @@ pub fn onWriteComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u6
             conn.response_buf = null;
         }
         if (self.ws_server.getActive(conn_id) != null) {
+            // 修改原因：WebSocket 101 升级完成后 keep_alive 在 tryWsUpgrade 被设为 false，
+            // 若不重置为 true，onWsWriteComplete 的 keep_alive 检查会把后续 pong/应用帧写入后断连。
+            conn.keep_alive = true;
             conn.write_offset = 0;
             conn.write_headers_len = 0;
             conn.state = .ws_reading;
