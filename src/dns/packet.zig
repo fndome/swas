@@ -76,8 +76,14 @@ fn encodeName(name: []const u8, out: []u8) !usize {
         out[0] = 0;
         return 1;
     }
+    // 修改原因：DNS 绝对域名允许末尾点，例如 example.com.；末尾点只表示 root，不能当成空 label 报错。
+    const wire_name = if (name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+    if (wire_name.len == 0) {
+        out[0] = 0;
+        return 1;
+    }
     var off: usize = 0;
-    var it = std.mem.splitScalar(u8, name, '.');
+    var it = std.mem.splitScalar(u8, wire_name, '.');
     while (it.next()) |label| {
         if (label.len > 63) return error.LabelTooLong;
         if (label.len == 0) return error.EmptyLabel;
@@ -230,6 +236,16 @@ test "buildQuery rejects DNS names longer than wire limit" {
     }
 
     try std.testing.expectError(error.NameTooLong, buildQuery(name_buf[0..pos], 0x1234));
+}
+
+test "buildQuery accepts trailing root dot" {
+    const relative = try buildQuery("example.com", 0x1234);
+    const absolute = try buildQuery("example.com.", 0x1234);
+    try std.testing.expectEqualSlices(u8, relative.bytes(), absolute.bytes());
+
+    const root = try buildQuery(".", 0x1234);
+    try std.testing.expectEqual(@as(usize, 17), root.len);
+    try std.testing.expectEqual(@as(u8, 0), root.buf[12]);
 }
 
 test "parseResponse tolerates malformed answer name" {
