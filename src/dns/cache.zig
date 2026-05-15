@@ -41,7 +41,7 @@ pub const DnsCache = struct {
     pub fn get(self: *DnsCache, name: []const u8, now_ms: i64) ?struct { addrs: []const u32, ttl: u32 } {
         const hash = hashName(name);
         for (self.entries.items) |*entry| {
-            if (entry.key_hash == hash and std.mem.eql(u8, entry.name, name)) {
+            if (entry.key_hash == hash and namesEqual(entry.name, name)) {
                 if (entry.expires_at_ms <= now_ms) return null;
                 if (entry.negative) return null;
                 return .{ .addrs = entry.addrs[0..entry.addr_count], .ttl = @intCast(@max(entry.expires_at_ms - now_ms, 1000) / 1000) };
@@ -57,7 +57,7 @@ pub const DnsCache = struct {
         const expires = now_ms + @as(i64, @intCast(capped_ttl)) * 1000;
 
         for (self.entries.items) |*entry| {
-            if (entry.key_hash == hash and std.mem.eql(u8, entry.name, name)) {
+            if (entry.key_hash == hash and namesEqual(entry.name, name)) {
                 const name_dup = try self.allocator.dupe(u8, name);
                 // 修改原因：更新已有缓存项时必须先分配新 name，成功后再释放旧 name；
                 // 旧逻辑先 free 再 dupe，OOM 会把 entry.name 留成悬空指针。
@@ -128,6 +128,11 @@ pub const DnsCache = struct {
     }
 };
 
+fn namesEqual(a: []const u8, b: []const u8) bool {
+    // 修改原因：DNS 名称大小写不敏感；hashName 已按小写计算，比较逻辑也必须保持一致。
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
 fn hashName(name: []const u8) u64 {
     var h: u64 = 0xcbf29ce484222325;
     for (name) |c| {
@@ -150,4 +155,21 @@ test "DnsCache replaces existing entry after allocating replacement name" {
     const cached = cache.get("example.com", 1000).?;
     try std.testing.expectEqual(@as(usize, 1), cached.addrs.len);
     try std.testing.expectEqual(second[0], cached.addrs[0]);
+}
+
+test "DnsCache matches names case-insensitively" {
+    var cache = DnsCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const first = [_]u32{0x01020304};
+    const second = [_]u32{0x05060708};
+
+    try cache.put("Example.COM", first[0..], 30, 0, false);
+    const cached = cache.get("example.com", 1000).?;
+    try std.testing.expectEqual(first[0], cached.addrs[0]);
+
+    try cache.put("example.com", second[0..], 30, 2000, false);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    const updated = cache.get("EXAMPLE.COM", 2000).?;
+    try std.testing.expectEqual(second[0], updated.addrs[0]);
 }
