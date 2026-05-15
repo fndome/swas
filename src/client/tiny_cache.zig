@@ -54,7 +54,8 @@ pub const TinyCache = struct {
         for (self.entries.items) |*e| {
             if (e.borrowed) continue;
             if (e.port != port) continue;
-            if (!std.mem.eql(u8, e.host, host)) continue;
+            // 修改原因：HTTP/DNS 主机名大小写不敏感，连接池复用也必须折叠大小写，避免同一上游重复建连。
+            if (!sameHost(e.host, host)) continue;
             if (now_ms - e.last_used_ms >= self.ttl_ms) continue;
             e.pipe.reset();
             e.last_used_ms = now_ms;
@@ -163,6 +164,10 @@ pub const TinyCache = struct {
     }
 };
 
+fn sameHost(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
 fn testPipe(stream: *RingSharedClient) Pipe {
     return .{
         .allocator = std.testing.allocator,
@@ -196,4 +201,32 @@ test "TinyCache.store keeps stream ownership with caller on PoolFull" {
     }
 
     try std.testing.expectError(error.PoolFull, cache.store(fake_stream, testPipe(fake_stream), "overflow", 80, 0));
+}
+
+test "TinyCache.acquire matches host case-insensitively" {
+    var cache = TinyCache.init(std.testing.allocator, 1000);
+    defer {
+        for (cache.entries.items) |*e| {
+            std.testing.allocator.free(e.host);
+        }
+        cache.entries.deinit(std.testing.allocator);
+    }
+
+    const fake_stream: *RingSharedClient = @ptrFromInt(0x1000);
+    const host = try std.testing.allocator.dupe(u8, "Example.COM");
+    try cache.entries.append(.{
+        .host = host,
+        .port = 80,
+        .stream = fake_stream,
+        .pipe = testPipe(fake_stream),
+        .last_used_ms = 0,
+        .borrowed = false,
+    });
+
+    const borrowed = cache.acquire("example.com", 80, 1) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(fake_stream, borrowed.stream);
+    try std.testing.expect(cache.entries.items[0].borrowed);
 }
