@@ -14,7 +14,8 @@ pub fn isUpgradeRequest(data: []const u8) bool {
     var has_ws_version = false;
     var lines = std.mem.splitSequence(u8, data, "\r\n");
     while (lines.next()) |line| {
-        if (line.len == 0) continue;
+        // 修改原因：HTTP 头部到空行就结束，不能继续把 body 中伪造的 Sec-WebSocket-* 行当成握手头。
+        if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, "Upgrade:")) {
             const value = std.mem.trim(u8, line["Upgrade:".len..], " \t");
             if (std.ascii.eqlIgnoreCase(value, "websocket")) {
@@ -76,6 +77,8 @@ fn isValidWsKey(key: []const u8) bool {
 pub fn extractWsKey(data: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, data, "\r\n");
     while (lines.next()) |line| {
+        // 修改原因：Sec-WebSocket-Key 必须来自 HTTP header，不能从 header 结束后的 body 提取。
+        if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, "Sec-WebSocket-Key:")) {
             const key_start = line[18..];
             const trimmed = std.mem.trim(u8, key_start, " \t\r\n");
@@ -165,6 +168,19 @@ test "isUpgradeRequest rejects duplicate Sec-WebSocket-Key" {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     try std.testing.expect(!isUpgradeRequest(duplicate_key));
+}
+
+test "isUpgradeRequest ignores WebSocket fields after header terminator" {
+    const key_in_body =
+        "GET /ws HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+
+    try std.testing.expect(!isUpgradeRequest(key_in_body));
+    try std.testing.expect(extractWsKey(key_in_body) == null);
 }
 
 test "computeAcceptKey validates WebSocket nonce" {
