@@ -129,13 +129,18 @@ pub const DnsCache = struct {
 };
 
 fn namesEqual(a: []const u8, b: []const u8) bool {
-    // 修改原因：DNS 名称大小写不敏感；hashName 已按小写计算，比较逻辑也必须保持一致。
-    return std.ascii.eqlIgnoreCase(a, b);
+    // 修改原因：DNS 名称大小写不敏感，且末尾点只表示 root 终止；比较逻辑必须和查询编码保持一致。
+    return std.ascii.eqlIgnoreCase(canonicalName(a), canonicalName(b));
+}
+
+fn canonicalName(name: []const u8) []const u8 {
+    return if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
 }
 
 fn hashName(name: []const u8) u64 {
     var h: u64 = 0xcbf29ce484222325;
-    for (name) |c| {
+    // 修改原因：example.com. 和 example.com 会编码成同一个 DNS qname，缓存 key 也要折叠末尾 root 点。
+    for (canonicalName(name)) |c| {
         h ^= @as(u64, @intCast(std.ascii.toLower(c)));
         h *%= 0x100000001b3;
     }
@@ -171,5 +176,22 @@ test "DnsCache matches names case-insensitively" {
     try cache.put("example.com", second[0..], 30, 2000, false);
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     const updated = cache.get("EXAMPLE.COM", 2000).?;
+    try std.testing.expectEqual(second[0], updated.addrs[0]);
+}
+
+test "DnsCache folds trailing root dot" {
+    var cache = DnsCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const first = [_]u32{0x01020304};
+    const second = [_]u32{0x05060708};
+
+    try cache.put("example.com.", first[0..], 30, 0, false);
+    const cached = cache.get("example.com", 1000).?;
+    try std.testing.expectEqual(first[0], cached.addrs[0]);
+
+    try cache.put("EXAMPLE.COM", second[0..], 30, 2000, false);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    const updated = cache.get("example.com.", 2000).?;
     try std.testing.expectEqual(second[0], updated.addrs[0]);
 }
