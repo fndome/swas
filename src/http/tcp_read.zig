@@ -567,7 +567,23 @@ fn requestLineIsSupported(buf: []const u8) bool {
     // 修改原因：当前 HTTP 栈只实现 HTTP/1.0/1.1 请求语义，缺失或额外字段都应在协议层拒绝。
     if (parts.next() != null) return false;
     if (method.len == 0 or target.len == 0) return false;
+    // 修改原因：method/target 是请求行协议边界；非法 token 或控制字符不能降级成普通 404。
+    if (!requestMethodIsToken(method) or !requestTargetIsValid(target)) return false;
     return std.mem.eql(u8, version, "HTTP/1.1") or std.mem.eql(u8, version, "HTTP/1.0");
+}
+
+fn requestMethodIsToken(method: []const u8) bool {
+    for (method) |ch| {
+        if (!isRequestHeaderNameChar(ch)) return false;
+    }
+    return true;
+}
+
+fn requestTargetIsValid(target: []const u8) bool {
+    for (target) |ch| {
+        if (ch <= ' ' or ch == 0x7f) return false;
+    }
+    return true;
 }
 
 fn requestLineIsHttp11(buf: []const u8) bool {
@@ -689,6 +705,8 @@ test "requestLineIsSupported rejects malformed request lines" {
     try std.testing.expect(!requestLineIsSupported("GET /hello\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/2\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/1.1 extra\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GE:T /hello HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GET /\x01 HTTP/1.1\r\nHost: example.test\r\n\r\n"));
 }
 
 test "requestHeadersAreWellFormed rejects malformed header lines" {

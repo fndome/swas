@@ -423,6 +423,54 @@ PY
   fi
 }
 
+invalid_method_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-bad-method.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+payload = (
+    b'GE:T /hello HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Connection: keep-alive\r\n'
+    b'\r\n'
+)
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：非法 method token 不能走路由层变成 404，协议层应直接按坏请求拒绝。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'invalid method request did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'HTTP/1.1 400 Bad Request' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected invalid method response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 malformed_header_expect() {
   local out_file
   out_file="$(mktemp "${TMPDIR:-/tmp}/sws-bad-header.XXXXXX")"
@@ -672,6 +720,9 @@ duplicate_content_length_expect
 
 log "malformed request line test"
 malformed_request_line_expect
+
+log "invalid method token test"
+invalid_method_expect
 
 log "malformed header test"
 malformed_header_expect
