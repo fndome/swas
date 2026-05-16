@@ -134,6 +134,19 @@ test "control frames allow the RFC maximum payload" {
     try std.testing.expectEqual(@as(usize, out.len), written);
 }
 
+test "writeFrame rejects invalid outbound control frames" {
+    var out: [256]u8 = undefined;
+    var oversized = [_]u8{0} ** 126;
+    var empty = [_]u8{};
+    var one_byte_close = [_]u8{0};
+    var invalid_close_code = [_]u8{ 0x03, 0xE7 };
+
+    try std.testing.expectError(error.InvalidFrame, writeFrame(&out, .{ .opcode = .ping, .fin = true, .payload = oversized[0..] }));
+    try std.testing.expectError(error.InvalidFrame, writeFrame(&out, .{ .opcode = .pong, .fin = false, .payload = empty[0..] }));
+    try std.testing.expectError(error.InvalidFrame, writeFrame(&out, .{ .opcode = .close, .fin = true, .payload = one_byte_close[0..] }));
+    try std.testing.expectError(error.InvalidFrame, writeFrame(&out, .{ .opcode = .close, .fin = true, .payload = invalid_close_code[0..] }));
+}
+
 pub fn frameSize(payload_len: usize) usize {
     var hdr: usize = 2;
     if (payload_len > 125) {
@@ -146,7 +159,25 @@ pub fn frameSize(payload_len: usize) usize {
     return hdr + payload_len;
 }
 
+fn validateOutboundFrame(frame: Frame) !void {
+    switch (frame.opcode) {
+        .close, .ping, .pong => {
+            // 修改原因：服务端生成控制帧时也必须遵守 RFC 6455；否则应用层可发出过长 ping/pong 或非法 close payload。
+            if (!frame.fin or frame.payload.len > 125) return error.InvalidFrame;
+            if (frame.opcode == .close) {
+                if (frame.payload.len == 1) return error.InvalidFrame;
+                if (frame.payload.len >= 2) {
+                    const code = std.mem.readInt(u16, frame.payload[0..2], .big);
+                    if (!isValidCloseCode(code)) return error.InvalidFrame;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 pub fn writeFrame(buf: []u8, frame: Frame) !usize {
+    try validateOutboundFrame(frame);
     const total = frameSize(frame.payload.len);
     if (buf.len < total) return error.BufferTooSmall;
 
