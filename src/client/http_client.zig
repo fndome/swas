@@ -152,13 +152,31 @@ fn getHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn getSingleHeaderValue(headers: []const u8, name: []const u8) !?[]const u8 {
+    var seen: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, name)) {
+            const after = line[name.len..];
+            if (after.len > 0 and after[0] == ':') {
+                // 修改原因：响应 Content-Length 重复会让 keep-alive 响应边界不唯一，客户端不能只信第一个值。
+                if (seen != null) return error.DuplicateHeader;
+                seen = std.mem.trim(u8, after[1..], " \t\r\n");
+            }
+        }
+    }
+    return seen;
+}
+
 fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
     if (getHeaderValue(headers, "Transfer-Encoding")) |te| {
         if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) return error.ChunkedUnsupported;
     }
-    const content_len = if (getHeaderValue(headers, "Content-Length")) |value|
+    const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value|
         try std.fmt.parseInt(usize, value, 10)
     else
         0;
@@ -746,6 +764,11 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "HttpClient responseCompleteLen rejects duplicate Content-Length" {
+    const duplicate = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello world";
+    try std.testing.expectError(error.DuplicateHeader, responseCompleteLen(duplicate));
 }
 
 test "HttpClient parseResponse rejects malformed status lines" {
