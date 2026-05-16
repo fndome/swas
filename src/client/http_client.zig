@@ -172,6 +172,22 @@ fn getSingleHeaderValue(headers: []const u8, name: []const u8) !?[]const u8 {
     return seen;
 }
 
+fn validateResponseHeaderLines(headers: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    _ = lines.next() orelse return error.InvalidResponse;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        // 修改原因：响应头行会参与 keep-alive 边界判断，内嵌 CR、缺冒号或非法字段名都不能被静默忽略。
+        if (line.len == 0 or std.mem.indexOfScalar(u8, line, '\r') != null) return error.InvalidResponse;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidResponse;
+        const field_name = line[0..colon];
+        if (field_name.len == 0) return error.InvalidResponse;
+        for (field_name) |ch| {
+            if (!isHttpTokenChar(ch)) return error.InvalidResponse;
+        }
+    }
+}
+
 fn parseStatusCode(first_line: []const u8) !u16 {
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     const version = parts.next() orelse return error.InvalidResponse;
@@ -205,6 +221,7 @@ fn parseResponseContentLength(value: []const u8) !usize {
 fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
+    try validateResponseHeaderLines(headers);
     if (getHeaderValue(headers, "Transfer-Encoding")) |_| {
         // 修改原因：当前客户端只按 Content-Length 做响应边界，不会解码任何 Transfer-Encoding。
         return error.TransferEncodingUnsupported;
@@ -832,6 +849,13 @@ test "HttpClient responseCompleteLen rejects malformed Content-Length" {
 test "HttpClient responseCompleteLen rejects Transfer-Encoding" {
     const encoded = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
     try std.testing.expectError(error.TransferEncodingUnsupported, responseCompleteLen(encoded));
+}
+
+test "HttpClient responseCompleteLen rejects malformed response headers" {
+    try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nBad Name: x\r\n\r\n"));
+    try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nX-Test : x\r\n\r\n"));
+    try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nBroken\r\n\r\n"));
+    try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nX-Test: ok\rBad: yes\r\n\r\n"));
 }
 
 test "HttpClient responseCompleteLen requires length for body-capable responses" {
