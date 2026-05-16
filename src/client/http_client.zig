@@ -187,6 +187,16 @@ fn responseMayOmitContentLength(status: u16) bool {
     return status < 200 or status == 204 or status == 304;
 }
 
+fn parseResponseContentLength(value: []const u8) !usize {
+    // 修改原因：响应 Content-Length 也是协议边界，parseInt 会接受前导零这类非规范值并放宽响应边界判断。
+    if (value.len == 0) return error.InvalidContentLength;
+    if (value.len > 1 and value[0] == '0') return error.InvalidContentLength;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.InvalidContentLength;
+    }
+    return std.fmt.parseInt(usize, value, 10) catch error.InvalidContentLength;
+}
+
 fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
@@ -195,7 +205,7 @@ fn responseCompleteLen(data: []const u8) !?usize {
         return error.TransferEncodingUnsupported;
     }
     const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value| blk: {
-        break :blk try std.fmt.parseInt(usize, value, 10);
+        break :blk try parseResponseContentLength(value);
     } else blk: {
         const first_line_end = std.mem.indexOfScalar(u8, headers, '\r') orelse
             std.mem.indexOfScalar(u8, headers, '\n') orelse
@@ -807,6 +817,11 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
 test "HttpClient responseCompleteLen rejects duplicate Content-Length" {
     const duplicate = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello world";
     try std.testing.expectError(error.DuplicateHeader, responseCompleteLen(duplicate));
+}
+
+test "HttpClient responseCompleteLen rejects malformed Content-Length" {
+    try std.testing.expectError(error.InvalidContentLength, responseCompleteLen("HTTP/1.1 200 OK\r\nContent-Length: 01\r\n\r\nx"));
+    try std.testing.expectError(error.InvalidContentLength, responseCompleteLen("HTTP/1.1 200 OK\r\nContent-Length: 1x\r\n\r\nx"));
 }
 
 test "HttpClient responseCompleteLen rejects Transfer-Encoding" {
