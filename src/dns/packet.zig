@@ -156,6 +156,13 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
             resp.rcode = .SERVFAIL;
             return resp;
         }
+        const qtype = std.mem.readInt(u16, packet[off..][0..2], .big);
+        const qclass = std.mem.readInt(u16, packet[off + 2 ..][0..2], .big);
+        // 修改原因：resolver 只查询 A/IN，响应 question 回显不一致时不能信任后续 answer。
+        if (qtype != 1 or qclass != 1) {
+            resp.rcode = .SERVFAIL;
+            return resp;
+        }
         off += 4;
     }
 
@@ -221,11 +228,15 @@ fn appendTestRootARecord(buf: []u8, off: *usize, ip: [4]u8) void {
 
 // 修改原因：DNS 响应测试样本必须带 resolver 实际发送的单 question，避免绕过 QDCOUNT 校验。
 fn appendTestRootQuestion(buf: []u8, off: *usize) void {
+    appendTestRootQuestionWithTypeClass(buf, off, 1, 1);
+}
+
+fn appendTestRootQuestionWithTypeClass(buf: []u8, off: *usize, qtype: u16, qclass: u16) void {
     buf[off.*] = 0;
     off.* += 1;
-    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    std.mem.writeInt(u16, buf[off.*..][0..2], qtype, .big);
     off.* += 2;
-    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    std.mem.writeInt(u16, buf[off.*..][0..2], qclass, .big);
     off.* += 2;
 }
 
@@ -369,6 +380,21 @@ test "parseResponse rejects non-query opcode response" {
 
     var off: usize = 12;
     appendTestRootQuestion(&pkt, &off);
+    appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
+}
+
+test "parseResponse rejects mismatched question type" {
+    var pkt = [_]u8{0} ** 32;
+    pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
+    pkt[7] = 1; // ANCOUNT = 1
+
+    var off: usize = 12;
+    appendTestRootQuestionWithTypeClass(&pkt, &off, 28, 1);
     appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
 
     const parsed = parseResponse(pkt[0..off]);
