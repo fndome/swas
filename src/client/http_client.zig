@@ -49,6 +49,8 @@ fn validateUrlHost(host: []const u8) !void {
     if (host.len == 0) return error.InvalidUrl;
     for (host) |ch| {
         if (isCtlOrSpace(ch)) return error.InvalidUrl;
+        // 修改原因：当前客户端不解析 URL userinfo，@ 出现在 authority 中不能被当成 host 字符写入 Host 头。
+        if (ch == '@') return error.InvalidUrl;
     }
 }
 
@@ -876,6 +878,7 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:abc/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:80:90/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://user@example.com/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://:8080/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com\r\nX-Bad: yes/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com/path\r\nX-Bad: yes"));
