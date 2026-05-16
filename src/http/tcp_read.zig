@@ -171,6 +171,14 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         } else if (std.mem.indexOf(u8, effective_buf, "\n\n")) |pos| {
             hw.headers_end = @intCast(pos + 2);
         }
+        if (helpers.extractHeader(effective_buf, "Transfer-Encoding")) |_| {
+            // 修改原因：当前请求体读取只支持 Content-Length，不支持 chunked；继续交给 handler 会把分块 body 留在连接里污染后续请求。
+            self.buffer_pool.markReplenish(bid);
+            conn.read_len = 0;
+            conn.keep_alive = false;
+            self.respond(conn, 400, "Bad Request");
+            return;
+        }
         if (helpers.extractHeader(effective_buf, "Content-Length")) |val| {
             // 修改原因：HTTP header 名大小写不敏感，lowercase content-length 也必须生效。
             hw.content_length = parseContentLength(val) catch {

@@ -323,6 +323,56 @@ PY
   fi
 }
 
+transfer_encoding_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-transfer-encoding.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+payload = (
+    b'POST /http-method HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Transfer-Encoding: chunked\r\n'
+    b'Connection: keep-alive\r\n'
+    b'\r\n'
+    b'7\r\n{"a":1}\r\n0\r\n\r\n'
+)
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：服务端目前不支持 chunked body，必须在协议层拒绝，避免分块数据污染 keep-alive 后续请求。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'Transfer-Encoding request did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'HTTP/1.1 400 Bad Request' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected Transfer-Encoding response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -420,6 +470,9 @@ pipelined_extra_bytes_close_expect
 
 log "invalid Content-Length test"
 invalid_content_length_expect
+
+log "Transfer-Encoding rejection test"
+transfer_encoding_expect
 
 cleanup
 SERVER_PID=""
