@@ -232,12 +232,19 @@ fn responseCompleteLen(data: []const u8) !?usize {
         // 修改原因：当前客户端只按 Content-Length 做响应边界，不会解码任何 Transfer-Encoding。
         return error.TransferEncodingUnsupported;
     }
-    const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value| blk: {
-        break :blk try parseResponseContentLength(value);
-    } else blk: {
-        // 修改原因：200 等可带 body 响应缺少长度时无法在 keep-alive 连接上确定边界，不能按空 body 复用连接。
-        if (!responseMayOmitContentLength(status)) return error.MissingContentLength;
+    const content_len_header = try getSingleHeaderValue(headers, "Content-Length");
+    const content_len = if (responseMayOmitContentLength(status)) blk: {
+        if (content_len_header) |value| {
+            const declared_len = try parseResponseContentLength(value);
+            // 修改原因：204 没有响应 body，非 0 Content-Length 不能驱动读取正文或返回伪 body。
+            if (status == 204 and declared_len != 0) return error.InvalidResponse;
+        }
         break :blk 0;
+    } else if (content_len_header) |value| blk: {
+        break :blk try parseResponseContentLength(value);
+    } else {
+        // 修改原因：200 等可带 body 响应缺少长度时无法在 keep-alive 连接上确定边界，不能按空 body 复用连接。
+        return error.MissingContentLength;
     };
     // 修改原因：上游 keep-alive 时连接不会 EOF，必须按 Content-Length 判断响应边界。
     const total = bounds.header_end + bounds.sep_len + content_len;
@@ -871,6 +878,19 @@ test "HttpClient responseCompleteLen requires length for body-capable responses"
     const no_content = "HTTP/1.1 204 No Content\r\n\r\nignored";
     const expected = (std.mem.indexOf(u8, no_content, "\r\n\r\n") orelse unreachable) + 4;
     try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLen(no_content));
+}
+
+test "HttpClient responseCompleteLen frames no-body responses at header end" {
+    try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nhello"));
+
+    const not_modified = "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\nextra";
+    const expected = (std.mem.indexOf(u8, not_modified, "\r\n\r\n") orelse unreachable) + 4;
+    try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLen(not_modified));
+
+    var resp = try parseResponse(std.testing.allocator, not_modified[0..expected]);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 304), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
 }
 
 test "HttpClient detects trailing bytes after complete response" {
