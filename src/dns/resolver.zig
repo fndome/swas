@@ -163,8 +163,9 @@ pub const DnsResolver = struct {
             .addr = self.nameserver_ip,
             .zero = [_]u8{0} ** 8,
         };
-        // UDP sendto on non-blocking socket: small packet (<100B) always succeeds
-        _ = linux.sendto(self.udp_fd, query_bytes.ptr, query_bytes.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        const send_rc = linux.sendto(self.udp_fd, query_bytes.ptr, query_bytes.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        // 修改原因：sendto 失败时不能挂起 fiber 等 DNS timeout；需要立即把 UDP 发送错误返回给调用方。
+        if (linux.errno(send_rc) != .SUCCESS or send_rc != query_bytes.len) return error.DnsSendFailed;
         self.submitRecv();
     }
 
@@ -291,4 +292,28 @@ test "DnsResolver nextTxid skips zero and pending ids" {
     resolver.next_txid = std.math.maxInt(u16);
     try resolver.pending.put(std.math.maxInt(u16), testPendingQuery(std.math.maxInt(u16)));
     try std.testing.expectEqual(@as(u16, 2), try resolver.nextTxid());
+}
+
+test "DnsResolver sendQuery reports sendto failure" {
+    var resolver = DnsResolver{
+        .allocator = std.testing.allocator,
+        .rs = undefined,
+        .io = undefined,
+        .udp_fd = -1,
+        .dns_ud = 0,
+        .nameserver_ip = 0,
+        .nameserver_port = packet.DNS_PORT,
+        .cache = DnsCache.init(std.testing.allocator),
+        .pending = std.AutoHashMap(u16, PendingQuery).init(std.testing.allocator),
+        .results = std.AutoHashMap(u16, QueryResult).init(std.testing.allocator),
+        .next_txid = 1,
+        .recv_buf = [_]u8{0} ** packet.MAX_PACKET_SIZE,
+        .recv_outstanding = false,
+    };
+    defer resolver.cache.deinit();
+    defer resolver.pending.deinit();
+    defer resolver.results.deinit();
+
+    try std.testing.expectError(error.DnsSendFailed, resolver.sendQuery("example.com", 0x1234));
+    try std.testing.expect(!resolver.recv_outstanding);
 }
