@@ -178,6 +178,11 @@ fn parseStatusCode(first_line: []const u8) !u16 {
     const code = parts.next() orelse return error.InvalidResponse;
     // 修改原因：上游状态行坏掉时不能伪装成 500 正常响应；调用方需要知道这是非法 HTTP 响应。
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.InvalidResponse;
+    // 修改原因：HTTP status-code 必须正好 3 位数字，parseInt 会把 0200 这类畸形码放宽成 200。
+    if (code.len != 3) return error.InvalidResponse;
+    for (code) |ch| {
+        if (ch < '0' or ch > '9') return error.InvalidResponse;
+    }
     const status = std.fmt.parseInt(u16, code, 10) catch return error.InvalidResponse;
     if (status < 100 or status > 999) return error.InvalidResponse;
     return status;
@@ -858,6 +863,10 @@ test "HttpClient parseResponse rejects malformed status lines" {
     try std.testing.expectError(
         error.InvalidResponse,
         parseResponse(std.testing.allocator, "HTTP/1.1BAD 200 OK\r\nContent-Length: 0\r\n\r\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        parseResponse(std.testing.allocator, "HTTP/1.1 0200 OK\r\nContent-Length: 0\r\n\r\n"),
     );
 }
 
