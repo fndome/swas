@@ -48,14 +48,14 @@ pub const Pipe = struct {
     }
 
     /// RingSharedClient.on_data 回调入口。
-    /// 超出 max_read 时丢弃数据、唤醒 fiber 报错。
+    /// 超出 max_read 时拒绝数据、唤醒 fiber 报错。
     pub fn feed(self: *Pipe, data: []const u8) !void {
         if (self.read_buf.items.len + data.len > self.max_read) {
-            // 缓冲区满, 丢弃新数据, 唤醒 fiber 报 BufferFull
+            // 修改原因：读缓冲溢出不能静默返回成功，否则上层会继续复用已经缺字节的连接。
             if (Fiber.isYielded()) {
                 Fiber.pushResume(0, 0, &.{});
             }
-            return;
+            return error.BufferFull;
         }
         self.read_buf.appendSlice(self.allocator, data) catch |err| {
             // 修改原因：append OOM 时也要唤醒正在 reader.read() 里等待的 fiber，否则请求会一直挂起。
@@ -145,6 +145,21 @@ test "Pipe.Reader.read returns zero for empty destination" {
 
     var empty: [0]u8 = .{};
     try std.testing.expectEqual(@as(usize, 0), try pipe.reader().read(empty[0..]));
+}
+
+test "Pipe.feed reports max_read overflow" {
+    var pipe = Pipe{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .read_buf = std.ArrayList(u8).empty,
+        .write_buf = std.ArrayList(u8).empty,
+        .max_read = 3,
+    };
+    defer pipe.deinit();
+
+    try pipe.feed("abc");
+    try std.testing.expectError(error.BufferFull, pipe.feed("d"));
+    try std.testing.expectEqualStrings("abc", pipe.read_buf.items);
 }
 
 test "Pipe.feed reports append allocation failure" {
