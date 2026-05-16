@@ -109,14 +109,7 @@ fn parseResponse(allocator: Allocator, data: []const u8) !Response {
     const first_line_end = std.mem.indexOfScalar(u8, data, '\r') orelse
         std.mem.indexOfScalar(u8, data, '\n') orelse
         return error.InvalidResponse;
-    var status: u16 = 0;
-    var parts = std.mem.splitScalar(u8, data[0..first_line_end], ' ');
-    const version = parts.next() orelse return error.InvalidResponse;
-    const code = parts.next() orelse return error.InvalidResponse;
-    // 修改原因：上游状态行坏掉时不能伪装成 500 正常响应；调用方需要知道这是非法 HTTP 响应。
-    if (!std.mem.startsWith(u8, version, "HTTP/")) return error.InvalidResponse;
-    status = std.fmt.parseInt(u16, code, 10) catch return error.InvalidResponse;
-    if (status < 100 or status > 999) return error.InvalidResponse;
+    const status = try parseStatusCode(data[0..first_line_end]);
     const body_start = bounds.header_end + bounds.sep_len;
     const body = try allocator.dupe(u8, data[body_start..total_len]);
     return .{ .status = status, .body = body, .allocator = allocator };
@@ -170,16 +163,38 @@ fn getSingleHeaderValue(headers: []const u8, name: []const u8) !?[]const u8 {
     return seen;
 }
 
+fn parseStatusCode(first_line: []const u8) !u16 {
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    const version = parts.next() orelse return error.InvalidResponse;
+    const code = parts.next() orelse return error.InvalidResponse;
+    // 修改原因：上游状态行坏掉时不能伪装成 500 正常响应；调用方需要知道这是非法 HTTP 响应。
+    if (!std.mem.startsWith(u8, version, "HTTP/")) return error.InvalidResponse;
+    const status = std.fmt.parseInt(u16, code, 10) catch return error.InvalidResponse;
+    if (status < 100 or status > 999) return error.InvalidResponse;
+    return status;
+}
+
+fn responseMayOmitContentLength(status: u16) bool {
+    return status < 200 or status == 204 or status == 304;
+}
+
 fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
     if (getHeaderValue(headers, "Transfer-Encoding")) |te| {
         if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) return error.ChunkedUnsupported;
     }
-    const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value|
-        try std.fmt.parseInt(usize, value, 10)
-    else
-        0;
+    const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value| blk: {
+        break :blk try std.fmt.parseInt(usize, value, 10);
+    } else blk: {
+        const first_line_end = std.mem.indexOfScalar(u8, headers, '\r') orelse
+            std.mem.indexOfScalar(u8, headers, '\n') orelse
+            return error.InvalidResponse;
+        const status = try parseStatusCode(headers[0..first_line_end]);
+        // 修改原因：200 等可带 body 响应缺少长度时无法在 keep-alive 连接上确定边界，不能按空 body 复用连接。
+        if (!responseMayOmitContentLength(status)) return error.MissingContentLength;
+        break :blk 0;
+    };
     // 修改原因：上游 keep-alive 时连接不会 EOF，必须按 Content-Length 判断响应边界。
     const total = bounds.header_end + bounds.sep_len + content_len;
     if (data.len < total) return null;
@@ -781,6 +796,14 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
 test "HttpClient responseCompleteLen rejects duplicate Content-Length" {
     const duplicate = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello world";
     try std.testing.expectError(error.DuplicateHeader, responseCompleteLen(duplicate));
+}
+
+test "HttpClient responseCompleteLen requires length for body-capable responses" {
+    try std.testing.expectError(error.MissingContentLength, responseCompleteLen("HTTP/1.1 200 OK\r\n\r\nhello"));
+
+    const no_content = "HTTP/1.1 204 No Content\r\n\r\nignored";
+    const expected = (std.mem.indexOf(u8, no_content, "\r\n\r\n") orelse unreachable) + 4;
+    try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLen(no_content));
 }
 
 test "HttpClient detects trailing bytes after complete response" {
