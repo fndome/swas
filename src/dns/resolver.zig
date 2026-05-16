@@ -31,6 +31,12 @@ fn dnsDispatch(ptr: *anyopaque, user_data: u64, res: i32) void {
     self.handleCqe(res);
 }
 
+fn udpSocketFd(raw_fd: usize) !i32 {
+    // 修改原因：UDP socket 创建失败时 raw_fd 是 errno 编码值，不能先转成 i32 再判断负数。
+    if (linux.errno(raw_fd) != .SUCCESS) return error.UdpSocketFailed;
+    return @intCast(raw_fd);
+}
+
 pub const DnsResolver = struct {
     allocator: std.mem.Allocator,
     rs: RingShared,
@@ -58,8 +64,7 @@ pub const DnsResolver = struct {
             linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
             0,
         );
-        const fd: i32 = @intCast(raw_fd);
-        if (fd < 0) return error.UdpSocketFailed;
+        const fd = try udpSocketFd(raw_fd);
 
         var addr_any = linux.sockaddr.in{
             .family = linux.AF.INET,
@@ -316,4 +321,10 @@ test "DnsResolver sendQuery reports sendto failure" {
 
     try std.testing.expectError(error.DnsSendFailed, resolver.sendQuery("example.com", 0x1234));
     try std.testing.expect(!resolver.recv_outstanding);
+}
+
+test "DnsResolver socket fd conversion checks errno before casting" {
+    const failed: usize = @bitCast(@as(isize, -1));
+    try std.testing.expectError(error.UdpSocketFailed, udpSocketFd(failed));
+    try std.testing.expectEqual(@as(i32, 4), try udpSocketFd(4));
 }

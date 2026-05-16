@@ -13,6 +13,12 @@ fn clientDispatch(ptr: *anyopaque, user_data: u64, res: i32) void {
     self.dispatchCqeRes(user_data, res);
 }
 
+fn streamSocketFd(raw_fd: usize) !i32 {
+    // 修改原因：linux.socket 失败时返回 errno 编码的 usize，先 @intCast 会在安全构建下触发整数转换失败。
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
+    return @intCast(raw_fd);
+}
+
 pub const RingSharedClient = struct {
     allocator: Allocator,
     rs: RingShared,
@@ -104,8 +110,7 @@ pub const RingSharedClient = struct {
 
     pub fn connectRawTimeout(self: *RingSharedClient, ip: u32, port: u16, timeout_ms: u32) !void {
         const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
-        const fd: i32 = @intCast(raw_fd);
-        if (fd < 0) return error.SocketFailed;
+        const fd = try streamSocketFd(raw_fd);
         errdefer {
             // 修改原因：connect 提交失败时 self.fd/self.id 已经写入，必须同步清理，避免调用方 deinit 时重复关闭 fd 或留下 registry 项。
             if (self.id != 0) {
@@ -337,4 +342,10 @@ test "RingSharedClient connect submit checks timeout SQE capacity" {
     try std.testing.expect(hasConnectSqeCapacity(254, 256, 5000));
     try std.testing.expect(!hasConnectSqeCapacity(255, 256, 5000));
     try std.testing.expect(hasConnectSqeCapacity(255, 256, 0));
+}
+
+test "RingSharedClient socket fd conversion checks errno before casting" {
+    const failed: usize = @bitCast(@as(isize, -1));
+    try std.testing.expectError(error.SocketFailed, streamSocketFd(failed));
+    try std.testing.expectEqual(@as(i32, 3), try streamSocketFd(3));
 }

@@ -58,6 +58,12 @@ const WsTaskCtx = ws_fiber.WsTaskCtx;
 const DeferredNode = hook_system.DeferredNode;
 const deferredRespond = hook_system.deferredRespond;
 
+fn listenSocketFd(raw_fd: usize) !i32 {
+    // 修改原因：listen socket 创建失败时 linux.socket 返回 errno 编码的 usize，先 @intCast 可能在安全构建中直接失败。
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketCreationFailed;
+    return @intCast(raw_fd);
+}
+
 pub const AsyncServer = struct {
     allocator: Allocator,
     io: std.Io,
@@ -205,8 +211,7 @@ pub const AsyncServer = struct {
         const ip_addr = try parseIpv4(ip_str);
 
         const raw_fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
-        const fd = @as(i32, @intCast(raw_fd));
-        if (fd < 0) return error.SocketCreationFailed;
+        const fd = try listenSocketFd(raw_fd);
         errdefer _ = linux.close(fd);
 
         var reuse: i32 = 1;
@@ -642,3 +647,9 @@ const statusText = http_response.statusText;
 pub const submitBodyRead = http_body.submitBodyRead;
 pub const onBodyChunk = http_body.onBodyChunk;
 pub const onStreamRead = http_body.onStreamRead;
+
+test "AsyncServer socket fd conversion checks errno before casting" {
+    const failed: usize = @bitCast(@as(isize, -1));
+    try std.testing.expectError(error.SocketCreationFailed, listenSocketFd(failed));
+    try std.testing.expectEqual(@as(i32, 5), try listenSocketFd(5));
+}
