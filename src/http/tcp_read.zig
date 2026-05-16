@@ -601,6 +601,8 @@ fn requestMethodIsToken(method: []const u8) bool {
 fn requestTargetIsValid(target: []const u8) bool {
     for (target) |ch| {
         if (ch <= ' ' or ch == 0x7f) return false;
+        // 修改原因：fragment 属于客户端本地 URI 语义，HTTP request-target 里出现 # 不能交给路由层匹配。
+        if (ch == '#') return false;
     }
     return true;
 }
@@ -726,6 +728,7 @@ test "requestLineIsSupported rejects malformed request lines" {
     try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/1.1 extra\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GE:T /hello HTTP/1.1\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GET /\x01 HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GET /hello#frag HTTP/1.1\r\nHost: example.test\r\n\r\n"));
 }
 
 test "requestHeadersAreWellFormed rejects malformed header lines" {

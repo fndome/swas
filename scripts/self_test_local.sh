@@ -520,6 +520,54 @@ PY
   fi
 }
 
+fragment_target_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-fragment-target.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+payload = (
+    b'GET /hello#frag HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Connection: keep-alive\r\n'
+    b'\r\n'
+)
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：fragment 不属于 HTTP request-target，不能进入路由层后变成普通 404。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'fragment request-target did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'HTTP/1.1 400 Bad Request' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected fragment request-target response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 malformed_header_expect() {
   local out_file
   out_file="$(mktemp "${TMPDIR:-/tmp}/sws-bad-header.XXXXXX")"
@@ -775,6 +823,9 @@ invalid_method_expect
 
 log "long path limit test"
 long_path_expect
+
+log "fragment request-target test"
+fragment_target_expect
 
 log "malformed header test"
 malformed_header_expect
