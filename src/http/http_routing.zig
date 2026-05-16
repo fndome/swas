@@ -13,7 +13,7 @@ const WildcardEntry = @import("middleware_store.zig").WildcardEntry;
 const PathRule = @import("../antpath.zig").PathRule;
 const helpers = @import("http_helpers.zig");
 const getMethodFromRequest = helpers.getMethodFromRequest;
-const getPathFromRequest = helpers.getPathFromRequest;
+const getPathFromRequestWithLimit = helpers.getPathFromRequestWithLimit;
 const logErr = helpers.logErr;
 const ws_upgrade = @import("../ws/upgrade.zig");
 const http_fiber = @import("http_fiber.zig");
@@ -200,7 +200,11 @@ pub fn processBodyRequest(self: *AsyncServer, conn_id: u64, conn: *Connection, b
     defer {
         if (owned_request_data) |saved| self.allocator.free(saved);
     }
-    const path = getPathFromRequest(effective_buf) orelse {
+    const path = getPathFromRequestWithLimit(
+        effective_buf,
+        @as(usize, @intCast(self.cfg.max_path_length)),
+    ) orelse {
+        // 修改原因：大 body 完整读取后也必须使用配置的 max_path_length，不能退回默认常量或忽略限制。
         self.buffer_pool.markReplenish(bid);
         self.large_pool.release(body_buf);
         conn.read_len = 0;

@@ -471,6 +471,55 @@ PY
   fi
 }
 
+long_path_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-long-path.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+path = "/" + ("a" * 2050)
+payload = (
+    f"GET {path} HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+).encode()
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：超过默认 max_path_length 的路径必须在协议层拒绝，不能绕过 fast-path 变成 404。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'long path request did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'HTTP/1.1 414 URI Too Long' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected long path response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 malformed_header_expect() {
   local out_file
   out_file="$(mktemp "${TMPDIR:-/tmp}/sws-bad-header.XXXXXX")"
@@ -723,6 +772,9 @@ malformed_request_line_expect
 
 log "invalid method token test"
 invalid_method_expect
+
+log "long path limit test"
+long_path_expect
 
 log "malformed header test"
 malformed_header_expect

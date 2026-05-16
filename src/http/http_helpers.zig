@@ -8,7 +8,7 @@ pub fn getMethodFromRequest(buf: []const u8) ?[]const u8 {
     return line[0..first_space];
 }
 
-pub fn getPathFromRequest(buf: []const u8) ?[]const u8 {
+pub fn getPathFromRequestWithLimit(buf: []const u8, max_path_length: usize) ?[]const u8 {
     const end = std.mem.indexOf(u8, buf, "\r\n") orelse std.mem.indexOfScalar(u8, buf, '\n') orelse return null;
     const line = buf[0..end];
     const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
@@ -16,9 +16,14 @@ pub fn getPathFromRequest(buf: []const u8) ?[]const u8 {
     while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
     const second_space = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     const raw = rest[0..second_space];
-    if (raw.len == 0 or raw.len > MAX_PATH_LENGTH) return null;
     const q_pos = std.mem.indexOfScalar(u8, raw, '?') orelse raw.len;
+    // 修改原因：max_path_length 限制的是路由 path，不应把 query string 计入；否则短路径大查询会被误拒绝。
+    if (q_pos == 0 or q_pos > max_path_length) return null;
     return raw[0..q_pos];
+}
+
+pub fn getPathFromRequest(buf: []const u8) ?[]const u8 {
+    return getPathFromRequestWithLimit(buf, MAX_PATH_LENGTH);
 }
 
 pub fn isKeepAliveConnection(buf: []const u8) bool {
@@ -168,6 +173,19 @@ test "extractHeader supports LF-only request headers" {
 
     try std.testing.expectEqualStrings("4", extractHeader(req, "Content-Length").?);
     try std.testing.expect(extractHeader(req, "Content") == null);
+}
+
+test "getPathFromRequestWithLimit limits only the path part" {
+    try std.testing.expectEqualStrings(
+        "/search",
+        getPathFromRequestWithLimit(
+            "GET /search?q=abcdefghijklmnopqrstuvwxyz HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            7,
+        ).?,
+    );
+    try std.testing.expect(
+        getPathFromRequestWithLimit("GET /toolong HTTP/1.1\r\nHost: example.test\r\n\r\n", 3) == null,
+    );
 }
 
 test "parseNameserverLine accepts whitespace separated resolv.conf entries" {

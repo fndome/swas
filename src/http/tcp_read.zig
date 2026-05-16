@@ -7,7 +7,7 @@ const Context = @import("context.zig").Context;
 const packUserData = @import("../stack_pool.zig").packUserData;
 const sticker = @import("../stack_pool_sticker.zig");
 const helpers = @import("http_helpers.zig");
-const getPathFromRequest = helpers.getPathFromRequest;
+const getPathFromRequestWithLimit = helpers.getPathFromRequestWithLimit;
 const getMethodFromRequest = helpers.getMethodFromRequest;
 const isKeepAliveConnection = helpers.isKeepAliveConnection;
 const logErr = helpers.logErr;
@@ -176,6 +176,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         conn.last_active_ms = now_ms;
 
         const slot = &self.pool.slots[conn.pool_idx];
+        const path_limit = @as(usize, @intCast(self.cfg.max_path_length));
         const hw = resetHttpWorkForRequest(slot);
         hw.header_len = @intCast(@min(effective_nread, 65535));
         hw.method = if (effective_nread > 0) effective_buf[0] else 'G';
@@ -187,6 +188,18 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
                     const raw_target = effective_buf[path_start..][0..sp2];
                     // 修改原因：路由匹配只使用 path，不能把 query string 一起写入 fast-path cache。
                     const q_pos = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
+                    if (q_pos == 0 or q_pos > path_limit) {
+                        // 修改原因：fast-path cache 之前没有执行 max_path_length，超长路径会绕过 helper 进入路由层。
+                        self.buffer_pool.markReplenish(bid);
+                        conn.read_len = 0;
+                        conn.keep_alive = false;
+                        self.respond(
+                            conn,
+                            if (q_pos == 0) 400 else 414,
+                            if (q_pos == 0) "Bad Request" else "URI Too Long",
+                        );
+                        return;
+                    }
                     hw.path_offset = @intCast(path_start);
                     hw.path_len = @intCast(q_pos);
                 }
@@ -335,13 +348,19 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         const hw2 = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
         if (hw2.path_len > 0 and hw2.path_offset + hw2.path_len <= request_buf.len)
             break :blk request_buf[hw2.path_offset..][0..hw2.path_len];
-        break :blk getPathFromRequest(request_buf) orelse {
+        break :blk getPathFromRequestWithLimit(
+            request_buf,
+            @as(usize, @intCast(self.cfg.max_path_length)),
+        ) orelse {
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
             self.respond(conn, 400, "Bad Request");
             return;
         };
-    } else getPathFromRequest(request_buf) orelse {
+    } else getPathFromRequestWithLimit(
+        request_buf,
+        @as(usize, @intCast(self.cfg.max_path_length)),
+    ) orelse {
         self.buffer_pool.markReplenish(bid);
         conn.read_len = 0;
         self.respond(conn, 400, "Bad Request");
