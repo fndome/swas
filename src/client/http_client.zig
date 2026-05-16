@@ -21,6 +21,7 @@ pub const Response = struct {
 
 const ParsedUrl = struct {
     host: []const u8,
+    authority: []const u8,
     port: u16,
     path: []const u8,
 };
@@ -100,7 +101,11 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
         if (port_text.len == 0) return error.InvalidUrl;
         break :blk std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidUrl;
     } else 80;
-    return .{ .host = try allocator.dupe(u8, host), .port = port, .path = path };
+    const host_dup = try allocator.dupe(u8, host);
+    errdefer allocator.free(host_dup);
+    // 修改原因：HTTP/1.1 Host 必须保留显式端口；连接用 host，Host 头用 authority。
+    const authority_dup = try allocator.dupe(u8, host_port);
+    return .{ .host = host_dup, .authority = authority_dup, .port = port, .path = path };
 }
 
 fn parseResponse(allocator: Allocator, data: []const u8) !Response {
@@ -596,6 +601,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
         return;
     };
     defer ctx.allocator.free(parsed.host);
+    defer ctx.allocator.free(parsed.authority);
 
     const ip = client.ring_b.dns.resolve(parsed.host) catch {
         ctx.response = makeErrorResponse(ctx.allocator, 502, "DNS resolution failed");
@@ -672,7 +678,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     const reader = pipe.reader();
 
     var req_buf: [4096]u8 = undefined;
-    const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.host, ctx.headers, ctx.body) catch |err| {
+    const req = buildRequest(&req_buf, ctx.method, parsed.path, parsed.authority, ctx.headers, ctx.body) catch |err| {
         ctx.cleanup();
         // 修改原因：请求过大时还没有写入上游，必须归还已借出的 pipe，避免连接池项永久停在 borrowed 状态。
         cache.release(pipe, nowMs());
@@ -874,30 +880,42 @@ test "HttpClient parseUrl rejects malformed explicit ports" {
 
     const parsed = try parseUrl(std.testing.allocator, "http://example.com:8080/path");
     defer std.testing.allocator.free(parsed.host);
+    defer std.testing.allocator.free(parsed.authority);
     try std.testing.expectEqualStrings("example.com", parsed.host);
+    try std.testing.expectEqualStrings("example.com:8080", parsed.authority);
     try std.testing.expectEqual(@as(u16, 8080), parsed.port);
     try std.testing.expectEqualStrings("/path", parsed.path);
 
+    var req_buf: [512]u8 = undefined;
+    const explicit_port_req = try buildRequest(&req_buf, "GET", parsed.path, parsed.authority, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, explicit_port_req, "Host: example.com:8080\r\n") != null);
+
     const parsed_upper_scheme = try parseUrl(std.testing.allocator, "HTTP://example.com/upper");
     defer std.testing.allocator.free(parsed_upper_scheme.host);
+    defer std.testing.allocator.free(parsed_upper_scheme.authority);
     try std.testing.expectEqualStrings("example.com", parsed_upper_scheme.host);
+    try std.testing.expectEqualStrings("example.com", parsed_upper_scheme.authority);
     try std.testing.expectEqualStrings("/upper", parsed_upper_scheme.path);
 
     try std.testing.expectError(error.TlsNotSupported, parseUrl(std.testing.allocator, "HTTPS://example.com/"));
 
     const parsed_query = try parseUrl(std.testing.allocator, "http://example.com?x=1");
     defer std.testing.allocator.free(parsed_query.host);
+    defer std.testing.allocator.free(parsed_query.authority);
     try std.testing.expectEqualStrings("example.com", parsed_query.host);
+    try std.testing.expectEqualStrings("example.com", parsed_query.authority);
     try std.testing.expectEqual(@as(u16, 80), parsed_query.port);
     try std.testing.expectEqualStrings("?x=1", parsed_query.path);
 
     const parsed_fragment = try parseUrl(std.testing.allocator, "http://example.com/path?q=1#frag");
     defer std.testing.allocator.free(parsed_fragment.host);
+    defer std.testing.allocator.free(parsed_fragment.authority);
     try std.testing.expectEqualStrings("example.com", parsed_fragment.host);
     try std.testing.expectEqualStrings("/path?q=1", parsed_fragment.path);
 
     const parsed_root_fragment = try parseUrl(std.testing.allocator, "http://example.com#frag");
     defer std.testing.allocator.free(parsed_root_fragment.host);
+    defer std.testing.allocator.free(parsed_root_fragment.authority);
     try std.testing.expectEqualStrings("example.com", parsed_root_fragment.host);
     try std.testing.expectEqualStrings("/", parsed_root_fragment.path);
 }
