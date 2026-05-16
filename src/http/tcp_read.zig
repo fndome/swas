@@ -156,6 +156,15 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         return;
     }
 
+    if (!hostHeaderIsValidForRequest(effective_buf)) {
+        // 修改原因：HTTP/1.1 要求且只允许一个 Host；缺失或重复 Host 不能继续交给业务 handler。
+        self.buffer_pool.markReplenish(bid);
+        conn.read_len = 0;
+        conn.keep_alive = false;
+        self.respond(conn, 400, "Bad Request");
+        return;
+    }
+
     conn.keep_alive = isKeepAliveConnection(effective_buf);
 
     if (conn.pool_idx != 0xFFFFFFFF) {
@@ -561,6 +570,17 @@ fn requestLineIsSupported(buf: []const u8) bool {
     return std.mem.eql(u8, version, "HTTP/1.1") or std.mem.eql(u8, version, "HTTP/1.0");
 }
 
+fn requestLineIsHttp11(buf: []const u8) bool {
+    const end = std.mem.indexOf(u8, buf, "\r\n") orelse
+        std.mem.indexOfScalar(u8, buf, '\n') orelse
+        return false;
+    var parts = std.mem.tokenizeScalar(u8, std.mem.trim(u8, buf[0..end], "\r"), ' ');
+    _ = parts.next() orelse return false;
+    _ = parts.next() orelse return false;
+    const version = parts.next() orelse return false;
+    return std.mem.eql(u8, version, "HTTP/1.1");
+}
+
 fn isRequestHeaderNameChar(ch: u8) bool {
     const token_symbols = "!#$%&'*+-.^_`|~";
     return (ch >= 'A' and ch <= 'Z') or
@@ -586,6 +606,23 @@ fn requestHeadersAreWellFormed(buf: []const u8) bool {
         }
     }
     return false;
+}
+
+fn hostHeaderIsValidForRequest(buf: []const u8) bool {
+    var host_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, buf, '\n');
+    _ = lines.next() orelse return false;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], "Host")) {
+            host_count += 1;
+        }
+    }
+    // 修改原因：HTTP/1.1 必须且只能有一个 Host；HTTP/1.0 不强制 Host，但重复 Host 仍会造成目标主机歧义。
+    if (requestLineIsHttp11(buf)) return host_count == 1;
+    return host_count <= 1;
 }
 
 fn parseContentLength(value: []const u8) !u64 {
@@ -659,6 +696,14 @@ test "requestHeadersAreWellFormed rejects malformed header lines" {
     try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nBad Header: value\r\n\r\n"));
     try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nBrokenHeader\r\n\r\n"));
     try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nHost: ok\x01bad\r\n\r\n"));
+}
+
+test "hostHeaderIsValidForRequest enforces HTTP version rules" {
+    try std.testing.expect(hostHeaderIsValidForRequest("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!hostHeaderIsValidForRequest("GET / HTTP/1.1\r\n\r\n"));
+    try std.testing.expect(!hostHeaderIsValidForRequest("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"));
+    try std.testing.expect(hostHeaderIsValidForRequest("GET / HTTP/1.0\r\n\r\n"));
+    try std.testing.expect(!hostHeaderIsValidForRequest("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"));
 }
 
 test "HTTP work metadata resets between keep-alive requests" {
