@@ -134,14 +134,19 @@ fn parseNameserverLine(line: []const u8) ?u32 {
     return parseIpv4(ip_str) catch null;
 }
 
+fn openReadOnly(path: [*:0]const u8) !i32 {
+    const flags: std.os.linux.O = @bitCast(@as(u32, 0));
+    const raw_fd = std.os.linux.open(path, flags, 0);
+    // 修改原因：linux.open 返回 usize，失败时要用 errno 判断，不能用 raw_fd < 0 检查。
+    if (std.os.linux.errno(raw_fd) != .SUCCESS) return error.FileNotFound;
+    return @intCast(raw_fd);
+}
+
 /// Parse /etc/resolv.conf for the first nameserver entry.
 /// Previously duplicated in async_server.zig and client/ring.zig.
 pub fn readResolvConfNameserver() !u32 {
     const path = "/etc/resolv.conf\x00";
-    const flags: std.os.linux.O = @bitCast(@as(u32, 0));
-    const raw_fd = std.os.linux.open(@ptrCast(path), flags, 0);
-    if (raw_fd < 0) return error.FileNotFound;
-    const fd: i32 = @intCast(raw_fd);
+    const fd = try openReadOnly(@ptrCast(path));
     defer _ = std.os.linux.close(fd);
 
     var buf: [4096]u8 = undefined;
@@ -193,4 +198,8 @@ test "parseNameserverLine accepts whitespace separated resolv.conf entries" {
     try std.testing.expectEqual(try parseIpv4("8.8.8.8"), parseNameserverLine("  nameserver   8.8.8.8  ").?);
     try std.testing.expectEqual(try parseIpv4("1.1.1.1"), parseNameserverLine("nameserver 1.1.1.1 # cloudflare").?);
     try std.testing.expect(parseNameserverLine("nameserverfoo 9.9.9.9") == null);
+}
+
+test "openReadOnly reports missing files through errno" {
+    try std.testing.expectError(error.FileNotFound, openReadOnly("/tmp/sws-definitely-missing-resolv.conf\x00"));
 }
