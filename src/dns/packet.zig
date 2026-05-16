@@ -151,7 +151,10 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     _ = &qi;
     var q: u16 = 0;
     while (q < qdcount) : (q += 1) {
-        off = skipName(packet, off);
+        off = skipName(packet, off) orelse {
+            resp.rcode = .SERVFAIL;
+            return resp;
+        };
         if (off + 4 > packet.len) {
             resp.rcode = .SERVFAIL;
             return resp;
@@ -169,10 +172,9 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     var min_ttl: u32 = std.math.maxInt(u32);
     var i: u16 = 0;
     while (i < total) : (i += 1) {
-        off = skipName(packet, off);
+        off = skipName(packet, off) orelse break;
         if (off + 10 > packet.len) {
-            // 修改原因：畸形 DNS name 可能让 skipName 直接返回 packet.len；
-            // 必须在跳过 name 后再检查 RR 头长度，避免后续 readInt 越界 panic。
+            // 修改原因：即使 name 合法，后续 RR 头也可能被截断，必须在 readInt 前检查长度。
             break;
         }
         const rtype = std.mem.readInt(u16, packet[off..][0..2], .big);
@@ -206,15 +208,22 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     return resp;
 }
 
-fn skipName(packet: []const u8, start: usize) usize {
+fn skipName(packet: []const u8, start: usize) ?usize {
     var off = start;
     while (off < packet.len) {
         const len = packet[off];
         if (len == 0) return off + 1;
-        if (len & 0xC0 == 0xC0) return off + 2;
+        if (len & 0xC0 == 0xC0) {
+            // 修改原因：压缩指针必须完整占 2 字节，缺少第二字节时不能继续解析后续字段。
+            if (off + 2 > packet.len) return null;
+            return off + 2;
+        }
+        // 修改原因：DNS 普通 label 最高两位必须为 00；保留格式和超长 label 都是 malformed name。
+        if ((len & 0xC0) != 0 or len > 63) return null;
+        if (off + 1 + @as(usize, len) > packet.len) return null;
         off += @as(usize, len) + 1;
     }
-    return packet.len;
+    return null;
 }
 
 pub fn parseTxid(packet: []const u8) u16 {
@@ -339,6 +348,16 @@ test "parseResponse rejects truncated question" {
     pkt[2] = 0x80; // QR response
     pkt[5] = 1; // QDCOUNT = 1
     pkt[12] = 20; // malformed question name
+
+    const parsed = parseResponse(&pkt);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+}
+
+test "parseResponse rejects reserved question label format" {
+    var pkt = [_]u8{0} ** 17;
+    pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
+    pkt[12] = 0x40; // reserved label format, not a length or compression pointer
 
     const parsed = parseResponse(&pkt);
     try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
