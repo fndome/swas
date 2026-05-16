@@ -92,7 +92,9 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     const path = if (path_start) |p| stripFragmentTarget(rest[p..]) else "/";
     const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
     const host = if (colon) |c| host_port[0..c] else host_port;
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return error.InvalidUrl;
     // 修改原因：host 和 request-target 会直接拼进请求行/Host 头，必须拒绝 CR/LF/空白控制字符，避免请求头注入。
+    // 当前客户端只支持普通 host[:port] authority，多冒号或 IPv6 bracket 形式不能靠 lastIndex 静默解析。
     try validateUrlHost(host);
     try validateRequestTarget(path);
     const port: u16 = if (colon) |c| blk: {
@@ -873,6 +875,7 @@ test "HttpClient cancelled notify returns request slot once" {
 test "HttpClient parseUrl rejects malformed explicit ports" {
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:abc/"));
+    try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com:80:90/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://:8080/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com\r\nX-Bad: yes/"));
     try std.testing.expectError(error.InvalidUrl, parseUrl(std.testing.allocator, "http://example.com/path\r\nX-Bad: yes"));
