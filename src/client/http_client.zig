@@ -113,7 +113,12 @@ fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
 }
 
 fn parseResponse(allocator: Allocator, data: []const u8) !Response {
-    const total_len = (try responseCompleteLen(data)) orelse return error.IncompleteResponse;
+    return parseResponseForMethod(allocator, data, "GET");
+}
+
+fn parseResponseForMethod(allocator: Allocator, data: []const u8, method: []const u8) !Response {
+    // 修改原因：HEAD 响应的 Content-Length 只描述假想正文，解析阶段必须沿用请求方法，否则会把合法 HEAD 响应误判成未读完整。
+    const total_len = (try responseCompleteLenForMethod(data, method)) orelse return error.IncompleteResponse;
     const bounds = findHeaderEnd(data[0..total_len]) orelse return error.InvalidResponse;
     const first_line_end = std.mem.indexOfScalar(u8, data, '\r') orelse
         std.mem.indexOfScalar(u8, data, '\n') orelse
@@ -821,7 +826,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
         return;
     }
 
-    if (parseResponse(ctx.allocator, resp_buf[0..complete_len])) |resp| {
+    if (parseResponseForMethod(ctx.allocator, resp_buf[0..complete_len], ctx.method)) |resp| {
         ctx.response = resp;
         ctx.notify();
         if (responseHasTrailingBytes(total, complete_len) or responseWantsClose(resp_buf[0..complete_len])) {
@@ -936,7 +941,7 @@ test "HttpClient responseCompleteLen frames HEAD responses at header end" {
     const expected = (std.mem.indexOf(u8, head_response, "\r\n\r\n") orelse unreachable) + 4;
     try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLenForMethod(head_response, "HEAD"));
 
-    var resp = try parseResponse(std.testing.allocator, head_response[0..expected]);
+    var resp = try parseResponseForMethod(std.testing.allocator, head_response[0..expected], "HEAD");
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(usize, 0), resp.body.len);
