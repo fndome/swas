@@ -147,6 +147,15 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
         return;
     }
 
+    if (!requestHeadersAreWellFormed(effective_buf)) {
+        // 修改原因：畸形 header 行不能被业务层忽略后继续处理，否则会放宽 HTTP 边界并影响后续头解析。
+        self.buffer_pool.markReplenish(bid);
+        conn.read_len = 0;
+        conn.keep_alive = false;
+        self.respond(conn, 400, "Bad Request");
+        return;
+    }
+
     conn.keep_alive = isKeepAliveConnection(effective_buf);
 
     if (conn.pool_idx != 0xFFFFFFFF) {
@@ -552,6 +561,33 @@ fn requestLineIsSupported(buf: []const u8) bool {
     return std.mem.eql(u8, version, "HTTP/1.1") or std.mem.eql(u8, version, "HTTP/1.0");
 }
 
+fn isRequestHeaderNameChar(ch: u8) bool {
+    const token_symbols = "!#$%&'*+-.^_`|~";
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        std.mem.indexOfScalar(u8, token_symbols, ch) != null;
+}
+
+fn requestHeadersAreWellFormed(buf: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, buf, '\n');
+    _ = lines.next() orelse return false;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        if (line.len == 0) return true;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        if (colon == 0) return false;
+        // 修改原因：header name 是 HTTP token，不能包含空格、控制字符或冒号前空白。
+        for (line[0..colon]) |ch| {
+            if (!isRequestHeaderNameChar(ch)) return false;
+        }
+        for (line[colon + 1 ..]) |ch| {
+            if ((ch < ' ' and ch != '\t') or ch == 0x7f) return false;
+        }
+    }
+    return false;
+}
+
 fn parseContentLength(value: []const u8) !u64 {
     // 修改原因：Content-Length 只能是十进制数字；解析失败时当成 0 会让带 body 的坏请求进入业务逻辑。
     if (value.len == 0) return error.InvalidContentLength;
@@ -616,6 +652,13 @@ test "requestLineIsSupported rejects malformed request lines" {
     try std.testing.expect(!requestLineIsSupported("GET /hello\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/2\r\nHost: example.test\r\n\r\n"));
     try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/1.1 extra\r\nHost: example.test\r\n\r\n"));
+}
+
+test "requestHeadersAreWellFormed rejects malformed header lines" {
+    try std.testing.expect(requestHeadersAreWellFormed("GET / HTTP/1.1\r\nHost: example.test\r\nX-Test: ok\r\n\r\n"));
+    try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nBad Header: value\r\n\r\n"));
+    try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nBrokenHeader\r\n\r\n"));
+    try std.testing.expect(!requestHeadersAreWellFormed("GET / HTTP/1.1\r\nHost: ok\x01bad\r\n\r\n"));
 }
 
 test "HTTP work metadata resets between keep-alive requests" {
