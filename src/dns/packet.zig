@@ -119,6 +119,11 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
         resp.rcode = .SERVFAIL;
         return resp;
     }
+    // 修改原因：resolver 只发标准 QUERY，非 0 opcode 的响应不能按普通 hostname 查询结果解析。
+    if (((flags1 >> 3) & 0x0F) != 0) {
+        resp.rcode = .SERVFAIL;
+        return resp;
+    }
     // 修改原因：TC 表示 UDP 响应已截断，继续使用其中的 A 记录会把不完整答案当成完整解析结果。
     if ((flags1 & 0x02) != 0) {
         resp.rcode = .SERVFAIL;
@@ -344,6 +349,21 @@ test "parseResponse rejects unexpected question count" {
 test "parseResponse rejects truncated response" {
     var pkt = [_]u8{0} ** 32;
     pkt[2] = 0x82; // QR response + TC truncated flag
+    pkt[5] = 1; // QDCOUNT = 1
+    pkt[7] = 1; // ANCOUNT = 1
+
+    var off: usize = 12;
+    appendTestRootQuestion(&pkt, &off);
+    appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
+}
+
+test "parseResponse rejects non-query opcode response" {
+    var pkt = [_]u8{0} ** 32;
+    pkt[2] = 0x88; // QR response + opcode 1 instead of standard QUERY
     pkt[5] = 1; // QDCOUNT = 1
     pkt[7] = 1; // ANCOUNT = 1
 
