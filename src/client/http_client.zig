@@ -172,6 +172,34 @@ fn getSingleHeaderValue(headers: []const u8, name: []const u8) !?[]const u8 {
     return seen;
 }
 
+fn headerValueHasToken(value: []const u8, token: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
+}
+
+fn responseHeaderHasToken(headers: []const u8, name: []const u8, token: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    _ = lines.next() orelse return false;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (std.ascii.startsWithIgnoreCase(line, name)) {
+            const after = line[name.len..];
+            if (after.len > 0 and after[0] == ':' and headerValueHasToken(after[1..], token)) return true;
+        }
+    }
+    return false;
+}
+
+fn responseWantsClose(data: []const u8) bool {
+    const bounds = findHeaderEnd(data) orelse return false;
+    const headers = data[0..bounds.header_end];
+    // 修改原因：上游声明 Connection: close 时，该 TCP 连接不能放回 keep-alive 池等待复用。
+    return responseHeaderHasToken(headers, "Connection", "close");
+}
+
 fn validateResponseHeaderLines(headers: []const u8) !void {
     var lines = std.mem.splitScalar(u8, headers, '\n');
     _ = lines.next() orelse return error.InvalidResponse;
@@ -796,8 +824,8 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     if (parseResponse(ctx.allocator, resp_buf[0..complete_len])) |resp| {
         ctx.response = resp;
         ctx.notify();
-        if (responseHasTrailingBytes(total, complete_len)) {
-            // 修改原因：同一次 read 读到 Content-Length 之后的多余字节时，连接已无法安全复用，必须从池里淘汰。
+        if (responseHasTrailingBytes(total, complete_len) or responseWantsClose(resp_buf[0..complete_len])) {
+            // 修改原因：多余字节或 Connection: close 都说明连接不能安全复用，必须从池里淘汰。
             cache.evictPipe(pipe);
         } else {
             cache.release(pipe, nowMs());
@@ -917,6 +945,14 @@ test "HttpClient responseCompleteLen frames HEAD responses at header end" {
 test "HttpClient detects trailing bytes after complete response" {
     try std.testing.expect(!responseHasTrailingBytes(42, 42));
     try std.testing.expect(responseHasTrailingBytes(43, 42));
+}
+
+test "HttpClient detects Connection close response token" {
+    const close_resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(responseWantsClose(close_resp));
+
+    const keep_resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expect(!responseWantsClose(keep_resp));
 }
 
 test "HttpClient parseResponse rejects malformed status lines" {
