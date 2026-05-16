@@ -233,7 +233,8 @@ fn parseStatusCode(first_line: []const u8) !u16 {
         if (ch < '0' or ch > '9') return error.InvalidResponse;
     }
     const status = std.fmt.parseInt(u16, code, 10) catch return error.InvalidResponse;
-    if (status < 100 or status > 999) return error.InvalidResponse;
+    // 修改原因：HTTP status-code 只定义 100-599；放行 6xx-9xx 会把上游坏响应当成正常响应边界复用连接。
+    if (status < 100 or status > 599) return error.InvalidResponse;
     return status;
 }
 
@@ -986,6 +987,10 @@ test "HttpClient parseResponse rejects malformed status lines" {
     try std.testing.expectError(
         error.InvalidResponse,
         parseResponse(std.testing.allocator, "HTTP/1.1 0200 OK\r\nContent-Length: 0\r\n\r\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        parseResponse(std.testing.allocator, "HTTP/1.1 999 Weird\r\nContent-Length: 0\r\n\r\n"),
     );
 }
 
