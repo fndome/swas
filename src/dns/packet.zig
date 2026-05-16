@@ -209,6 +209,16 @@ fn appendTestRootARecord(buf: []u8, off: *usize, ip: [4]u8) void {
     appendTestRootARecordWithClass(buf, off, ip, 1);
 }
 
+// 修改原因：DNS 响应测试样本必须带 resolver 实际发送的单 question，避免绕过 QDCOUNT 校验。
+fn appendTestRootQuestion(buf: []u8, off: *usize) void {
+    buf[off.*] = 0;
+    off.* += 1;
+    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    off.* += 2;
+    std.mem.writeInt(u16, buf[off.*..][0..2], 1, .big);
+    off.* += 2;
+}
+
 fn appendTestRootARecordWithClass(buf: []u8, off: *usize, ip: [4]u8, class: u16) void {
     buf[off.*] = 0;
     off.* += 1;
@@ -262,20 +272,25 @@ test "buildQuery accepts trailing root dot" {
 test "parseResponse tolerates malformed answer name" {
     var pkt = [_]u8{0} ** 24;
     pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
     pkt[7] = 1; // ANCOUNT = 1
-    pkt[12] = 20; // label claims more bytes than the packet contains
+    var off: usize = 12;
+    appendTestRootQuestion(&pkt, &off);
+    pkt[off] = 20; // label claims more bytes than the packet contains
 
     const parsed = parseResponse(&pkt);
     try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
 }
 
 test "parseResponse ignores additional A records" {
-    var pkt = [_]u8{0} ** 42;
+    var pkt = [_]u8{0} ** 47;
     pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
     pkt[7] = 1; // ANCOUNT = 1
     pkt[11] = 1; // ARCOUNT = 1
 
     var off: usize = 12;
+    appendTestRootQuestion(&pkt, &off);
     appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
     appendTestRootARecord(&pkt, &off, .{ 5, 6, 7, 8 });
 
@@ -285,11 +300,13 @@ test "parseResponse ignores additional A records" {
 }
 
 test "parseResponse ignores non-IN A records" {
-    var pkt = [_]u8{0} ** 28;
+    var pkt = [_]u8{0} ** 32;
     pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
     pkt[7] = 1; // ANCOUNT = 1
 
     var off: usize = 12;
+    appendTestRootQuestion(&pkt, &off);
     appendTestRootARecordWithClass(&pkt, &off, .{ 9, 9, 9, 9 }, 3);
 
     const parsed = parseResponse(pkt[0..off]);
