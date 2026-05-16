@@ -205,7 +205,7 @@ fn parseStatusCode(first_line: []const u8) !u16 {
 }
 
 fn responseMayOmitContentLength(status: u16) bool {
-    return status < 200 or status == 204 or status == 304;
+    return status == 204 or status == 304;
 }
 
 fn parseResponseContentLength(value: []const u8) !usize {
@@ -222,6 +222,12 @@ fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
     try validateResponseHeaderLines(headers);
+    const first_line_end = std.mem.indexOfScalar(u8, headers, '\r') orelse
+        std.mem.indexOfScalar(u8, headers, '\n') orelse
+        return error.InvalidResponse;
+    const status = try parseStatusCode(headers[0..first_line_end]);
+    // 修改原因：客户端还没有实现 1xx interim response 折叠，不能把 100 Continue 当成最终响应返回。
+    if (status < 200) return error.InformationalResponseUnsupported;
     if (getHeaderValue(headers, "Transfer-Encoding")) |_| {
         // 修改原因：当前客户端只按 Content-Length 做响应边界，不会解码任何 Transfer-Encoding。
         return error.TransferEncodingUnsupported;
@@ -229,10 +235,6 @@ fn responseCompleteLen(data: []const u8) !?usize {
     const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value| blk: {
         break :blk try parseResponseContentLength(value);
     } else blk: {
-        const first_line_end = std.mem.indexOfScalar(u8, headers, '\r') orelse
-            std.mem.indexOfScalar(u8, headers, '\n') orelse
-            return error.InvalidResponse;
-        const status = try parseStatusCode(headers[0..first_line_end]);
         // 修改原因：200 等可带 body 响应缺少长度时无法在 keep-alive 连接上确定边界，不能按空 body 复用连接。
         if (!responseMayOmitContentLength(status)) return error.MissingContentLength;
         break :blk 0;
@@ -856,6 +858,11 @@ test "HttpClient responseCompleteLen rejects malformed response headers" {
     try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nX-Test : x\r\n\r\n"));
     try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nBroken\r\n\r\n"));
     try std.testing.expectError(error.InvalidResponse, responseCompleteLen("HTTP/1.1 204 No Content\r\nX-Test: ok\rBad: yes\r\n\r\n"));
+}
+
+test "HttpClient responseCompleteLen rejects unsupported informational responses" {
+    try std.testing.expectError(error.InformationalResponseUnsupported, responseCompleteLen("HTTP/1.1 100 Continue\r\n\r\n"));
+    try std.testing.expectError(error.InformationalResponseUnsupported, responseCompleteLen("HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n"));
 }
 
 test "HttpClient responseCompleteLen requires length for body-capable responses" {
