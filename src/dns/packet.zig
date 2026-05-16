@@ -172,10 +172,17 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     var min_ttl: u32 = std.math.maxInt(u32);
     var i: u16 = 0;
     while (i < total) : (i += 1) {
-        off = skipName(packet, off) orelse break;
+        off = skipName(packet, off) orelse {
+            // 修改原因：answer section 结构损坏时不能返回前面已解析的部分 A 记录，否则会缓存畸形 DNS 响应。
+            resp.rcode = .SERVFAIL;
+            resp.addrs.len = 0;
+            return resp;
+        };
         if (off + 10 > packet.len) {
-            // 修改原因：即使 name 合法，后续 RR 头也可能被截断，必须在 readInt 前检查长度。
-            break;
+            // 修改原因：RR 头截断表示整包 answer section 不可信，不能把前面完整记录当成最终解析结果。
+            resp.rcode = .SERVFAIL;
+            resp.addrs.len = 0;
+            return resp;
         }
         const rtype = std.mem.readInt(u16, packet[off..][0..2], .big);
         off += 2;
@@ -186,7 +193,12 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
         const rdlen = std.mem.readInt(u16, packet[off..][0..2], .big);
         off += 2;
 
-        if (off + rdlen > packet.len) break;
+        if (off + rdlen > packet.len) {
+            // 修改原因：RDATA 截断同样会让 answer count 与实际内容不一致，必须拒绝整包而不是使用部分地址。
+            resp.rcode = .SERVFAIL;
+            resp.addrs.len = 0;
+            return resp;
+        }
 
         // 修改原因：只有 IN class 的 A 记录才是 IPv4 地址答案，不能把 CHAOS/HS 等其它 class 的 A 记录写入连接地址。
         if (rtype == 1 and rclass == 1 and rdlen == 4) {
@@ -309,6 +321,24 @@ test "parseResponse tolerates malformed answer name" {
     pkt[off] = 20; // label claims more bytes than the packet contains
 
     const parsed = parseResponse(&pkt);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
+}
+
+test "parseResponse rejects truncated answer after valid record" {
+    var pkt = [_]u8{0} ** 64;
+    pkt[2] = 0x80; // QR response
+    pkt[5] = 1; // QDCOUNT = 1
+    pkt[7] = 2; // ANCOUNT = 2, second answer will be truncated
+
+    var off: usize = 12;
+    appendTestRootQuestion(&pkt, &off);
+    appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
+    pkt[off] = 0; // second answer name only; RR header is missing
+    off += 1;
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
     try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
 }
 
