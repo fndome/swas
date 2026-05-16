@@ -40,6 +40,14 @@ pub fn parseFrame(data: []u8) !Frame {
         .close, .ping, .pong => if (!fin or payload_len > 125) return error.InvalidFrame,
         else => {},
     }
+    switch (opcode) {
+        .continuation => return error.InvalidFrame,
+        .text, .binary => {
+            // 修改原因：当前服务器没有维护 WebSocket 分片消息状态；接受 FIN=0 会把半条消息直接交给业务 handler。
+            if (!fin) return error.InvalidFrame;
+        },
+        else => {},
+    }
     if (opcode == .close and payload_len == 1) {
         // 修改原因：Close 帧 payload 要么为空，要么至少包含 2 字节状态码；1 字节会让关闭原因解析半截数据。
         return error.InvalidFrame;
@@ -102,6 +110,14 @@ test "parseFrame rejects non-minimal payload length encoding" {
 
     var medium_as_127 = [_]u8{ 0x81, 0xFF, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
     try std.testing.expectError(error.InvalidFrame, parseFrame(&medium_as_127));
+}
+
+test "parseFrame rejects unsupported fragmented data frames" {
+    var fragmented_text = [_]u8{ 0x01, 0x80, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&fragmented_text));
+
+    var orphan_continuation = [_]u8{ 0x80, 0x80, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&orphan_continuation));
 }
 
 test "control frames allow the RFC maximum payload" {
