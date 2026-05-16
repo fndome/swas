@@ -208,6 +208,10 @@ fn responseMayOmitContentLength(status: u16) bool {
     return status == 204 or status == 304;
 }
 
+fn methodForbidsResponseBody(method: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(method, "HEAD");
+}
+
 fn parseResponseContentLength(value: []const u8) !usize {
     // 修改原因：响应 Content-Length 也是协议边界，parseInt 会接受前导零这类非规范值并放宽响应边界判断。
     if (value.len == 0) return error.InvalidContentLength;
@@ -219,6 +223,10 @@ fn parseResponseContentLength(value: []const u8) !usize {
 }
 
 fn responseCompleteLen(data: []const u8) !?usize {
+    return responseCompleteLenForMethod(data, "GET");
+}
+
+fn responseCompleteLenForMethod(data: []const u8, method: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
     try validateResponseHeaderLines(headers);
@@ -233,12 +241,14 @@ fn responseCompleteLen(data: []const u8) !?usize {
         return error.TransferEncodingUnsupported;
     }
     const content_len_header = try getSingleHeaderValue(headers, "Content-Length");
-    const content_len = if (responseMayOmitContentLength(status)) blk: {
+    const body_forbidden = responseMayOmitContentLength(status) or methodForbidsResponseBody(method);
+    const content_len = if (body_forbidden) blk: {
         if (content_len_header) |value| {
             const declared_len = try parseResponseContentLength(value);
             // 修改原因：204 没有响应 body，非 0 Content-Length 不能驱动读取正文或返回伪 body。
             if (status == 204 and declared_len != 0) return error.InvalidResponse;
         }
+        // 修改原因：HEAD/304 的 Content-Length 描述假想正文长度，不能作为当前响应读取边界。
         break :blk 0;
     } else if (content_len_header) |value| blk: {
         break :blk try parseResponseContentLength(value);
@@ -761,7 +771,7 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     const read_ok = blk: {
         while (true) {
             // 修改原因：HTTP/1.1 keep-alive 不会主动关闭连接，读到完整响应就应停止等待。
-            const maybe_complete = responseCompleteLen(resp_buf[0..total]) catch {
+            const maybe_complete = responseCompleteLenForMethod(resp_buf[0..total], ctx.method) catch {
                 invalid_response = true;
                 break :blk false;
             };
@@ -890,6 +900,17 @@ test "HttpClient responseCompleteLen frames no-body responses at header end" {
     var resp = try parseResponse(std.testing.allocator, not_modified[0..expected]);
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 304), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), resp.body.len);
+}
+
+test "HttpClient responseCompleteLen frames HEAD responses at header end" {
+    const head_response = "HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\nextra";
+    const expected = (std.mem.indexOf(u8, head_response, "\r\n\r\n") orelse unreachable) + 4;
+    try std.testing.expectEqual(@as(?usize, expected), try responseCompleteLenForMethod(head_response, "HEAD"));
+
+    var resp = try parseResponse(std.testing.allocator, head_response[0..expected]);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(usize, 0), resp.body.len);
 }
 
