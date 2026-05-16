@@ -83,7 +83,8 @@ pub const TinyCache = struct {
             return error.CacheDisabled;
         }
         self.evictExpired(now_ms);
-        if (self.entries.items.len >= MAX_CONNS_PER_HOST) {
+        if (self.countForHostPort(host, port) >= MAX_CONNS_PER_HOST) {
+            // 修改原因：上限语义是同一 host:port 的并发连接数，不能让其他上游占满全局池导致误报 PoolFull。
             return error.PoolFull;
         }
         const host_dup = self.allocator.dupe(u8, host) catch {
@@ -155,6 +156,14 @@ pub const TinyCache = struct {
         }
     }
 
+    fn countForHostPort(self: *const TinyCache, host: []const u8, port: u16) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.port == port and sameHost(e.host, host)) n += 1;
+        }
+        return n;
+    }
+
     pub fn count(self: *const TinyCache) usize {
         var n: usize = 0;
         for (self.entries.items) |e| {
@@ -188,8 +197,8 @@ test "TinyCache.store keeps stream ownership with caller on PoolFull" {
     }
 
     const fake_stream: *RingSharedClient = @ptrFromInt(0x1000);
-    for (0..MAX_CONNS_PER_HOST) |i| {
-        const host = try std.fmt.allocPrint(std.testing.allocator, "h{d}", .{i});
+    for (0..MAX_CONNS_PER_HOST) |_| {
+        const host = try std.testing.allocator.dupe(u8, "same.test");
         try cache.entries.append(.{
             .host = host,
             .port = 80,
@@ -200,7 +209,33 @@ test "TinyCache.store keeps stream ownership with caller on PoolFull" {
         });
     }
 
-    try std.testing.expectError(error.PoolFull, cache.store(fake_stream, testPipe(fake_stream), "overflow", 80, 0));
+    try std.testing.expectError(error.PoolFull, cache.store(fake_stream, testPipe(fake_stream), "same.test", 80, 0));
+}
+
+test "TinyCache.store applies pool limit per host and port" {
+    var cache = TinyCache.init(std.testing.allocator, 1000);
+    defer {
+        for (cache.entries.items) |*e| {
+            std.testing.allocator.free(e.host);
+        }
+        cache.entries.deinit(std.testing.allocator);
+    }
+
+    const fake_stream: *RingSharedClient = @ptrFromInt(0x1000);
+    for (0..MAX_CONNS_PER_HOST) |i| {
+        const host = try std.fmt.allocPrint(std.testing.allocator, "h{d}.test", .{i});
+        try cache.entries.append(.{
+            .host = host,
+            .port = 80,
+            .stream = fake_stream,
+            .pipe = testPipe(fake_stream),
+            .last_used_ms = 0,
+            .borrowed = false,
+        });
+    }
+
+    try cache.store(fake_stream, testPipe(fake_stream), "extra.test", 80, 0);
+    try std.testing.expectEqual(MAX_CONNS_PER_HOST + 1, cache.entries.items.len);
 }
 
 test "TinyCache.acquire matches host case-insensitively" {
