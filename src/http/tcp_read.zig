@@ -179,7 +179,15 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             self.respond(conn, 400, "Bad Request");
             return;
         }
-        if (helpers.extractHeader(effective_buf, "Content-Length")) |val| {
+        const content_length_value = extractSingleContentLength(effective_buf) catch {
+            // 修改原因：重复 Content-Length 会让请求体边界产生歧义，不能只取第一个值继续处理。
+            self.buffer_pool.markReplenish(bid);
+            conn.read_len = 0;
+            conn.keep_alive = false;
+            self.respond(conn, 400, "Bad Request");
+            return;
+        };
+        if (content_length_value) |val| {
             // 修改原因：HTTP header 名大小写不敏感，lowercase content-length 也必须生效。
             hw.content_length = parseContentLength(val) catch {
                 // 修改原因：非法 Content-Length 不能按无 body 继续处理，否则坏请求会进入 handler 并污染 keep-alive 连接。
@@ -532,6 +540,26 @@ fn parseContentLength(value: []const u8) !u64 {
     return std.fmt.parseInt(u64, value, 10) catch error.InvalidContentLength;
 }
 
+fn extractSingleContentLength(data: []const u8) !?[]const u8 {
+    var seen: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, "Content-Length")) {
+            const name_len = "Content-Length".len;
+            if (line.len <= name_len) continue;
+            const after = line[name_len..];
+            if (after.len > 0 and after[0] == ':') {
+                if (seen != null) return error.DuplicateContentLength;
+                // 修改原因：重复 Content-Length 即使数值相同也会扩大请求走私面；当前协议层选择直接拒绝。
+                seen = std.mem.trim(u8, after[1..], " \t\r\n");
+            }
+        }
+    }
+    return seen;
+}
+
 fn completeRequestEnd(buffer_len: usize, headers_end: u16, content_length: u64) ?usize {
     if (headers_end == 0) return null;
     const header_bytes: usize = headers_end;
@@ -596,4 +624,12 @@ test "parseContentLength rejects malformed values" {
     // 修改原因：RFC 7230 禁止前导零，例如 "00"、"01" 必须拒绝。
     try std.testing.expectError(error.InvalidContentLength, parseContentLength("00"));
     try std.testing.expectError(error.InvalidContentLength, parseContentLength("01"));
+}
+
+test "extractSingleContentLength rejects duplicate values" {
+    const ok = "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 7\r\n\r\n";
+    try std.testing.expectEqualStrings("7", (try extractSingleContentLength(ok)).?);
+
+    const duplicate = "POST / HTTP/1.1\r\nContent-Length: 7\r\ncontent-length: 7\r\n\r\n";
+    try std.testing.expectError(error.DuplicateContentLength, extractSingleContentLength(duplicate));
 }

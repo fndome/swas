@@ -323,6 +323,58 @@ PY
   fi
 }
 
+duplicate_content_length_expect() {
+  local out_file
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sws-duplicate-cl.XXXXXX")"
+
+  if ! python3 - "$EXAMPLE_PORT" "$out_file" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+out_path = sys.argv[2]
+payload = (
+    b'POST /http-method HTTP/1.1\r\n'
+    b'Host: localhost\r\n'
+    b'Content-Type: application/json\r\n'
+    b'Content-Length: 7\r\n'
+    b'Content-Length: 3\r\n'
+    b'Connection: keep-alive\r\n'
+    b'\r\n'
+    b'{"a":1}'
+)
+
+with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+    sock.settimeout(3)
+    # 修改原因：重复 Content-Length 会让 body 边界不唯一，协议层必须拒绝而不是只取第一个值。
+    sock.sendall(payload)
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+with open(out_path, "wb") as f:
+    f.write(b"".join(chunks))
+PY
+  then
+    printf 'duplicate Content-Length request did not close cleanly:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq 'HTTP/1.1 400 Bad Request' "$out_file" || ! grep -iq '^Connection: close' "$out_file"; then
+    printf 'unexpected duplicate Content-Length response:\n' >&2
+    cat "$out_file" >&2 || true
+    printf '\nserver log:\n' >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+}
+
 transfer_encoding_expect() {
   local out_file
   out_file="$(mktemp "${TMPDIR:-/tmp}/sws-transfer-encoding.XXXXXX")"
@@ -470,6 +522,9 @@ pipelined_extra_bytes_close_expect
 
 log "invalid Content-Length test"
 invalid_content_length_expect
+
+log "duplicate Content-Length test"
+duplicate_content_length_expect
 
 log "Transfer-Encoding rejection test"
 transfer_encoding_expect
