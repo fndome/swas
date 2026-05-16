@@ -138,6 +138,15 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     }
     conn.state = .processing;
 
+    if (!requestLineIsSupported(effective_buf)) {
+        // 修改原因：请求行必须包含 method、target 和 HTTP/1.x 版本；畸形请求不能继续进入业务 handler。
+        self.buffer_pool.markReplenish(bid);
+        conn.read_len = 0;
+        conn.keep_alive = false;
+        self.respond(conn, 400, "Bad Request");
+        return;
+    }
+
     conn.keep_alive = isKeepAliveConnection(effective_buf);
 
     if (conn.pool_idx != 0xFFFFFFFF) {
@@ -529,6 +538,20 @@ fn headerBufferFullWithoutTerminator(effective_nread: usize, header_limit: usize
     return effective_nread >= header_limit;
 }
 
+fn requestLineIsSupported(buf: []const u8) bool {
+    const end = std.mem.indexOf(u8, buf, "\r\n") orelse
+        std.mem.indexOfScalar(u8, buf, '\n') orelse
+        return false;
+    var parts = std.mem.tokenizeScalar(u8, std.mem.trim(u8, buf[0..end], "\r"), ' ');
+    const method = parts.next() orelse return false;
+    const target = parts.next() orelse return false;
+    const version = parts.next() orelse return false;
+    // 修改原因：当前 HTTP 栈只实现 HTTP/1.0/1.1 请求语义，缺失或额外字段都应在协议层拒绝。
+    if (parts.next() != null) return false;
+    if (method.len == 0 or target.len == 0) return false;
+    return std.mem.eql(u8, version, "HTTP/1.1") or std.mem.eql(u8, version, "HTTP/1.0");
+}
+
 fn parseContentLength(value: []const u8) !u64 {
     // 修改原因：Content-Length 只能是十进制数字；解析失败时当成 0 会让带 body 的坏请求进入业务逻辑。
     if (value.len == 0) return error.InvalidContentLength;
@@ -585,6 +608,14 @@ test "submitRead preparation resets recycled marker for next CQE" {
     var conn = Connection{ .read_buf_recycled = true };
     prepareReadSubmission(&conn);
     try std.testing.expect(!conn.read_buf_recycled);
+}
+
+test "requestLineIsSupported rejects malformed request lines" {
+    try std.testing.expect(requestLineIsSupported("GET /hello HTTP/1.1\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(requestLineIsSupported("GET /hello HTTP/1.0\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GET /hello\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/2\r\nHost: example.test\r\n\r\n"));
+    try std.testing.expect(!requestLineIsSupported("GET /hello HTTP/1.1 extra\r\nHost: example.test\r\n\r\n"));
 }
 
 test "HTTP work metadata resets between keep-alive requests" {
