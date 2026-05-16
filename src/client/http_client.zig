@@ -181,8 +181,9 @@ fn responseMayOmitContentLength(status: u16) bool {
 fn responseCompleteLen(data: []const u8) !?usize {
     const bounds = findHeaderEnd(data) orelse return null;
     const headers = data[0..bounds.header_end];
-    if (getHeaderValue(headers, "Transfer-Encoding")) |te| {
-        if (std.ascii.indexOfIgnoreCase(te, "chunked") != null) return error.ChunkedUnsupported;
+    if (getHeaderValue(headers, "Transfer-Encoding")) |_| {
+        // 修改原因：当前客户端只按 Content-Length 做响应边界，不会解码任何 Transfer-Encoding。
+        return error.TransferEncodingUnsupported;
     }
     const content_len = if (try getSingleHeaderValue(headers, "Content-Length")) |value| blk: {
         break :blk try std.fmt.parseInt(usize, value, 10);
@@ -796,6 +797,11 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
 test "HttpClient responseCompleteLen rejects duplicate Content-Length" {
     const duplicate = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello world";
     try std.testing.expectError(error.DuplicateHeader, responseCompleteLen(duplicate));
+}
+
+test "HttpClient responseCompleteLen rejects Transfer-Encoding" {
+    const encoded = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectError(error.TransferEncodingUnsupported, responseCompleteLen(encoded));
 }
 
 test "HttpClient responseCompleteLen requires length for body-capable responses" {
