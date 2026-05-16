@@ -186,6 +186,11 @@ pub const RingSharedClient = struct {
     }
 
     pub fn write(self: *RingSharedClient, data: []const u8) !void {
+        if (self.state == .connecting) {
+            // 修改原因：connectRawTimeout 只提交异步 connect；HTTP client 会先写请求，必须排队等 connect CQE 成功后发送。
+            try self.write_buf.appendSlice(self.allocator, data);
+            return;
+        }
         if (self.state != .connected) return error.NotConnected;
         try self.write_buf.appendSlice(self.allocator, data);
         if (!self.writing) {
@@ -249,9 +254,16 @@ pub const RingSharedClient = struct {
                 _ = linux.setsockopt(self.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(i32));
                 // 修改原因：RingSharedClient 没有 fixed-file 槽位分配器；多个连接共用 slot 0 会互相覆盖 fd。
                 self.fixed_index = 0xFFFF;
-                self.submitRead() catch {
-                    self.onClose();
-                };
+                if (self.write_buf.items.len > self.write_offset) {
+                    // 修改原因：连接建立前排队的首个请求必须先写出，再等响应；否则新建连接会先挂读或直接丢掉首包。
+                    self.flushWrite() catch {
+                        self.onClose();
+                    };
+                } else {
+                    self.submitRead() catch {
+                        self.onClose();
+                    };
+                }
             },
             .connected, .closing => {
                 if (res < 0) {
@@ -332,6 +344,17 @@ fn hasConnectSqeCapacity(ready: usize, capacity: usize, timeout_ms: u32) bool {
     return capacity - ready >= needed;
 }
 
+fn noopClientData(stream: *RingSharedClient, ctx: ?*anyopaque, data: []u8) void {
+    _ = stream;
+    _ = ctx;
+    _ = data;
+}
+
+fn noopClientClose(stream: *RingSharedClient, ctx: ?*anyopaque) void {
+    _ = stream;
+    _ = ctx;
+}
+
 test "RingSharedClient distinguishes write CQE user data" {
     const base = @as(u64, 1) << 62;
     try std.testing.expect(!isWriteCqe(base));
@@ -348,4 +371,29 @@ test "RingSharedClient socket fd conversion checks errno before casting" {
     const failed: usize = @bitCast(@as(isize, -1));
     try std.testing.expectError(error.SocketFailed, streamSocketFd(failed));
     try std.testing.expectEqual(@as(i32, 3), try streamSocketFd(3));
+}
+
+test "RingSharedClient queues writes while connect is in flight" {
+    var read_buf: [1]u8 = undefined;
+    var client = RingSharedClient{
+        .allocator = std.testing.allocator,
+        .rs = undefined,
+        .id = 0,
+        .fd = -1,
+        .state = .connecting,
+        .on_data = &noopClientData,
+        .on_close = &noopClientClose,
+        .callback_ctx = null,
+        .read_buf = read_buf[0..],
+        .write_buf = std.ArrayList(u8).empty,
+        .write_offset = 0,
+        .writing = false,
+        .dns = null,
+    };
+    defer client.write_buf.deinit(std.testing.allocator);
+
+    try client.write("GET / HTTP/1.1\r\n\r\n");
+
+    try std.testing.expectEqualStrings("GET / HTTP/1.1\r\n\r\n", client.write_buf.items);
+    try std.testing.expect(!client.writing);
 }
