@@ -111,8 +111,12 @@ fn parseResponse(allocator: Allocator, data: []const u8) !Response {
         return error.InvalidResponse;
     var status: u16 = 0;
     var parts = std.mem.splitScalar(u8, data[0..first_line_end], ' ');
-    _ = parts.next();
-    if (parts.next()) |code| status = std.fmt.parseInt(u16, code, 10) catch 500;
+    const version = parts.next() orelse return error.InvalidResponse;
+    const code = parts.next() orelse return error.InvalidResponse;
+    // 修改原因：上游状态行坏掉时不能伪装成 500 正常响应；调用方需要知道这是非法 HTTP 响应。
+    if (!std.mem.startsWith(u8, version, "HTTP/")) return error.InvalidResponse;
+    status = std.fmt.parseInt(u16, code, 10) catch return error.InvalidResponse;
+    if (status < 100 or status > 999) return error.InvalidResponse;
     const body_start = bounds.header_end + bounds.sep_len;
     const body = try allocator.dupe(u8, data[body_start..total_len]);
     return .{ .status = status, .body = body, .allocator = allocator };
@@ -742,6 +746,17 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "HttpClient parseResponse rejects malformed status lines" {
+    try std.testing.expectError(
+        error.InvalidResponse,
+        parseResponse(std.testing.allocator, "HTTP/1.1 abc Broken\r\nContent-Length: 0\r\n\r\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        parseResponse(std.testing.allocator, "NOTHTTP 200 OK\r\nContent-Length: 0\r\n\r\n"),
+    );
 }
 
 test "HttpClient cancelled notify returns request slot once" {
