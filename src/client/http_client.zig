@@ -186,6 +186,10 @@ fn responseCompleteLen(data: []const u8) !?usize {
     return total;
 }
 
+fn responseHasTrailingBytes(total_read: usize, complete_len: usize) bool {
+    return total_read > complete_len;
+}
+
 fn makeErrorResponse(allocator: Allocator, status: u16, msg: []const u8) Response {
     // Triple-fallback: dupe -> alloc(0) -> zero-length compile-time literal.
     // The final literal is safe because Response.deinit guards on body.len > 0.
@@ -713,7 +717,12 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     if (parseResponse(ctx.allocator, resp_buf[0..complete_len])) |resp| {
         ctx.response = resp;
         ctx.notify();
-        cache.release(pipe, nowMs());
+        if (responseHasTrailingBytes(total, complete_len)) {
+            // 修改原因：同一次 read 读到 Content-Length 之后的多余字节时，连接已无法安全复用，必须从池里淘汰。
+            cache.evictPipe(pipe);
+        } else {
+            cache.release(pipe, nowMs());
+        }
     } else |_| {
         cache.evictPipe(pipe);
         ctx.response = makeErrorResponse(ctx.allocator, 502, "invalid response");
@@ -769,6 +778,11 @@ test "HttpClient responseCompleteLen waits for Content-Length body" {
 test "HttpClient responseCompleteLen rejects duplicate Content-Length" {
     const duplicate = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello world";
     try std.testing.expectError(error.DuplicateHeader, responseCompleteLen(duplicate));
+}
+
+test "HttpClient detects trailing bytes after complete response" {
+    try std.testing.expect(!responseHasTrailingBytes(42, 42));
+    try std.testing.expect(responseHasTrailingBytes(43, 42));
 }
 
 test "HttpClient parseResponse rejects malformed status lines" {
