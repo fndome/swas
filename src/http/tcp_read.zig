@@ -40,6 +40,26 @@ fn resetHttpWorkForRequest(slot: *StackSlot) *HttpWork {
     return hw;
 }
 
+fn clearPendingHeaderCopy(allocator: std.mem.Allocator, slot: *StackSlot, hw: *HttpWork) void {
+    if (slot.line3.pending_buffer_ptr == 0) return;
+    const saved: []u8 = @as([*]u8, @ptrFromInt(slot.line3.pending_buffer_ptr))[0..hw.header_len];
+    allocator.free(saved);
+    slot.line3.pending_buffer_ptr = 0;
+    hw.pending_bid = 0;
+    hw.pending_len = 0;
+    hw.header_len = 0;
+}
+
+fn savePendingHeaderCopy(allocator: std.mem.Allocator, slot: *StackSlot, hw: *HttpWork, data: []const u8) !void {
+    clearPendingHeaderCopy(allocator, slot, hw);
+    const saved = try allocator.dupe(u8, data);
+    // 修改原因：多次 TCP 分片后的 header 不再完整存在于某一个 read buffer，必须保存累计副本。
+    slot.line3.pending_buffer_ptr = @intFromPtr(saved.ptr);
+    hw.pending_bid = 0;
+    hw.pending_len = @intCast(saved.len);
+    hw.header_len = @intCast(saved.len);
+}
+
 pub fn submitRead(self: *AsyncServer, conn_id: u64, conn: *Connection) !void {
     _ = conn_id;
     // 修改原因：read_buf_recycled 针对单次 read CQE，重新提交 buffer-selection read 前必须重置。
@@ -76,19 +96,34 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     var effective_buf: []const u8 = read_buf[0..nread];
     var effective_nread = nread;
     var pending_to_free: u16 = 0;
+    var reassembled_header = false;
+    var combo: [MAX_REASSEMBLED_HEADER_SIZE]u8 = undefined;
 
     if (conn.pool_idx != 0xFFFFFFFF) {
-        const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
-        if (hw.pending_len > 0 and hw.pending_bid != 0) {
-            const prev_buf = self.buffer_pool.getReadBuf(hw.pending_bid);
-            var combo: [MAX_REASSEMBLED_HEADER_SIZE]u8 = undefined;
-            const prev_len = @min(hw.pending_len, combo.len);
-            const cur_len = @min(nread, combo.len - prev_len);
-            @memcpy(combo[0..prev_len], prev_buf[0..prev_len]);
-            @memcpy(combo[prev_len..][0..cur_len], read_buf[0..cur_len]);
-            effective_buf = combo[0 .. prev_len + cur_len];
-            effective_nread = prev_len + cur_len;
-            pending_to_free = hw.pending_bid;
+        const slot = &self.pool.slots[conn.pool_idx];
+        const hw = sticker.httpWork(slot);
+        if (hw.pending_len > 0 and (hw.pending_bid != 0 or slot.line3.pending_buffer_ptr != 0)) {
+            const prev_len: usize = @intCast(hw.pending_len);
+            var saved_heap: ?[]u8 = null;
+            const prev_buf: []const u8 = if (slot.line3.pending_buffer_ptr != 0) blk: {
+                const saved: []u8 = @as([*]u8, @ptrFromInt(slot.line3.pending_buffer_ptr))[0..prev_len];
+                // 修改原因：超过两段的 header 重组不能只依赖上一个 buffer id，累计片段必须从堆副本恢复。
+                saved_heap = saved;
+                slot.line3.pending_buffer_ptr = 0;
+                hw.header_len = 0;
+                break :blk saved;
+            } else blk: {
+                pending_to_free = hw.pending_bid;
+                break :blk self.buffer_pool.getReadBuf(hw.pending_bid)[0..prev_len];
+            };
+            const copy_prev_len = @min(prev_buf.len, combo.len);
+            const cur_len = @min(nread, combo.len - copy_prev_len);
+            @memcpy(combo[0..copy_prev_len], prev_buf[0..copy_prev_len]);
+            @memcpy(combo[copy_prev_len..][0..cur_len], read_buf[0..cur_len]);
+            effective_buf = combo[0 .. copy_prev_len + cur_len];
+            effective_nread = copy_prev_len + cur_len;
+            reassembled_header = true;
+            if (saved_heap) |saved| self.allocator.free(saved);
             hw.pending_bid = 0;
             hw.pending_len = 0;
         }
@@ -117,9 +152,25 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             return;
         }
         if (conn.pool_idx != 0xFFFFFFFF) {
-            const hw = sticker.httpWork(&self.pool.slots[conn.pool_idx]);
-            hw.pending_bid = bid;
-            hw.pending_len = @intCast(effective_nread);
+            const slot = &self.pool.slots[conn.pool_idx];
+            const hw = sticker.httpWork(slot);
+            if (reassembled_header) {
+                savePendingHeaderCopy(self.allocator, slot, hw, effective_buf) catch {
+                    self.buffer_pool.markReplenish(bid);
+                    conn.read_bid = 0;
+                    conn.read_len = 0;
+                    conn.keep_alive = false;
+                    self.respond(conn, 500, "Internal Server Error");
+                    return;
+                };
+                // 修改原因：header 已经是多片段重组结果，当前 bid 只含最后一片，必须保存完整累计副本。
+                self.buffer_pool.markReplenish(bid);
+                conn.read_bid = 0;
+            } else {
+                hw.pending_bid = bid;
+                hw.pending_len = @intCast(effective_nread);
+                hw.header_len = 0;
+            }
         }
         conn.read_len = 0;
         self.submitRead(conn_id, conn) catch |err| {
@@ -265,7 +316,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
             self.respond(conn, 413, "Content Too Large");
             return;
         }
-        if (pending_to_free != 0) {
+        if (reassembled_header) {
             // 修改原因：header 跨 TCP 分片时 effective_buf 是栈上重组副本；进入异步 body 读取后必须保存完整请求头，否则完成 body 后会只看到第二片并误路由。
             const header_copy = self.allocator.dupe(u8, effective_buf[0..headers_end]) catch {
                 self.buffer_pool.markReplenish(bid);
@@ -495,7 +546,7 @@ pub fn onReadComplete(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64
     if (has_async) {
         var selected_buf = request_buf;
         var request_data_owned = false;
-        if (pending_to_free != 0) {
+        if (reassembled_header) {
             selected_buf = self.allocator.dupe(u8, request_buf) catch {
                 self.buffer_pool.markReplenish(conn.read_bid);
                 conn.read_len = 0;
@@ -712,6 +763,27 @@ test "header reassembly rejects at full buffer without terminator" {
     try std.testing.expect(headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE, reassembledHeaderLimit(8192)));
     try std.testing.expect(!headerBufferFullWithoutTerminator(MAX_REASSEMBLED_HEADER_SIZE - 1, reassembledHeaderLimit(8192)));
     try std.testing.expectEqual(@as(usize, MAX_REASSEMBLED_HEADER_SIZE), reassembledHeaderLimit(16 * 1024));
+}
+
+test "pending header copy preserves reassembled fragments" {
+    var slot = StackSlot{
+        .line1 = .{},
+        .line2 = .{},
+        .line3 = .{},
+        .line4 = .{},
+        .line5 = .{},
+    };
+    const hw = sticker.httpWork(&slot);
+    const data = "GET /split HTTP/1.1\r\nHost: example.test\r\nX-Long: partial";
+
+    try savePendingHeaderCopy(std.testing.allocator, &slot, hw, data);
+    defer clearPendingHeaderCopy(std.testing.allocator, &slot, hw);
+
+    try std.testing.expectEqual(@as(u16, 0), hw.pending_bid);
+    try std.testing.expectEqual(@as(u16, data.len), hw.pending_len);
+    try std.testing.expectEqual(@as(u16, data.len), hw.header_len);
+    const saved = @as([*]u8, @ptrFromInt(slot.line3.pending_buffer_ptr))[0..data.len];
+    try std.testing.expectEqualStrings(data, saved);
 }
 
 test "submitRead preparation resets recycled marker for next CQE" {
