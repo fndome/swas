@@ -124,6 +124,13 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
     resp.rcode = @enumFromInt(flags2 & 0x0F);
     if (resp.rcode != .NOERROR) return resp;
 
+    const qdcount = std.mem.readInt(u16, packet[4..6], .big);
+    // 修改原因：resolver 只会发送单 question 查询，问题数异常的响应不能可靠对应当前 hostname。
+    if (qdcount != 1) {
+        resp.rcode = .SERVFAIL;
+        return resp;
+    }
+
     const ancount = std.mem.readInt(u16, packet[6..8], .big);
     // 修改原因：authority/additional section 中的 A 记录不是当前查询名的答案，不能当解析结果返回。
     const total = ancount;
@@ -132,7 +139,6 @@ pub fn parseResponse(packet: []const u8) ParsedResponse {
 
     var qi: u16 = 0;
     _ = &qi;
-    const qdcount = std.mem.readInt(u16, packet[4..6], .big);
     var q: u16 = 0;
     while (q < qdcount) : (q += 1) {
         off = skipName(packet, off);
@@ -298,4 +304,17 @@ test "parseResponse rejects truncated question" {
 
     const parsed = parseResponse(&pkt);
     try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+}
+
+test "parseResponse rejects unexpected question count" {
+    var pkt = [_]u8{0} ** 28;
+    pkt[2] = 0x80; // QR response
+    pkt[7] = 1; // ANCOUNT = 1, but QDCOUNT stays 0
+
+    var off: usize = 12;
+    appendTestRootARecord(&pkt, &off, .{ 1, 2, 3, 4 });
+
+    const parsed = parseResponse(pkt[0..off]);
+    try std.testing.expectEqual(Rcode.SERVFAIL, parsed.rcode);
+    try std.testing.expectEqual(@as(u8, 0), parsed.addrs.len);
 }
