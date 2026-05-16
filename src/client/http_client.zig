@@ -514,7 +514,9 @@ fn validateCallerHeaders(headers: []const u8) !void {
         }
         if (line.len == 0) return error.InvalidHeaders;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeaders;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const name = line[0..colon];
+        // 修改原因：headers 会原样发送，冒号前空白不能靠 trim 放行，否则客户端会生成畸形请求头。
+        if (name.len != std.mem.trim(u8, name, " \t").len) return error.InvalidHeaders;
         if (!validateHeaderName(name) or isManagedRequestHeader(name)) return error.InvalidHeaders;
         if (rel_end) |_| {
             start = end + 1;
@@ -755,6 +757,7 @@ test "HttpClient buildRequest rejects managed caller headers" {
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "POST", "/", "example.com", "Transfer-Encoding: chunked", "{}"));
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\r\n\r\nX-After: injected", null));
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "Bad Name: ok", null));
+    try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test : ok", null));
     try std.testing.expectError(error.InvalidHeaders, buildRequest(&buf, "GET", "/", "example.com", "X-Test: ok\rX-Injected: yes", null));
     try std.testing.expectError(error.InvalidMethod, buildRequest(&buf, "GET\r\nX-Bad: yes", "/", "example.com", null, null));
     try std.testing.expectError(error.InvalidUrl, buildRequest(&buf, "GET", "/\r\nX-Bad: yes", "example.com", null, null));
